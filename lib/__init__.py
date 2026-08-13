@@ -1,0 +1,1 @@
+# MCM Analytics shared library
