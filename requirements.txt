@@ -10,3 +10,5 @@ scipy>=1.11.0
 plotly>=5.18.0
 arch>=6.2.0
 toml>=0.10.2
+kaleido>=0.2.1
+streamlit-autorefresh>=1.0.1
