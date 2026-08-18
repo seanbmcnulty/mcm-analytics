@@ -25,9 +25,10 @@ TEMPLATE = "plotly_white"
 TIME_TICKFORMAT = "%d-%b %H:%M"
 XAXIS_TIME = "Time (SGT)"
 DISPLAY_TZ_LABEL = "SGT"
+EXPIRY_LABEL_FONT_SIZE = 12
 
 # ---------------------------------------------------------------------------
-# Chart Styling Dictionaries (Required by cmd_vol / cmd_market)
+# Chart Styling Dictionaries
 # ---------------------------------------------------------------------------
 
 TERM_STRUCTURE_SERIES_STYLE = {
@@ -117,7 +118,7 @@ def apply_theme(fig: go.Figure, theme: str = "auto") -> go.Figure:
 
 
 def finalize(fig: go.Figure, height: int = 450, title: str = None, **kwargs) -> go.Figure:
-    """Apply final sizing and standard layout adjustments to a figure, safely swallowing extra kwargs."""
+    """Apply final sizing and layout adjustments, safely ignoring extra kwargs like legend_rows."""
     if fig is None:
         return None
     
