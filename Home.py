@@ -118,18 +118,10 @@ st.subheader("Pages")
 page_info = [
     ("01 MCM Bot", "Full markets bot: 21 commands — vol/skew term structure, forward vols, carry, basis, flow, RV"),
     ("02 Block Trades", "Deribit block trade analysis with Greeks and Telegram reporting"),
-    ("03 Vol Surface Marking", "SABR/5F calibration on live Deribit surface"),
-    ("04 Option Surface", "Live option chain viewer with mark vs bid/ask"),
-    ("05 Term Structure", "ATM term structure across expiries"),
     ("06 Realized Vol", "Multi-estimator RV matrix (BTC/ETH/SOL/HYPE)"),
     ("07 Regime Identifier", "Vol regime classification (GARCH + implied vol)"),
     ("08 Spot-Vol Correlation", "DVOL vs spot analysis (BTC/ETH)"),
-    ("09 Funding Rates", "Deribit perpetual funding rate analysis"),
     ("10 Macro Event Impact", "CPI/FOMC/NFP surprise z-scores + price reactions"),
-    ("11 Accumulator Builder", "Accumulator structured product pricer"),
-    ("12 Constant Maturity", "Live constant-maturity IV from option chain"),
-    ("13 Z-Score Analysis", "Vol z-scores vs historical snapshots"),
-    ("14 Vol Surface Upload", "Screenshot upload and parse tool"),
 ]
 
 grid_cols = st.columns(3)

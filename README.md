@@ -20,18 +20,10 @@ The app will open at `http://localhost:8020`.
 |---|------|-------------|
 | 1 | **MCM Bot** | Full markets bot: vol surface, term structure, skew, trade flow, RV |
 | 2 | **Block Trades** | Deribit block trade analysis with Greeks and Telegram reporting |
-| 3 | **Vol Surface Marking** | SABR/polynomial calibration on live Deribit surface |
-| 4 | **Option Surface** | Live option chain viewer with mark vs bid/ask |
-| 5 | **Term Structure** | ATM implied vol term structure across expiries |
 | 6 | **Realized Vol** | Multi-estimator RV matrix (BTC/ETH/SOL/HYPE) |
 | 7 | **Regime Identifier** | Vol regime classification (GARCH + implied vol) |
 | 8 | **Spot-Vol Correlation** | DVOL vs spot price analysis (BTC/ETH) |
-| 9 | **Funding Rates** | Deribit perpetual funding rate analysis |
 | 10 | **Macro Event Impact** | CPI/FOMC/NFP surprise z-scores + price reactions |
-| 11 | **Accumulator Builder** | Accumulator structured product pricer |
-| 12 | **Constant Maturity** | Live constant-maturity IV from option chain |
-| 13 | **Z-Score Analysis** | Vol z-scores vs historical snapshots |
-| 14 | **Vol Surface Upload** | Screenshot upload and parse tool |
 
 ## Asset Universe
 
@@ -128,8 +120,10 @@ mcm-analytics/
 ├── pages/
 │   ├── 01_MCM_Bot.py
 │   ├── 02_Block_Trades.py
-│   ├── ... (14 pages total)
-│   └── 14_Vol_Surface_Upload.py
+│   ├── 06_Realized_Vol.py
+│   ├── 07_Regime_Identifier.py
+│   ├── 08_Spot_Vol_Correlation.py
+│   └── 10_Macro_Event_Impact.py
 └── data/
     └── macro_events_calendar.csv  # Bundled macro event calendar
 ```
