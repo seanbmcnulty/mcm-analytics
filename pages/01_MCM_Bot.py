@@ -1,8 +1,11 @@
 """
 MCM Bot — the full markets bot, Deribit public data only.
 
-Layout mirrors the FalconX bot page: Settings, Load reports, the per-asset
-dashboard grid, and a Run-single-command panel at the bottom.
+Layout: a compact toolbar (expiry + load/refresh/send), then one tab per
+asset for the report grid plus a final "Run single command" tab — so
+switching between assets (or to the ad-hoc single-command tool) is a tab
+click instead of a long scroll. "What each report shows" lives in the
+sidebar as reference material.
 """
 
 import sys
@@ -248,6 +251,30 @@ with st.sidebar:
         _surface.clear_cache()
         _history.clear_cache()
         st.rerun()
+    st.divider()
+    with st.expander("What each report shows"):
+        st.markdown("""
+| Command | What it shows |
+|--------|----------------|
+| **Vol run** | Implied volatility by expiry (ATM σ, 3h/open change, RV, IV−RV, 25Δ wings, forward IV). Green/red = up/down. |
+| **Vol term structure** | ATM vol across expiries; current vs 24h / 1w / 1m ago. |
+| **Skew term structure** | 25Δ call minus put skew by expiry (call–put vol spread). |
+| **Basis run** | Perp and dated futures basis vs index. Basis % (1Y APR) = annualized; green/red = contango/backwardation. |
+| **Forward vols** | Combined ATM, 25d call, 25d put vols and their forward vols by expiry date. |
+| **Forward vol steepness** | ATM-only $100k vega daily carry waterfall by adjacent tenor pair (excludes <=3DTE; weighted to 30D vega). |
+| **Forward vol steepness 25d call / put** | Same waterfall for the 25d call or 25d put wing. |
+| **Forward vol steepness multidelta** | Grouped bar chart of carry (pts/30d) for ATM vs 25d call vs 25d put by tenor pair. |
+| **ATM IV box plot** | 90-day ATM IV distribution per tenor with today's curve overlaid; P-number = current percentile. |
+| **Forward vol matrix** | Forward vol between every pair of expiries, as a heatmap. |
+| **Intraday basis / vol / skew** | Last 24 hours for the selected expiry; perp price on the secondary axis. |
+| **Vol time series** | Last month of ATM and 25Δ/10Δ vol for the selected expiry (Singapore time). |
+| **Skew time series** | 25Δ and 10Δ skew (call − put) over the last month. |
+| **Vol smile** | Implied vol across deltas for current, 1d ago, 1w ago, 1m ago. |
+| **Funding rates** | Annualized Deribit perpetual funding APR (last 30 days). |
+| **RV plot** | Realized volatility (Parkinson) over 3d, 7d, 30d, 90d. |
+| **Block trades summary** | Last 24h large option trades by expiry: **Delta, Vega, Gamma** = net $ exposure (green = net long, red = net short). Net Puts/Calls = contract flow (+ buy, − sell). |
+| **Moonphase** | Perp price with lunar phases; bands show full/new moon windows. |
+""")
 
 for _asset in ASSETS:
     try:
@@ -261,41 +288,53 @@ st.caption("Crypto derivatives analytics · Deribit public API · "
            f"{fx_style.DISPLAY_TZ_LABEL} time")
 
 # ---------------------------------------------------------------------------
-# Settings
+# Toolbar — expiry + load/refresh/send, one compact row instead of three
+# stacked sections. Everything here used to take ~40 lines of subheaders and
+# always-visible captions before a single chart appeared; the explanatory
+# text now lives in tooltips (hover ⓘ) and the "Load selected…" popover.
 # ---------------------------------------------------------------------------
-
-st.subheader("Settings")
-st.caption("These settings apply to the dashboard and to reports sent to Telegram.")
 
 _expiries, _using_fallback = _expiry_options()
 _default_idx = _expiries.index(min(_expiries, key=lambda d: abs(d - 30)))
-st.selectbox(
-    "Default expiry (Deribit listed)", options=_expiries, index=_default_idx,
-    format_func=_expiry_label, key="mcm_dte_days",
-    help="DTE = days to expiry. Used for: Vol Time Series, Skew Time Series, "
-         "Intraday Basis/Vol/Skew, and Vol Smile. Only Deribit-listed option "
-         "expiries are shown.")
-if _using_fallback:
-    st.caption("Using default expiries (7, 30, 90 d) — Deribit list unavailable.")
-else:
-    st.caption("Expiry dates are Deribit's listed option expiries. Choose which "
-               "tenor to view in time-series and intraday charts.")
 
-# ---------------------------------------------------------------------------
-# Load reports
-# ---------------------------------------------------------------------------
-
-st.subheader("Load reports")
-st.caption("Reports are not loaded until you click a button below. **Load all** "
-           "runs every command for all assets; **Load selected** lets you pick "
-           "assets and commands.")
-
-load_all_btn = st.button("Load all", key="mcm_load_all",
-                         help=f"Run all {len(cmdreg.COMMAND_NAMES)} commands for "
-                              f"{', '.join(ASSETS)}. May take several minutes.")
-refresh_all_btn = st.button("Refresh all", key="mcm_refresh_all",
-                            help="Re-run all commands and replace the dashboard "
-                                 "with the latest data.")
+_tb1, _tb2, _tb3, _tb4, _tb5 = st.columns([2.2, 1, 1, 1.4, 1.1])
+with _tb1:
+    st.selectbox(
+        "Default expiry", options=_expiries, index=_default_idx,
+        format_func=_expiry_label, key="mcm_dte_days",
+        help="DTE = days to expiry. Used for: Vol Time Series, Skew Time Series, "
+             "Intraday Basis/Vol/Skew, and Vol Smile. Only Deribit-listed option "
+             "expiries are shown." + (
+                 " Deribit's expiry list is unavailable right now, so 7/30/90d "
+                 "are shown instead." if _using_fallback else ""))
+with _tb2:
+    st.write("")
+    load_all_btn = st.button("Load all", key="mcm_load_all", **_stretch(),
+                             help=f"Run all {len(cmdreg.COMMAND_NAMES)} commands for "
+                                  f"{', '.join(ASSETS)}. May take several minutes.")
+with _tb3:
+    st.write("")
+    refresh_all_btn = st.button("Refresh all", key="mcm_refresh_all", **_stretch(),
+                                help="Re-run all commands and replace the dashboard "
+                                     "with the latest data.")
+with _tb4:
+    st.write("")
+    send_all_btn = st.button("Send all → Telegram", key="mcm_send_all", **_stretch(),
+                             disabled=not telegram.is_configured(),
+                             help="Send every loaded report to Telegram, in dashboard "
+                                  "order. Charts as images, tables as table images. "
+                                  "If not everything is loaded yet, Load all runs "
+                                  "first.")
+with _tb5:
+    st.write("")
+    with st.popover("Load selected…", **_stretch()):
+        st.caption("Pick specific assets/commands instead of loading everything.")
+        st.multiselect("Assets", ASSETS, default=list(ASSETS), key="mcm_sel_assets")
+        st.multiselect("Commands", list(cmdreg.COMMAND_NAMES), default=[],
+                       key="mcm_sel_cmds",
+                       help="Select at least one command. Reports appear in the "
+                            "asset tabs below.")
+        load_selected_btn = st.button("Load selected", key="mcm_load_selected")
 
 if load_all_btn or refresh_all_btn:
     with st.spinner(f"Running all commands for {', '.join(ASSETS)}…"):
@@ -305,17 +344,6 @@ if load_all_btn or refresh_all_btn:
         st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
     st.success("All reports loaded." if load_all_btn else "All reports refreshed.")
     st.rerun()
-
-with st.expander("Load selected reports", expanded=False):
-    st.caption("Pick one or more assets and one or more commands. Only the "
-               "selected reports will run — useful for quick updates or testing.")
-    st.multiselect("Assets", ASSETS, default=list(ASSETS), key="mcm_sel_assets",
-                   help="Any of " + ", ".join(ASSETS) + ".")
-    st.multiselect("Commands", list(cmdreg.COMMAND_NAMES), default=[],
-                   key="mcm_sel_cmds",
-                   help="Select at least one command. Reports appear in the "
-                        "dashboard grid below.")
-    load_selected_btn = st.button("Load selected", key="mcm_load_selected")
 
 if load_selected_btn:
     sel_assets = st.session_state.get("mcm_sel_assets", list(ASSETS))
@@ -332,12 +360,6 @@ if load_selected_btn:
         st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
         st.success(f"Loaded {len(sel_assets) * len(sel_cmds)} report(s).")
         st.rerun()
-
-st.caption("Send every loaded report to Telegram in order (same order as the "
-           "grid). Charts are sent as images; tables as table images. If not all "
-           "reports are loaded, **Load all** will run first.")
-send_all_btn = st.button("Send all reports to Telegram", key="mcm_send_all",
-                         disabled=not telegram.is_configured())
 
 if send_all_btn:
     results = st.session_state.mcm_all_results or {}
@@ -390,11 +412,15 @@ results = st.session_state.mcm_all_results or {}
 _ts = st.session_state.get("mcm_all_results_ts")
 
 # ---------------------------------------------------------------------------
-# Dashboard
+# Dashboard — one tab per asset, plus a tab for the single-command tool.
+# Replaces the old layout of "every asset's full grid, stacked vertically,
+# then the single-command panel below all of them" — which meant scrolling
+# past BTC's ~21 charts to see ETH's, then SOL's, then HYPE's, then the
+# single-command tool at the very bottom. Now switching between them is a
+# tab click, not a scroll. ("What each report shows" moved to the sidebar.)
 # ---------------------------------------------------------------------------
 
 st.divider()
-st.subheader("Dashboard")
 
 if _ts is not None and results:
     age_sec = (datetime.now(timezone.utc) - _ts).total_seconds()
@@ -407,148 +433,124 @@ if _ts is not None and results:
         st.info(f"Data is {age_min} min old. Click **Refresh all** above for "
                 "the latest.")
 elif not results:
-    st.info("No reports loaded yet. Use **Load all** or **Load selected reports** "
+    st.info("No reports loaded yet. Use **Load all** or **Load selected…** "
             "above to run commands.")
-
-with st.expander("What each report shows (guide)"):
-    st.markdown("""
-| Command | What it shows |
-|--------|----------------|
-| **Vol run** | Implied volatility by expiry (ATM σ, 3h/open change, RV, IV−RV, 25Δ wings, forward IV). Green/red = up/down. |
-| **Vol term structure** | ATM vol across expiries; current vs 24h / 1w / 1m ago. |
-| **Skew term structure** | 25Δ call minus put skew by expiry (call–put vol spread). |
-| **Basis run** | Perp and dated futures basis vs index. Basis % (1Y APR) = annualized; green/red = contango/backwardation. |
-| **Forward vols** | Combined ATM, 25d call, 25d put vols and their forward vols by expiry date. |
-| **Forward vol steepness** | ATM-only $100k vega daily carry waterfall by adjacent tenor pair (excludes <=3DTE; weighted to 30D vega). |
-| **Forward vol steepness 25d call / put** | Same waterfall for the 25d call or 25d put wing. |
-| **Forward vol steepness multidelta** | Grouped bar chart of carry (pts/30d) for ATM vs 25d call vs 25d put by tenor pair. |
-| **ATM IV box plot** | 90-day ATM IV distribution per tenor with today's curve overlaid; P-number = current percentile. |
-| **Forward vol matrix** | Forward vol between every pair of expiries, as a heatmap. |
-| **Intraday basis / vol / skew** | Last 24 hours for the selected expiry; perp price on the secondary axis. |
-| **Vol time series** | Last month of ATM and 25Δ/10Δ vol for the selected expiry (Singapore time). |
-| **Skew time series** | 25Δ and 10Δ skew (call − put) over the last month. |
-| **Vol smile** | Implied vol across deltas for current, 1d ago, 1w ago, 1m ago. |
-| **Funding rates** | Annualized Deribit perpetual funding APR (last 30 days). |
-| **RV plot** | Realized volatility (Parkinson) over 3d, 7d, 30d, 90d. |
-| **Block trades summary** | Last 24h large option trades by expiry: **Delta, Vega, Gamma** = net $ exposure (green = net long, red = net short). Net Puts/Calls = contract flow (+ buy, − sell). |
-| **Moonphase** | Perp price with lunar phases; bands show full/new moon windows. |
-""")
 
 visible_assets = [a for a in ASSETS
                   if (not results) or any((a, cn) in results
                                           for cn in cmdreg.COMMAND_NAMES)]
 
-for ia, a in enumerate(visible_assets):
-    order_a = [(x, cn) for x, cn in MCM_ORDER if x == a]
-    st.subheader(f"📊 {a}")
-    for i in range(0, len(order_a), 3):
-        row_items = order_a[i:i + 3]
-        multi_idx = None
-        for j, (_, cn) in enumerate(row_items):
-            entry = results.get((a, cn))
-            if entry and isinstance(entry[0], list) and entry[0]:
-                multi_idx = j
-                break
+_tab_labels = [f"📊 {a}" for a in visible_assets] + ["🔎 Run single command"]
+asset_tabs = st.tabs(_tab_labels)
 
-        if multi_idx is not None:
-            _, cn = row_items[multi_idx]
-            fig, df, text = results[(a, cn)]
-            st.caption(f"**{a}** /{cn}")
-            render_output(fig, df, text, key_prefix=f"{a}_{cn}", skip_figures=True)
-            others = [row_items[k] for k in range(len(row_items)) if k != multi_idx]
-            if others:
-                cols = st.columns(len(others))
-                for k, (_, cn2) in enumerate(others):
-                    with cols[k]:
-                        st.caption(f"**{a}** /{cn2}")
-                        if (a, cn2) in results:
-                            f2, d2, t2 = results[(a, cn2)]
-                            render_output(f2, d2, t2, key_prefix=f"{a}_{cn2}")
+for ia, a in enumerate(visible_assets):
+    with asset_tabs[ia]:
+        order_a = [(x, cn) for x, cn in MCM_ORDER if x == a]
+        for i in range(0, len(order_a), 3):
+            row_items = order_a[i:i + 3]
+            multi_idx = None
+            for j, (_, cn) in enumerate(row_items):
+                entry = results.get((a, cn))
+                if entry and isinstance(entry[0], list) and entry[0]:
+                    multi_idx = j
+                    break
+
+            if multi_idx is not None:
+                _, cn = row_items[multi_idx]
+                fig, df, text = results[(a, cn)]
+                st.caption(f"**{a}** /{cn}")
+                render_output(fig, df, text, key_prefix=f"{a}_{cn}", skip_figures=True)
+                others = [row_items[k] for k in range(len(row_items)) if k != multi_idx]
+                if others:
+                    cols = st.columns(len(others))
+                    for k, (_, cn2) in enumerate(others):
+                        with cols[k]:
+                            st.caption(f"**{a}** /{cn2}")
+                            if (a, cn2) in results:
+                                f2, d2, t2 = results[(a, cn2)]
+                                render_output(f2, d2, t2, key_prefix=f"{a}_{cn2}")
+                            else:
+                                st.caption("Not loaded. Use **Load all** or "
+                                           "**Load selected…** above.")
+            else:
+                cols = st.columns(3)
+                for j, (_, cn) in enumerate(row_items):
+                    with cols[j]:
+                        st.caption(f"**{a}** /{cn}")
+                        if (a, cn) in results:
+                            f2, d2, t2 = results[(a, cn)]
+                            render_output(f2, d2, t2, key_prefix=f"{a}_{cn}",
+                                          skip_figures=(cn == "vol_run"
+                                                        and isinstance(f2, list)))
                         else:
                             st.caption("Not loaded. Use **Load all** or "
-                                       "**Load selected reports** above.")
-        else:
-            cols = st.columns(3)
-            for j, (_, cn) in enumerate(row_items):
-                with cols[j]:
-                    st.caption(f"**{a}** /{cn}")
-                    if (a, cn) in results:
-                        f2, d2, t2 = results[(a, cn)]
-                        render_output(f2, d2, t2, key_prefix=f"{a}_{cn}",
-                                      skip_figures=(cn == "vol_run"
-                                                    and isinstance(f2, list)))
-                    else:
-                        st.caption("Not loaded. Use **Load all** or "
-                                   "**Load selected reports** above.")
-        if i + 3 < len(order_a):
-            st.write("")
+                                       "**Load selected…** above.")
+            if i + 3 < len(order_a):
+                st.write("")
 
-    if (a, "vol_run") in results:
-        f_list, _, _ = results[(a, "vol_run")]
-        if isinstance(f_list, list) and f_list:
-            st.caption(f"**{a}** Vol surface by expiry")
-            render_output(f_list, None, None,
-                          key_prefix=f"{a}_vol_surface", full_width_charts=True)
-    if ia < len(visible_assets) - 1:
-        st.divider()
-
-st.caption("Data provided by the Deribit public API.")
+        if (a, "vol_run") in results:
+            f_list, _, _ = results[(a, "vol_run")]
+            if isinstance(f_list, list) and f_list:
+                st.caption(f"**{a}** Vol surface by expiry")
+                render_output(f_list, None, None,
+                              key_prefix=f"{a}_vol_surface", full_width_charts=True)
 
 # ---------------------------------------------------------------------------
 # Run single command
 # ---------------------------------------------------------------------------
 
-st.divider()
-st.subheader("Run single command")
-st.caption("Run one command for one asset and view or send the result. Useful "
-           "for quick checks or sending a single chart/table to Telegram.")
+with asset_tabs[-1]:
+    st.caption("Run one command for one asset and view or send the result. Useful "
+               "for quick checks or sending a single chart/table to Telegram.")
 
-col1, col2, col3 = st.columns([1, 2, 1])
-with col1:
-    asset = st.selectbox("Asset", ASSETS, key="mcm_asset",
-                         help=", ".join(ASSETS) + ".")
-with col2:
-    command_input = st.selectbox("Command", cmdreg.COMMANDS, key="mcm_cmd",
-                                 help="Choose which report to run.")
-with col3:
-    show_help = st.checkbox("Show help", key="mcm_help",
-                            help="Show a short description of the selected command.")
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col1:
+        asset = st.selectbox("Asset", ASSETS, key="mcm_asset",
+                             help=", ".join(ASSETS) + ".")
+    with col2:
+        command_input = st.selectbox("Command", cmdreg.COMMANDS, key="mcm_cmd",
+                                     help="Choose which report to run.")
+    with col3:
+        show_help = st.checkbox("Show help", key="mcm_help",
+                                help="Show a short description of the selected command.")
 
-cmd_name = command_input.strip().lstrip("/").split()[0] if command_input else ""
-if cmd_name in cmdreg.EXPIRY_COMMANDS:
-    st.caption("This command uses the **default expiry (Deribit listed)** "
-               "selected at the top of the page.")
-if show_help:
-    st.info(f"**/{cmd_name}** — "
-            f"{cmdreg.COMMAND_HELP.get(cmd_name, 'No help for this command.')}")
+    cmd_name = command_input.strip().lstrip("/").split()[0] if command_input else ""
+    if cmd_name in cmdreg.EXPIRY_COMMANDS:
+        st.caption("This command uses the **default expiry** selected in the "
+                   "toolbar above.")
+    if show_help:
+        st.info(f"**/{cmd_name}** — "
+                f"{cmdreg.COMMAND_HELP.get(cmd_name, 'No help for this command.')}")
 
-run_btn = st.button("Run", type="primary", key="mcm_run")
+    run_btn = st.button("Run", type="primary", key="mcm_run")
 
-if run_btn and command_input:
-    with st.spinner("Running..."):
-        target = (st.session_state.get("mcm_dte_days", 30)
-                  if cmd_name in cmdreg.EXPIRY_COMMANDS else None)
-        fig, df, text = cmdreg.run_command(asset, command_input,
-                                           expiry_target_days=target)
-    st.session_state.mcm_fig = fig
-    st.session_state.mcm_df = df
-    st.session_state.mcm_text = text
-    if text and fig is None and (df is None or getattr(df, "empty", True)):
-        st.warning(text)
+    if run_btn and command_input:
+        with st.spinner("Running..."):
+            target = (st.session_state.get("mcm_dte_days", 30)
+                      if cmd_name in cmdreg.EXPIRY_COMMANDS else None)
+            fig, df, text = cmdreg.run_command(asset, command_input,
+                                               expiry_target_days=target)
+        st.session_state.mcm_fig = fig
+        st.session_state.mcm_df = df
+        st.session_state.mcm_text = text
+        if text and fig is None and (df is None or getattr(df, "empty", True)):
+            st.warning(text)
 
-_fig = st.session_state.mcm_fig
-_df = st.session_state.mcm_df
-_text = st.session_state.mcm_text
-_has_output = _fig is not None or (_df is not None and not getattr(_df, "empty", True))
+    _fig = st.session_state.mcm_fig
+    _df = st.session_state.mcm_df
+    _text = st.session_state.mcm_text
+    _has_output = _fig is not None or (_df is not None and not getattr(_df, "empty", True))
 
-if _has_output or _text:
-    render_output(_fig, _df, _text, key_prefix="single_cmd",
-                  full_width_charts=isinstance(_fig, list) and bool(_fig))
+    if _has_output or _text:
+        render_output(_fig, _df, _text, key_prefix="single_cmd",
+                      full_width_charts=isinstance(_fig, list) and bool(_fig))
 
-send_tg_btn = st.button("Send to Telegram", key="mcm_send_tg",
-                        disabled=not (_has_output and telegram.is_configured()))
-if send_tg_btn and _has_output:
-    if send_result_to_telegram(asset, cmd_name, _fig, _df, _text):
-        st.success("Sent to Telegram.")
-    else:
-        st.error("Failed to send to Telegram.")
+    send_tg_btn = st.button("Send to Telegram", key="mcm_send_tg",
+                            disabled=not (_has_output and telegram.is_configured()))
+    if send_tg_btn and _has_output:
+        if send_result_to_telegram(asset, cmd_name, _fig, _df, _text):
+            st.success("Sent to Telegram.")
+        else:
+            st.error("Failed to send to Telegram.")
+
+st.caption("Data provided by the Deribit public API.")
