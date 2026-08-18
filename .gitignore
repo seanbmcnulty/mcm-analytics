@@ -31,3 +31,6 @@ data/snapshots/
 
 # Secrets
 secrets.toml
+
+# Scratch (stale git locks moved aside)
+_to_delete/

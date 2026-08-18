@@ -8,6 +8,12 @@ echo.
 
 cd /d "%~dp0"
 
+REM --- Clear a stale index.lock left behind by an interrupted git process ---
+if exist ".git\index.lock" (
+    echo Found a stale .git\index.lock - removing it...
+    del /f /q ".git\index.lock"
+)
+
 git remote get-url origin >nul 2>&1
 if %errorlevel% neq 0 (
     echo Adding GitHub remote...
@@ -21,7 +27,7 @@ echo Renaming branch to main...
 git branch -M main
 
 echo.
-echo Staging and committing any local changes...
+echo Staging and committing local changes...
 git add -A
 git diff --cached --quiet
 if %errorlevel% neq 0 (
@@ -31,15 +37,28 @@ if %errorlevel% neq 0 (
 )
 
 echo.
-echo Pushing to GitHub (a browser or credential prompt may appear - sign in if asked)...
+echo Syncing with GitHub (rebasing on any remote commits)...
+git pull --rebase origin main
+if %errorlevel% neq 0 (
+    echo.
+    echo ==========================================
+    echo   Could not rebase automatically.
+    echo   Run: git rebase --abort
+    echo   then ask Claude to help resolve it.
+    echo ==========================================
+    echo.
+    pause
+    exit /b 1
+)
+
+echo.
+echo Pushing to GitHub (a browser or credential prompt may appear)...
 git push -u origin main
 
 if %errorlevel% neq 0 (
     echo.
     echo ==========================================
     echo   Push failed - see the error above.
-    echo   Common fix: make sure you are logged in
-    echo   to GitHub as seanbmcnulty when prompted.
     echo ==========================================
 ) else (
     echo.

@@ -116,7 +116,7 @@ st.divider()
 st.subheader("Pages")
 
 page_info = [
-    ("01 MCM Bot", "Full markets bot: vol surface, term structure, skew, trade flow, RV"),
+    ("01 MCM Bot", "Full markets bot: 21 commands — vol/skew term structure, forward vols, carry, basis, flow, RV"),
     ("02 Block Trades", "Deribit block trade analysis with Greeks and Telegram reporting"),
     ("03 Vol Surface Marking", "SABR/5F calibration on live Deribit surface"),
     ("04 Option Surface", "Live option chain viewer with mark vs bid/ask"),
