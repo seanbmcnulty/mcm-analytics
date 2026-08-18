@@ -243,8 +243,10 @@ with st.sidebar:
         st.caption(telegram.config_status())
     st.divider()
     if st.button("Clear data cache", **_stretch()):
-        from lib import deribit
+        from lib import deribit, surface as _surface, history as _history
         deribit.clear_cache()
+        _surface.clear_cache()
+        _history.clear_cache()
         st.rerun()
 
 try:

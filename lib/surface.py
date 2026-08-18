@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -52,6 +53,17 @@ _EXPIRY_RE = re.compile(r"^(\d{1,2})([A-Z]{3})(\d{2})$")
 _MONTHS = {m: i + 1 for i, m in enumerate(
     ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
      "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])}
+
+# option_vols_by_dte() re-parses the whole chain and re-runs the BS delta
+# search for every bucket/DTE. Every one of atm_iv_by_dte, iv_by_dte_for_delta
+# and current_smile funnels through it, and a single "Load all" pass calls
+# those a dozen-plus times per asset in the space of a couple of seconds —
+# same underlying chain, same answer, recomputed from scratch each time.
+# Cache it for as long as the least-fresh input (get_index_price, ttl=10s)
+# is considered current, so a render pass shares one computation without
+# masking a genuinely new chain on the next user-triggered refresh.
+_VOLS_CACHE: dict[str, tuple[float, dict]] = {}
+_VOLS_TTL = 10.0
 
 
 def acfg(asset: str) -> dict:
@@ -195,11 +207,21 @@ def parse_chain(asset: str) -> tuple[float | None, dict[int, list[tuple]]]:
 
 def option_vols_by_dte(asset: str) -> dict[str, dict[int, float]]:
     """
-    Live IV by delta bucket and DTE, in decimal.
+    Live IV by delta bucket and DTE, in decimal. Cached for ``_VOLS_TTL``
+    seconds per asset — see the comment on ``_VOLS_CACHE`` above.
 
     ``{"atm": {dte: iv}, "call25": {...}, "put25": {...},
        "call10": ..., "put10": ..., "call35": ..., "put35": ...}``
     """
+    hit = _VOLS_CACHE.get(asset)
+    if hit is not None and (time.time() - hit[0]) < _VOLS_TTL:
+        return hit[1]
+    out = _option_vols_by_dte_uncached(asset)
+    _VOLS_CACHE[asset] = (time.time(), out)
+    return out
+
+
+def _option_vols_by_dte_uncached(asset: str) -> dict[str, dict[int, float]]:
     out: dict[str, dict[int, float]] = {
         k: {} for k in
         ("atm", "call10", "call25", "call35", "put10", "put25", "put35")
@@ -489,3 +511,8 @@ def perp_mark(asset: str) -> float | None:
         return None
     v = t.get("mark_price")
     return float(v) if finite(v) else None
+
+
+def clear_cache():
+    """Drop the cached per-asset vol computation (see ``_VOLS_CACHE``)."""
+    _VOLS_CACHE.clear()

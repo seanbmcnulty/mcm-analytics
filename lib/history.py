@@ -18,10 +18,20 @@ using a three-tier preference chain:
 
 Anything produced by tiers 2 or 3 is flagged ``estimated=True`` so the UI can
 label it honestly rather than passing it off as recorded history.
+
+Snapshot durability: the *local* copy of ``data/snapshots`` only covers what
+this process has recorded since it started (Streamlit Community Cloud wipes
+it on every redeploy). A GitHub Actions cron job records the same snapshots
+independently and commits them to a separate ``snapshots`` branch — deliberately
+not the branch Streamlit Cloud watches, so hourly recording commits don't
+trigger app redeploys (see .github/workflows/record_snapshots.yml and
+scripts/record_snapshot.py). ``load_snapshots`` merges both sources, so the
+app always sees the fuller of the two.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import time
@@ -30,11 +40,23 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 
 from lib import deribit, surface
 from lib.constants import ASSET_CONFIG
 
 SNAPSHOT_DIR = Path(__file__).resolve().parent.parent / "data" / "snapshots"
+
+# Durable snapshot history lives on a branch Streamlit Cloud does NOT watch,
+# so the hourly recorder commit doesn't cause app redeploys.
+SNAPSHOT_REPO = "seanbmcnulty/mcm-analytics"
+SNAPSHOT_BRANCH = "snapshots"
+_REMOTE_SNAPSHOT_BASE = (
+    f"https://raw.githubusercontent.com/{SNAPSHOT_REPO}/{SNAPSHOT_BRANCH}/data/snapshots"
+)
+_REMOTE_TIMEOUT = 6.0
+_REMOTE_SNAPSHOT_CACHE: dict[str, tuple[float, "pd.DataFrame | None"]] = {}
+_REMOTE_SNAPSHOT_TTL = 300.0
 
 # Tenors we persist / reconstruct, in days.
 SNAPSHOT_DTES = [1, 7, 14, 30, 60, 90, 180, 365]
@@ -152,22 +174,74 @@ def record_snapshot(asset: str, min_interval_s: float = 1800.0) -> bool:
         return False
 
 
-def load_snapshots(asset: str, days: int) -> pd.DataFrame | None:
-    """Recorded snapshots for the last ``days``, indexed by UTC timestamp."""
-    path = _snapshot_path(asset)
-    if not path.exists():
-        return None
+def _parse_snapshot_csv(text: str) -> pd.DataFrame | None:
     try:
-        df = pd.read_csv(path)
+        df = pd.read_csv(io.StringIO(text))
         if df.empty or "timestamp" not in df:
             return None
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        df = df[df.index >= cutoff]
-        return df if len(df) >= 2 else None
+        return df if not df.empty else None
     except Exception:
         return None
+
+
+def _load_local_snapshots_raw(asset: str) -> pd.DataFrame | None:
+    path = _snapshot_path(asset)
+    if not path.exists():
+        return None
+    try:
+        return _parse_snapshot_csv(path.read_text())
+    except Exception:
+        return None
+
+
+def _fetch_remote_snapshots(asset: str) -> pd.DataFrame | None:
+    """
+    Durable snapshot history from the GitHub Actions recorder (``snapshots``
+    branch). Cached in-process for a few minutes; best-effort — any network
+    hiccup, missing branch, or malformed response just yields None so this
+    never breaks the app, it only means less history than we'd like.
+    """
+    hit = _REMOTE_SNAPSHOT_CACHE.get(asset)
+    if hit is not None and (time.time() - hit[0]) < _REMOTE_SNAPSHOT_TTL:
+        return hit[1]
+    frame = None
+    try:
+        url = f"{_REMOTE_SNAPSHOT_BASE}/{asset}_surface.csv"
+        resp = requests.get(url, timeout=_REMOTE_TIMEOUT)
+        if resp.status_code == 200 and resp.text.strip():
+            frame = _parse_snapshot_csv(resp.text)
+    except Exception:
+        frame = None
+    _REMOTE_SNAPSHOT_CACHE[asset] = (time.time(), frame)
+    return frame
+
+
+def load_snapshots(asset: str, days: int) -> pd.DataFrame | None:
+    """
+    Recorded snapshots for the last ``days``, indexed by UTC timestamp.
+
+    Merges the local file (whatever this process has recorded itself since
+    it started — ephemeral on Streamlit Community Cloud) with the durable
+    history the GitHub Actions recorder has committed to the ``snapshots``
+    branch. Rows present in both win from the local copy, since it's always
+    at least as fresh as the last hourly commit.
+    """
+    local = _load_local_snapshots_raw(asset)
+    remote = _fetch_remote_snapshots(asset)
+    if local is None and remote is None:
+        return None
+    if local is None:
+        df = remote
+    elif remote is None:
+        df = local
+    else:
+        combined = pd.concat([remote, local])
+        df = combined[~combined.index.duplicated(keep="last")].sort_index()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    df = df[df.index >= cutoff]
+    return df if len(df) >= 2 else None
 
 
 def _surface_from_snapshots(asset: str, delta_key: str,
@@ -380,3 +454,9 @@ def iv_series_at_dte(asset: str, dte: int, delta_key: str = "delta50",
             s = frame[int(near)]
     s = pd.to_numeric(s, errors="coerce").dropna() * 100.0
     return (s if len(s) >= 2 else None), estimated, src
+
+
+def clear_cache() -> None:
+    """Drop the in-memory level-driver and remote-snapshot caches."""
+    _DRIVER_CACHE.clear()
+    _REMOTE_SNAPSHOT_CACHE.clear()
