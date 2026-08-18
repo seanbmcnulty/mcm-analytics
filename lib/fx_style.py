@@ -233,3 +233,96 @@ def style_dataframe(df: pd.DataFrame):
                                          "Net Puts", "Net Calls"):
             styler = styler.map(_signed, subset=[col])
     return styler
+
+
+# ---------------------------------------------------------------------------
+# Light / dark theming
+# ---------------------------------------------------------------------------
+
+_DARK = {
+    "template": "plotly_dark",
+    "paper": "rgba(0,0,0,0)",
+    "plot": "rgba(0,0,0,0)",
+    "font": "#E6EAF1",
+    "grid": "rgba(230,234,241,0.12)",
+    "box": "rgba(20,26,38,0.92)",
+    "box_font": "#E6EAF1",
+}
+_LIGHT = {
+    "template": "plotly_white",
+    "paper": "white",
+    "plot": "white",
+    "font": "#333333",
+    "grid": "rgba(30,77,122,0.09)",
+    "box": "rgba(255,255,255,0.86)",
+    "box_font": HEADER_NAVY,
+}
+
+
+def active_theme(default: str = "dark") -> str:
+    """
+    The theme to draw in: the user's explicit choice, else Streamlit's own.
+
+    Falls back to ``default`` when neither is available (e.g. Telegram export).
+    """
+    try:
+        import streamlit as st
+        choice = st.session_state.get("mcm_chart_theme", "Auto")
+        if choice in ("Light", "Dark"):
+            return choice.lower()
+        detected = getattr(getattr(st, "context", None), "theme", None)
+        kind = getattr(detected, "type", None)
+        if kind in ("light", "dark"):
+            return kind
+    except Exception:
+        pass
+    return default
+
+
+def apply_theme(fig, mode: str | None = None):
+    """
+    Re-skin a finished figure for light or dark.
+
+    Charts are authored light (FalconX house style, which is what reads well in
+    Telegram); this repaints them for on-screen dark mode without touching the
+    data or the series colours, which stay legible on both backgrounds.
+    """
+    if fig is None:
+        return fig
+    palette = _DARK if (mode or active_theme()) == "dark" else _LIGHT
+    try:
+        fig.update_layout(
+            template=palette["template"],
+            paper_bgcolor=palette["paper"],
+            plot_bgcolor=palette["plot"],
+            font=dict(color=palette["font"]),
+        )
+        layout = getattr(fig, "layout", {})
+        for axis in ("xaxis", "yaxis", "xaxis2", "yaxis2"):
+            try:
+                fig.update_layout(**{axis: dict(gridcolor=palette["grid"])})
+            except Exception:
+                continue
+        # Repaint the stat/info boxes, which are authored on white.
+        anns = getattr(layout, "annotations", None) or getattr(fig, "annotations", [])
+        for ann in anns:
+            try:
+                bg = ann["bgcolor"] if isinstance(ann, dict) else getattr(ann, "bgcolor", None)
+            except Exception:
+                bg = None
+            if not bg:
+                continue
+            try:
+                if isinstance(ann, dict):
+                    ann["bgcolor"] = palette["box"]
+                    if ann.get("font"):
+                        ann["font"]["color"] = palette["box_font"]
+                else:
+                    ann.bgcolor = palette["box"]
+                    if getattr(ann, "font", None) is not None:
+                        ann.font.color = palette["box_font"]
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return fig

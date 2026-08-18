@@ -1,4 +1,19 @@
+# Streamlit picks one of these based on the user's choice in
+# ☰ menu -> Settings -> Appearance (Light / Dark / Use system setting).
+
 [theme]
+base = "dark"
+primaryColor = "#3790C7"
+font = "sans serif"
+
+[theme.light]
+base = "light"
+primaryColor = "#1E4D7A"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F7FB"
+textColor = "#13314F"
+
+[theme.dark]
 base = "dark"
 primaryColor = "#4da6ff"
 backgroundColor = "#0e1117"
