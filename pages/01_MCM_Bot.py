@@ -158,40 +158,30 @@ def render_output(fig, df, text, key_prefix: str = "out",
 
 
 def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> bool:
-    """
-    Send command results matching the FalconX format:
-    1. Table image sent first (with summary banner if present)
-    2. Charts sent with dynamic layout titles as captions
-    3. Fallback text block if image generation fails
-    """
+    """Send command results matching the FalconX bot format: Table first, then titled charts."""
     ok = False
     caption_base = f"{asset} /{cmd_name}"
     figs = fig if isinstance(fig, list) else ([fig] if fig is not None else [])
 
     # 1. Send Table Image First
     if df is not None and not getattr(df, "empty", True):
-        has_header = bool(text) and any(
-            c in df.columns for c in ("ATM σ%", "RV%", "Basis % (1Y APR)", "Basis %", "4hr Chg")
-        )
-        
-        # Calls the function in lib/fx_style.py
-        png = fx_style.dataframe_to_table_image(df, header_text=text if has_header else None)
+        # Uses your original fx_style engine, but now it won't fail because kaleido is installed
+        png = fx_style.dataframe_to_table_image(df, header_text=text or caption_base)
         
         if png:
-            caption = f"<b>{caption_base}</b>" if has_header else caption_base
             try:
-                sent = telegram.send_photo(png, caption, parse_mode="HTML")
+                sent = telegram.send_photo(png, f"<b>{caption_base}</b>", parse_mode="HTML")
             except TypeError:
-                sent = telegram.send_photo(png, caption)
+                sent = telegram.send_photo(png, caption_base)
             if sent:
                 ok = True
         else:
-            # Fallback to monospace text block if image rendering fails
+            # Fallback if image generation fails
             msg = f"<b>{caption_base}</b>\n<pre>{df.to_string(index=False)}</pre>"
             if telegram.send_message(msg):
                 ok = True
 
-    # 2. Send Charts with Specific Titles as Captions
+    # 2. Send Charts with Layout Titles
     for f in figs:
         if f is None:
             continue
@@ -209,13 +199,14 @@ def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> bool:
             if sent:
                 ok = True
 
-    # 3. Fallback Text
+    # 3. Fallback text if no charts or table were produced
     if not figs and (df is None or getattr(df, "empty", True)) and text:
         msg = f"<b>{caption_base}</b>\n\n{text}"
         if telegram.send_message(msg):
             ok = True
 
     return ok
+
 
 def run_reports(assets: list[str], cmd_names: list[str], target_days: int) -> dict:
     results = {}
