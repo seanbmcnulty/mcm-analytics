@@ -6,6 +6,7 @@ streamlit>=1.35.0
 requests>=2.31.0
 numpy>=1.26.0
 pandas>=2.1.0
+matplotlib>=3.7.0
 scipy>=1.11.0
 plotly>=5.18.0
 arch>=6.2.0
