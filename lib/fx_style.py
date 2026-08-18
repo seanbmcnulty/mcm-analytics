@@ -23,8 +23,10 @@ PURPLE = "#7B1FA2"
 
 TEMPLATE = "plotly_white"
 TIME_TICKFORMAT = "%d-%b %H:%M"
-XAXIS_TIME = "Time (SGT)"
+# All timestamps are displayed in this zone.
+DISPLAY_TZ = "Asia/Singapore"
 DISPLAY_TZ_LABEL = "SGT"
+XAXIS_TIME = "Time (SGT)"
 EXPIRY_LABEL_FONT_SIZE = 12
 
 # ---------------------------------------------------------------------------
@@ -68,46 +70,60 @@ _TBL_BLANK = "–"
 # Timezone Helpers
 # ---------------------------------------------------------------------------
 
-def local_now() -> datetime:
-    """Return current UTC time."""
-    return datetime.now(timezone.utc)
+def local_now() -> "pd.Timestamp":
+    """Current wall-clock time in the display zone (Asia/Singapore)."""
+    return pd.Timestamp.now(tz="UTC").tz_convert(DISPLAY_TZ)
 
 
-def to_local(dt):
-    """Convert datetime object to display format or timezone."""
-    if dt is None:
-        return None
-    return dt
-
-
-def to_local_ts(idx):
-    """Convert DatetimeIndex or Series timestamps for chart display."""
-    if idx is None or (hasattr(idx, "__len__") and len(idx) == 0):
-        return idx
+def to_local(index) -> pd.Index:
+    """Convert a UTC datetime index to the display zone, tz-naive for plotting."""
+    if index is None:
+        return index
     try:
-        if hasattr(idx, "tz"):
-            if idx.tz is None:
-                return idx.tz_localize("UTC")
-            return idx.tz_convert("UTC")
-        return idx
+        idx = pd.DatetimeIndex(index)
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        return idx.tz_convert(DISPLAY_TZ).tz_localize(None)
     except Exception:
-        return idx
+        return index
+
+
+def to_local_ts(ts):
+    """Convert a single timestamp to the display zone (tz-naive)."""
+    if ts is None:
+        return ts
+    try:
+        t = pd.Timestamp(ts)
+        if t.tz is None:
+            t = t.tz_localize("UTC")
+        return t.tz_convert(DISPLAY_TZ).tz_localize(None)
+    except Exception:
+        return pd.Timestamp(ts)
 
 
 # ---------------------------------------------------------------------------
 # Chart Theming & Watermarking
 # ---------------------------------------------------------------------------
 
-def add_watermark(fig: go.Figure) -> None:
-    """Optional watermark hook for charts (clean/no-op)."""
-    return
+def add_watermark(fig: go.Figure, text: str = "MCM Analytics") -> None:
+    """Faint branding mark, pinned to the top-right of the header block."""
+    if fig is None:
+        return
+    try:
+        fig.add_annotation(
+            x=1.0, y=1.0, xref="paper", yref="paper",
+            xanchor="right", yanchor="bottom", text=text, showarrow=False,
+            font=dict(size=10, color="rgba(138,138,138,0.65)"),
+        )
+    except Exception:
+        pass
 
 
 def apply_theme(fig: go.Figure, theme: str = "auto") -> go.Figure:
     """Apply standard clean styling and template to a Plotly figure."""
     if fig is None:
         return None
-    
+
     fig.update_layout(
         template=TEMPLATE,
         font=dict(family=_TBL_FONT_FAMILY, color=_TBL_TEXT),
@@ -117,19 +133,48 @@ def apply_theme(fig: go.Figure, theme: str = "auto") -> go.Figure:
     return fig
 
 
-def finalize(fig: go.Figure, height: int = 450, title: str = None, **kwargs) -> go.Figure:
-    """Apply final sizing and layout adjustments, safely ignoring extra kwargs like legend_rows."""
+def _title_text(fig) -> str:
+    """Read a figure's current title text across plotly/stub layout shapes."""
+    try:
+        t = fig.layout.title
+        if t is None:
+            return ""
+        text = getattr(t, "text", None)
+        if text is None and isinstance(t, dict):
+            text = t.get("text")
+        return text or ""
+    except Exception:
+        return ""
+
+
+def finalize(fig: go.Figure, note: str = None, legend_rows: int = 1,
+             extra_top: int = 0, keep_margin: bool = False, **kwargs) -> go.Figure:
+    """
+    Lay out the header block so the title, note and legend never collide.
+    Folds an optional reconstruction note into the title (as a smaller
+    second line) instead of a floating annotation, and grows the top
+    margin to fit the legend when it wraps to multiple rows.
+    """
     if fig is None:
         return None
-    
-    layout_update = dict(
-        height=height,
-        template=TEMPLATE,
-    )
-    if title:
-        layout_update["title"] = title
-        
-    fig.update_layout(**layout_update)
+    try:
+        if note:
+            base = _title_text(fig)
+            marker = "<span style='font-size:11px"
+            if marker not in base:
+                fig.update_layout(title=dict(
+                    text=f"{base}<br><span style='font-size:11px;color:#8a8a8a'>{note}</span>",
+                    x=0.0, xanchor="left", y=0.985, yanchor="top"))
+        rows = max(1, int(legend_rows))
+        if not keep_margin:
+            top = 52 + 24 * rows + (22 if note else 0) + int(extra_top)
+            fig.update_layout(margin=dict(t=top))
+        fig.update_layout(legend=dict(
+            orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0,
+            font=dict(size=11)))
+        add_watermark(fig)
+    except Exception:
+        pass
     return fig
 
 

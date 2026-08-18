@@ -25,6 +25,7 @@ from lib.vol_math import (
     yang_zhang_vol, rogers_satchell_vol, compute_rv_matrix, RV_ESTIMATORS,
 )
 from lib.telegram import send_message, send_photo, is_configured
+from lib import fx_style
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -251,7 +252,8 @@ for col, (asset, df) in zip(matrix_cols, ohlc_data.items()):
             yaxis_title="",
             title=f"{asset} Realized Vol Matrix",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        fx_style.add_watermark(fig)
+        st.plotly_chart(fx_style.apply_theme(fig), width="stretch")
 
 # ---------------------------------------------------------------------------
 # Time series chart
@@ -284,7 +286,8 @@ fig_ts.update_layout(
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
     hovermode="x unified",
 )
-st.plotly_chart(fig_ts, use_container_width=True)
+fx_style.add_watermark(fig_ts)
+st.plotly_chart(fx_style.apply_theme(fig_ts), width="stretch")
 
 # ---------------------------------------------------------------------------
 # Current RV summary table
@@ -304,7 +307,7 @@ if not summary_df.empty:
     pivot_summary = summary_df.pivot(index="Estimator", columns="Asset", values="30d RV (%)")
     st.dataframe(
         pivot_summary.style.format("{:.1f}%").background_gradient(cmap="YlOrRd", axis=None),
-        use_container_width=True,
+        width="stretch",
     )
 
 # ---------------------------------------------------------------------------
@@ -321,7 +324,7 @@ else:
         # Build text report
         lines = ["<b>Realized Volatility Matrix</b>"]
         lines.append(f"Timeframe: {timeframe} | Lookback: {lookback_label}")
-        lines.append(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+        lines.append(f"Generated: {fx_style.local_now():%Y-%m-%d %H:%M} {fx_style.DISPLAY_TZ_LABEL}")
         lines.append("")
 
         for asset, matrix in matrices.items():
@@ -344,5 +347,5 @@ else:
 
 st.caption(
     f"Data: Deribit TradingView OHLC (perpetual) | "
-    f"Last refresh: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
+    f"Last refresh: {fx_style.local_now():%H:%M:%S} {fx_style.DISPLAY_TZ_LABEL}"
 )

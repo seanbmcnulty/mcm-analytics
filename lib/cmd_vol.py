@@ -46,6 +46,56 @@ def _row_to_map(row: pd.Series) -> dict[float, float]:
     return {float(c): float(row[c]) for c in row.index if _finite(row.get(c))}
 
 
+def _fmt_ago(delta: timedelta) -> str:
+    """Human label for an elapsed time, e.g. '6d Ago', '18h Ago'."""
+    hours = delta.total_seconds() / 3600.0
+    if hours < 1:
+        return "<1h Ago"
+    if hours < 36:
+        return f"{round(hours)}h Ago"
+    days = hours / 24.0
+    if days < 45:
+        return f"{round(days)}d Ago"
+    return f"{round(days / 30.0)}mo Ago"
+
+
+def _lookback_points(frame: pd.DataFrame, now: datetime,
+                     requests: list[tuple[str, timedelta]],
+                     min_gap_hours: float = 6.0):
+    """
+    Resolve fixed lookback requests (e.g. 24h/1w/1m ago) against ``frame``,
+    relabeling honestly when the history doesn't reach back that far and
+    dropping requests that would otherwise re-plot the same underlying row
+    under a second, wrong label.
+
+    ``requests`` must be ordered smallest delta first. Returns a list of
+    ``(display_label, style_key, ts, row)`` — ``display_label`` is the
+    original nice label when the nearest row is reasonably close to the
+    requested horizon, otherwise the actual elapsed time (e.g. "3d Ago"
+    standing in for "1 Week Ago"). ``style_key`` is always the original
+    nominal label, so callers can still key a fixed color/dash per bucket
+    regardless of how the point ended up labeled. ``ts`` is the row's actual
+    timestamp, for callers that need to pair it with a second series (e.g.
+    matching a put frame to the same real moment as a resolved call frame).
+    """
+    out: list[tuple[str, str, pd.Timestamp, pd.Series]] = []
+    seen_ts: list[pd.Timestamp] = []
+    if frame is None or frame.empty:
+        return out
+    for label, delta in requests:
+        row, ts = history.surface_row_near(frame, now - delta)
+        if row is None or ts is None:
+            continue
+        if any(abs((ts - s).total_seconds()) < min_gap_hours * 3600 for s in seen_ts):
+            continue  # same underlying snapshot as an already-accepted, closer request
+        gap = abs((pd.Timestamp(ts) - pd.Timestamp(now - delta)).total_seconds())
+        tolerance = delta.total_seconds() * 0.25 + 6 * 3600
+        use_label = label if gap <= tolerance else _fmt_ago(now - ts)
+        out.append((use_label, label, pd.Timestamp(ts), row))
+        seen_ts.append(pd.Timestamp(ts))
+    return out
+
+
 # ===========================================================================
 # 1. Vol term structure
 # ===========================================================================
@@ -67,17 +117,16 @@ def cmd_vol_term_structure(asset: str, **kwargs):
     fig = go.Figure()
     x_cat = [(now.date() + timedelta(days=int(d))).strftime("%d-%b") for d in dtes]
 
-    series: list[tuple[str, dict[float, float]]] = [("Current", live)]
-    if frame is not None and not frame.empty:
-        for label, delta in (("24h Ago", timedelta(hours=24)),
-                             ("1 Week Ago", timedelta(days=7)),
-                             ("1 Month Ago", timedelta(days=30))):
-            row = history.surface_row_at(frame, now - delta)
-            if row is not None:
-                series.append((label, _row_to_map(row)))
+    series: list[tuple[str, str, dict[float, float]]] = [("Current", "Current", live)]
+    for label, style_key, _ts, row in _lookback_points(frame, now, [
+        ("24h Ago", timedelta(hours=24)),
+        ("1 Week Ago", timedelta(days=7)),
+        ("1 Month Ago", timedelta(days=30)),
+    ]):
+        series.append((label, style_key, _row_to_map(row)))
 
-    for label, vals in series:
-        style = TERM_STRUCTURE_SERIES_STYLE.get(label, TERM_STRUCTURE_SERIES_STYLE["Current"])
+    for label, style_key, vals in series:
+        style = TERM_STRUCTURE_SERIES_STYLE.get(style_key, TERM_STRUCTURE_SERIES_STYLE["Current"])
         y = [_pct(surface.interp_at_dte(vals, float(d))) for d in dtes]
         is_current = label == "Current"
         name = label if (is_current or not estimated) else f"{label} (est.)"
@@ -123,19 +172,22 @@ def cmd_skew_term_structure(asset: str, **kwargs):
     fp, _, _ = history.surface_history(asset, "deltaPut25", days=35)
 
     fig = go.Figure()
-    entries: list[tuple[str, dict[float, float], dict[float, float]]] = [
-        ("Current", call, put)]
+    entries: list[tuple[str, str, dict[float, float], dict[float, float]]] = [
+        ("Current", "Current", call, put)]
     if fc is not None and fp is not None and not fc.empty and not fp.empty:
-        for label, delta in (("24h Ago", timedelta(hours=24)),
-                             ("1 Week Ago", timedelta(days=7)),
-                             ("1 Month Ago", timedelta(days=30))):
-            rc = history.surface_row_at(fc, now - delta)
-            rp = history.surface_row_at(fp, now - delta)
-            if rc is not None and rp is not None:
-                entries.append((label, _row_to_map(rc), _row_to_map(rp)))
+        for label, style_key, ts, rc in _lookback_points(fc, now, [
+            ("24h Ago", timedelta(hours=24)),
+            ("1 Week Ago", timedelta(days=7)),
+            ("1 Month Ago", timedelta(days=30)),
+        ]):
+            # Pair the put frame to the SAME actual moment as the resolved
+            # call row, not a fresh (and possibly differently-aged) lookup.
+            rp, _ = history.surface_row_near(fp, ts)
+            if rp is not None:
+                entries.append((label, style_key, _row_to_map(rc), _row_to_map(rp)))
 
-    for label, cmap, pmap in entries:
-        style = TERM_STRUCTURE_SERIES_STYLE.get(label, TERM_STRUCTURE_SERIES_STYLE["Current"])
+    for label, style_key, cmap, pmap in entries:
+        style = TERM_STRUCTURE_SERIES_STYLE.get(style_key, TERM_STRUCTURE_SERIES_STYLE["Current"])
         y = []
         for d in dtes:
             c = surface.interp_at_dte(cmap, float(d))
@@ -190,20 +242,34 @@ def build_vol_surface_figure(asset: str, dte: int) -> go.Figure | None:
 
     cloud: dict[int, tuple[float, float]] = {}
     cloud_days = 0
+    snap_style_key: dict[str, str] = {}
     if hist_maps:
+        ref_frame = hist_maps["delta50"] if "delta50" in hist_maps else next(iter(hist_maps.values()))
+        seen_ts: list[pd.Timestamp] = []
         for label, delta in (("Yesterday", timedelta(hours=24)),
                              ("Week Ago", timedelta(days=7)),
                              ("1 Month Ago", timedelta(days=30))):
+            _, ref_ts = history.surface_row_near(ref_frame, now - delta)
+            if ref_ts is None:
+                continue
+            if any(abs((ref_ts - s).total_seconds()) < 6 * 3600 for s in seen_ts):
+                continue  # same underlying snapshot as an already-accepted, closer label
+            gap = abs((pd.Timestamp(ref_ts) - pd.Timestamp(now - delta)).total_seconds())
+            tolerance = delta.total_seconds() * 0.25 + 6 * 3600
+            disp_label = label if gap <= tolerance else _fmt_ago(now - ref_ts)
+
             pts: dict[int, float] = {}
             for key, frame in hist_maps.items():
-                row = history.surface_row_at(frame, now - delta)
+                row, _ts = history.surface_row_near(frame, now - delta)
                 if row is None:
                     continue
                 v = surface.interp_at_dte(_row_to_map(row), float(dte))
                 if _finite(v) and v > 0:
                     pts[surface.DELTA_X_MAP[key]] = _pct(v)
             if len(pts) >= 3:
-                snaps[label] = pts
+                snaps[disp_label] = pts
+                snap_style_key[disp_label] = label
+                seen_ts.append(pd.Timestamp(ref_ts))
         # High/low band across the whole window.
         for key, frame in hist_maps.items():
             x = surface.DELTA_X_MAP[key]
@@ -233,10 +299,11 @@ def build_vol_surface_figure(asset: str, dte: int) -> go.Figure | None:
                                  hoverinfo="skip", showlegend=True,
                                  name=f"High–Low ({cloud_days}d)"))
 
-    for label, style in SMILE_SNAPSHOT_STYLE.items():
-        pts = snaps.get(label)
+    for label, pts in snaps.items():
         if not pts or len(pts) < 3:
             continue
+        style_key = snap_style_key.get(label, label)
+        style = SMILE_SNAPSHOT_STYLE.get(style_key, SMILE_SNAPSHOT_STYLE["Current"])
         xs = sorted(pts)
         name = label if label == "Current" or not estimated else f"{label} (est.)"
         fig.add_trace(go.Scatter(
@@ -270,8 +337,9 @@ def build_vol_surface_figure(asset: str, dte: int) -> go.Figure | None:
     rr = (c25 - p25) if (_finite(c25) and _finite(p25)) else None
     if rr is not None:
         delta_txt = ""
-        for lbl, tag in (("Week Ago", "1w"), ("Yesterday", "1d"), ("1 Month Ago", "1m")):
-            prior = snaps.get(lbl)
+        style_key_to_label = {v: k for k, v in snap_style_key.items()}
+        for style_key, tag in (("Week Ago", "1w"), ("Yesterday", "1d"), ("1 Month Ago", "1m")):
+            prior = snaps.get(style_key_to_label.get(style_key, style_key))
             if prior and 25 in prior and 75 in prior:
                 delta_txt = f" ({tag} {rr - (prior[25] - prior[75]):+.1f})"
                 break

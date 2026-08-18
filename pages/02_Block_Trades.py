@@ -24,6 +24,8 @@ import requests
 from scipy.stats import norm
 import streamlit as st
 
+from lib import fx_style
+
 # ---------------------------------------------------------------------------
 # Page Config & Styles
 # ---------------------------------------------------------------------------
@@ -399,6 +401,8 @@ def plot_scatter_with_spot_and_dvol(data, hist_spot, dvol_series, current_spot, 
     fig = go.Figure()
     if data.empty:
         fig.update_layout(title=f'{asset} Block Trades Over Time: No Data')
+        fx_style.add_watermark(fig)
+        fig = fx_style.apply_theme(fig)
         return fig
 
     df = data.copy()
@@ -475,6 +479,8 @@ def plot_scatter_with_spot_and_dvol(data, hist_spot, dvol_series, current_spot, 
         layout['yaxis3'] = dict(title='DVOL', overlaying='y', side='right', position=0.95, showgrid=False, autorange=True)
 
     fig.update_layout(**layout)
+    fx_style.add_watermark(fig)
+    fig = fx_style.apply_theme(fig)
     return fig
 
 def plot_strike_vs_expiry(data, asset, size_multiplier=1.0):
@@ -544,6 +550,8 @@ def plot_strike_vs_expiry(data, asset, size_multiplier=1.0):
         height=500,
         margin=dict(l=40, r=40, t=40, b=40)
     )
+    fx_style.add_watermark(fig)
+    fig = fx_style.apply_theme(fig)
     return fig
 
 def plot_net_heatmap(data, asset):
@@ -572,6 +580,8 @@ def plot_net_heatmap(data, asset):
         height=400,
         margin=dict(l=40, r=40, t=40, b=40)
     )
+    fx_style.add_watermark(fig)
+    fig = fx_style.apply_theme(fig)
     return fig
 
 def plot_gross_volume_heatmap(data, asset):
@@ -600,6 +610,8 @@ def plot_gross_volume_heatmap(data, asset):
         height=400,
         margin=dict(l=40, r=40, t=40, b=40)
     )
+    fx_style.add_watermark(fig)
+    fig = fx_style.apply_theme(fig)
     return fig
 
 def plot_cumulative_flow(data, asset):
@@ -631,6 +643,8 @@ def plot_cumulative_flow(data, asset):
         height=400,
         margin=dict(l=40, r=40, t=40, b=40)
     )
+    fx_style.add_watermark(fig)
+    fig = fx_style.apply_theme(fig)
     return fig
 
 # ---------------------------------------------------------------------------
@@ -698,14 +712,14 @@ for idx, asset in enumerate(ASSETS):
         # 1. Scatter with Spot & DVOL
         st.plotly_chart(
             plot_scatter_with_spot_and_dvol(df_asset, hist_spot, dvol_s, spot_px, clean_name, m_size),
-            use_container_width=True,
+            width="stretch",
             key=f"tab_scatter_{asset}"
         )
         
         # 2. Strike vs Expiry
         st.plotly_chart(
             plot_strike_vs_expiry(df_asset, clean_name, s_mult),
-            use_container_width=True,
+            width="stretch",
             key=f"tab_strike_expiry_{asset}"
         )
         
@@ -714,20 +728,20 @@ for idx, asset in enumerate(ASSETS):
         with col1:
             st.plotly_chart(
                 plot_net_heatmap(df_asset, clean_name), 
-                use_container_width=True,
+                width="stretch",
                 key=f"tab_net_heatmap_{asset}"
             )
         with col2:
             st.plotly_chart(
                 plot_cumulative_flow(df_asset, clean_name), 
-                use_container_width=True,
+                width="stretch",
                 key=f"tab_cumulative_{asset}"
             )
             
         # 4. Gross Volume Heatmap
         st.plotly_chart(
             plot_gross_volume_heatmap(df_asset, clean_name), 
-            use_container_width=True,
+            width="stretch",
             key=f"tab_gross_volume_{asset}"
         )
 
@@ -743,7 +757,7 @@ with tabs[len(ASSETS)]:
             plot_scatter_with_spot_and_dvol(
                 asset_data_dict['BTC'], hist_spot_dict['BTC'], dvol_dict['BTC'], spot_dict['BTC'], 'BTC', 0.15
             ), 
-            use_container_width=True,
+            width="stretch",
             key="grid_scatter_btc"
         )
     with c2:
@@ -751,7 +765,7 @@ with tabs[len(ASSETS)]:
             plot_scatter_with_spot_and_dvol(
                 asset_data_dict['ETH'], hist_spot_dict['ETH'], dvol_dict['ETH'], spot_dict['ETH'], 'ETH', 0.5/15
             ), 
-            use_container_width=True,
+            width="stretch",
             key="grid_scatter_eth"
         )
         
@@ -761,7 +775,7 @@ with tabs[len(ASSETS)]:
             plot_scatter_with_spot_and_dvol(
                 asset_data_dict['SOL_USDC'], hist_spot_dict['SOL_USDC'], pd.Series(dtype=float), spot_dict['SOL_USDC'], 'SOL', 0.5/150
             ), 
-            use_container_width=True,
+            width="stretch",
             key="grid_scatter_sol"
         )
     with c4:
@@ -769,7 +783,7 @@ with tabs[len(ASSETS)]:
             plot_scatter_with_spot_and_dvol(
                 asset_data_dict['XRP_USDC'], hist_spot_dict['XRP_USDC'], pd.Series(dtype=float), spot_dict['XRP_USDC'], 'XRP', 0.5/1500
             ), 
-            use_container_width=True,
+            width="stretch",
             key="grid_scatter_xrp"
         )
 
@@ -788,6 +802,6 @@ with tabs[len(ASSETS) + 1]:
                 exp_table = create_expiry_table(df_asset)
                 st.subheader(f"{clean} Greeks & Volume by Expiry")
                 # Keys are not required for st.dataframe
-                st.dataframe(style_statistics_table(exp_table), use_container_width=True)
+                st.dataframe(style_statistics_table(exp_table), width="stretch")
             else:
                 st.info(f"No block trades found for {clean} in the selected time range.")

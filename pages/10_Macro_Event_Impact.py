@@ -20,6 +20,7 @@ import streamlit as st
 
 from lib.deribit import get_tradingview_ohlc, get_dvol
 from lib.constants import ASSET_CONFIG, ASSET_COLORS, PLOTLY_LAYOUT
+from lib import fx_style
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -315,7 +316,7 @@ st.dataframe(
         vmin=-3,
         vmax=3,
     ),
-    use_container_width=True,
+    width="stretch",
     height=min(400, 35 * len(display_df) + 38),
 )
 
@@ -398,7 +399,8 @@ else:
             legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
             height=500,
         )
-        st.plotly_chart(fig_individual, use_container_width=True)
+        fx_style.add_watermark(fig_individual)
+        st.plotly_chart(fx_style.apply_theme(fig_individual), width="stretch")
         st.caption(
             "Green = bullish surprise (z > 0.5), Red = bearish surprise (z < -0.5), "
             "Gray = neutral."
@@ -478,7 +480,8 @@ else:
                 ),
                 height=450,
             )
-            st.plotly_chart(fig_avg, use_container_width=True)
+            fx_style.add_watermark(fig_avg)
+            st.plotly_chart(fx_style.apply_theme(fig_avg), width="stretch")
 
         st.divider()
 
@@ -545,7 +548,8 @@ else:
                     yaxis_title="Price Move at T+2h (%)",
                     height=400,
                 )
-                st.plotly_chart(fig_s2h, use_container_width=True)
+                fx_style.add_watermark(fig_s2h)
+                st.plotly_chart(fx_style.apply_theme(fig_s2h), width="stretch")
 
             with col_24h:
                 fig_s24h = go.Figure()
@@ -570,7 +574,8 @@ else:
                     yaxis_title="Price Move at T+24h (%)",
                     height=400,
                 )
-                st.plotly_chart(fig_s24h, use_container_width=True)
+                fx_style.add_watermark(fig_s24h)
+                st.plotly_chart(fx_style.apply_theme(fig_s24h), width="stretch")
 
         st.divider()
 
@@ -649,7 +654,8 @@ else:
                 ),
                 height=450,
             )
-            st.plotly_chart(fig_dvol, use_container_width=True)
+            fx_style.add_watermark(fig_dvol)
+            st.plotly_chart(fx_style.apply_theme(fig_dvol), width="stretch")
             st.caption(
                 "Orange = large surprise (|z| > 1.0), Gray = small/no surprise."
             )
@@ -683,7 +689,8 @@ else:
                 yaxis_title="Avg DVOL Change (pts)",
                 height=350,
             )
-            st.plotly_chart(fig_avg_dvol, use_container_width=True)
+            fx_style.add_watermark(fig_avg_dvol)
+            st.plotly_chart(fx_style.apply_theme(fig_avg_dvol), width="stretch")
         else:
             st.info(
                 "No DVOL data available for the selected events. "
@@ -725,7 +732,7 @@ if summary_rows:
             {"Avg Surprise": "{:.3f}", "Std Surprise": "{:.3f}"},
             na_rep="—",
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 

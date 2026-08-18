@@ -18,6 +18,7 @@ import time
 from lib.deribit import get_dvol, get_tradingview_ohlc, get_index_price
 from lib.constants import ASSET_CONFIG, ASSET_COLORS, PLOTLY_LAYOUT
 from lib.telegram import send_photo, is_configured
+from lib import fx_style
 
 st.set_page_config(page_title="Spot-Vol Correlation", page_icon="📈", layout="wide")
 st.title("📈 Spot-Vol Correlation")
@@ -137,7 +138,8 @@ fig1.update_layout(
     yaxis2_title="DVOL (%)",
     legend=dict(x=0.01, y=0.99),
 )
-st.plotly_chart(fig1, use_container_width=True)
+fx_style.add_watermark(fig1)
+st.plotly_chart(fx_style.apply_theme(fig1), width="stretch")
 
 # ---------------------------------------------------------------------------
 # Chart 2: Rolling Correlation
@@ -163,7 +165,8 @@ fig2.update_layout(
     yaxis_title="Correlation",
     yaxis_range=[-1, 1],
 )
-st.plotly_chart(fig2, use_container_width=True)
+fx_style.add_watermark(fig2)
+st.plotly_chart(fx_style.apply_theme(fig2), width="stretch")
 
 # ---------------------------------------------------------------------------
 # Chart 3: Scatter plot (spot return vs dvol change)
@@ -209,7 +212,8 @@ fig3.update_layout(
     xaxis_title="Spot Daily Return (%)",
     yaxis_title="DVOL Daily Change (pts)",
 )
-st.plotly_chart(fig3, use_container_width=True)
+fx_style.add_watermark(fig3)
+st.plotly_chart(fx_style.apply_theme(fig3), width="stretch")
 
 # ---------------------------------------------------------------------------
 # Statistics Table
@@ -237,7 +241,7 @@ stats = {
         f"{merged['spot_return'].mean() * 100:.3f}%",
     ],
 }
-st.dataframe(pd.DataFrame(stats), use_container_width=True, hide_index=True)
+st.dataframe(pd.DataFrame(stats), width="stretch", hide_index=True)
 
 # ---------------------------------------------------------------------------
 # Telegram Blast

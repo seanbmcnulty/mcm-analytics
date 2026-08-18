@@ -23,6 +23,7 @@ from lib.deribit import get_tradingview_ohlc, get_atm_iv_by_dte, get_index_price
 from lib.constants import ASSET_CONFIG, ASSETS, ASSET_COLORS, PLOTLY_LAYOUT
 from lib.vol_math import close_to_close_vol
 from lib.telegram import send_message, is_configured
+from lib import fx_style
 
 # Try to import arch for GARCH
 try:
@@ -368,7 +369,8 @@ fig_price.update_layout(
 fig_price.update_yaxes(title_text="Price (USD)", row=1, col=1)
 fig_price.update_yaxes(title_text="RV (%)", row=2, col=1)
 
-st.plotly_chart(fig_price, use_container_width=True)
+fx_style.add_watermark(fig_price)
+st.plotly_chart(fx_style.apply_theme(fig_price), width="stretch")
 
 # ---------------------------------------------------------------------------
 # IV vs RV spread
@@ -405,7 +407,8 @@ if iv_df is not None and not iv_df.empty:
             xaxis_title="Days to Expiry",
             yaxis_title="Volatility (%)",
         )
-        st.plotly_chart(fig_ivrv, use_container_width=True)
+        fx_style.add_watermark(fig_ivrv)
+        st.plotly_chart(fx_style.apply_theme(fig_ivrv), width="stretch")
 
     with iv_cols[1]:
         # IV-RV spread summary
@@ -471,7 +474,8 @@ if garch_result:
             xaxis_title="Days Ahead",
             yaxis_title="Annualized Vol (%)",
         )
-        st.plotly_chart(fig_garch, use_container_width=True)
+        fx_style.add_watermark(fig_garch)
+        st.plotly_chart(fx_style.apply_theme(fig_garch), width="stretch")
 
     with garch_cols[1]:
         st.markdown("**Model Parameters**")
@@ -504,7 +508,7 @@ else:
     if st.button("Send Regime Report to Telegram", type="primary"):
         lines = [f"<b>{selected_asset} Volatility Regime Report</b>"]
         lines.append(
-            f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+            f"Generated: {fx_style.local_now():%Y-%m-%d %H:%M} {fx_style.DISPLAY_TZ_LABEL}"
         )
         lines.append("")
         lines.append(f"Regime: <b>{regime}</b>")
@@ -538,5 +542,5 @@ else:
 
 st.caption(
     f"Data: Deribit 1D OHLC ({ASSET_CONFIG[selected_asset]['perp']}) | "
-    f"Last refresh: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
+    f"Last refresh: {fx_style.local_now():%H:%M:%S} {fx_style.DISPLAY_TZ_LABEL}"
 )

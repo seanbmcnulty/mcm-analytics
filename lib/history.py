@@ -334,6 +334,29 @@ def surface_row_at(frame: pd.DataFrame, when: datetime) -> pd.Series | None:
     return frame.iloc[idx]
 
 
+def surface_row_near(frame: pd.DataFrame,
+                     when: datetime) -> tuple[pd.Series | None, pd.Timestamp | None]:
+    """
+    Same nearest-match lookup as ``surface_row_at``, but also returns the
+    timestamp the row actually came from.
+
+    ``get_indexer(..., method="nearest")`` always returns *some* row, even
+    when the frame doesn't reach back anywhere near ``when`` (e.g. asking for
+    a month ago when only three days of history exist). Callers that label
+    the result with a fixed period ("1 Month Ago") need the real timestamp
+    to relabel honestly and to de-duplicate requests that all resolve to the
+    same earliest row.
+    """
+    if frame is None or frame.empty:
+        return None, None
+    try:
+        idx = frame.index.get_indexer([pd.Timestamp(when)], method="nearest")[0]
+    except Exception:
+        return None, None
+    idx = max(0, min(int(idx), len(frame) - 1))
+    return frame.iloc[idx], frame.index[idx]
+
+
 def iv_series_at_dte(asset: str, dte: int, delta_key: str = "delta50",
                      days: int = 30) -> tuple[pd.Series | None, bool, str]:
     """Historical IV (vol points) for one tenor of one delta bucket."""
