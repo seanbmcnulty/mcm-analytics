@@ -249,10 +249,11 @@ with st.sidebar:
         _history.clear_cache()
         st.rerun()
 
-try:
-    history.record_snapshot(ASSETS[0])
-except Exception:
-    pass
+for _asset in ASSETS:
+    try:
+        history.record_snapshot(_asset)
+    except Exception:
+        pass
 
 st.title("🤖 MCM Bot")
 st.caption("Crypto derivatives analytics · Deribit public API · "
