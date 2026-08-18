@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import time
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -61,7 +60,7 @@ st.markdown("""
 st.markdown('<div class="main-header"><h1>📊 BLOCK TRADES - DERIBIT</h1></div>', unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants & Layout Settings
 # ---------------------------------------------------------------------------
 SGT = timezone(timedelta(hours=8))
 BACKGROUND_COLOR = '#FFFFFF'
@@ -80,6 +79,13 @@ DEFAULT_MIN_SIZES = {
 }
 
 ASSETS = list(DEFAULT_MIN_SIZES.keys())
+
+PLOTLY_LAYOUT = dict(
+    paper_bgcolor=BACKGROUND_COLOR,
+    plot_bgcolor=BACKGROUND_COLOR,
+    font=dict(color=TEXT_COLOR),
+    margin=dict(l=40, r=40, t=40, b=40)
+)
 
 # ---------------------------------------------------------------------------
 # Sidebar Controls
@@ -173,23 +179,28 @@ def fetch_public_trades(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
 
     df = pd.DataFrame(all_trades)
     
-    # Filter by instrument prefix for USDC settled
+    # Filter by instrument prefix for USDC settled (SOL, XRP, AVAX, HYPE, TRX)
     if "_USDC" in asset:
         prefix = f"{asset}-"
-        df = df[df['instrument_name'].str.startswith(prefix)].copy()
+        if "instrument_name" in df.columns:
+            df = df[df['instrument_name'].str.startswith(prefix)].copy()
 
     if df.empty:
         return pd.DataFrame()
 
     # Parse details
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert(SGT)
-    df['abs_amount'] = df['amount'].abs()
-    df['amount'] = np.where(df['direction'] == 'buy', df['abs_amount'], -df['abs_amount'])
+    if "timestamp" in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert(SGT)
+    
+    if "amount" in df.columns:
+        df['abs_amount'] = df['amount'].abs()
+        df['amount'] = np.where(df['direction'] == 'buy', df['abs_amount'], -df['abs_amount'])
     
     # Parse strikes and expiries
-    df['strike'] = pd.to_numeric(df['instrument_name'].str.extract(r'-(\d+(?:\.\d+)*)-')[0], errors='coerce')
-    df['expiry'] = pd.to_datetime(df['instrument_name'].str.extract(r'^[^-]*-([0-9]{1,2}[A-Z]{3}[0-9]{2})-')[0], format='%d%b%y', errors='coerce')
-    df['option_type'] = df['instrument_name'].str.extract(r'-(C|P)$')[0]
+    if "instrument_name" in df.columns:
+        df['strike'] = pd.to_numeric(df['instrument_name'].str.extract(r'-(\d+(?:\.\d+)*)-')[0], errors='coerce')
+        df['expiry'] = pd.to_datetime(df['instrument_name'].str.extract(r'^[^-]*-([0-9]{1,2}[A-Z]{3}[0-9]{2})-')[0], format='%d%b%y', errors='coerce')
+        df['option_type'] = df['instrument_name'].str.extract(r'-(C|P)$')[0]
     
     if 'mark_price' not in df.columns and 'price' in df.columns:
         df['mark_price'] = df['price']
@@ -440,7 +451,8 @@ def plot_scatter_with_spot_and_dvol(data, hist_spot, dvol_series, current_spot, 
         yaxis2=dict(title='Historical Spot Price', overlaying='y', side='right', showgrid=False, autorange=True),
         paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-        height=600
+        height=600,
+        margin=dict(l=40, r=40, t=40, b=40)
     )
     if not dvol_series.empty:
         layout['yaxis3'] = dict(title='DVOL', overlaying='y', side='right', position=0.95, showgrid=False, autorange=True)
@@ -512,7 +524,8 @@ def plot_strike_vs_expiry(data, asset, size_multiplier=1.0):
         yaxis=dict(type='log', tickvals=ticks, ticktext=[f'{t:,.0f}' for t in ticks],
                    ticks='outside', showline=True, linewidth=1, linecolor='black', mirror=True),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-        height=500
+        height=500,
+        margin=dict(l=40, r=40, t=40, b=40)
     )
     return fig
 
@@ -539,7 +552,8 @@ def plot_net_heatmap(data, asset):
         title=f'{asset} Option Strike vs Expiry Net Flow Heatmap',
         xaxis_title='Strike', yaxis_title='Expiry',
         paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
-        height=400
+        height=400,
+        margin=dict(l=40, r=40, t=40, b=40)
     )
     return fig
 
@@ -566,7 +580,8 @@ def plot_gross_volume_heatmap(data, asset):
         title=f'{asset} Gross Volume Heatmap',
         xaxis_title='Strike', yaxis_title='Expiry',
         paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
-        height=400
+        height=400,
+        margin=dict(l=40, r=40, t=40, b=40)
     )
     return fig
 
@@ -596,7 +611,8 @@ def plot_cumulative_flow(data, asset):
         xaxis_title='Date (SGT)', yaxis_title='Contracts',
         paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-        height=400
+        height=400,
+        margin=dict(l=40, r=40, t=40, b=40)
     )
     return fig
 
@@ -644,7 +660,9 @@ def get_asset_multipliers(asset):
     if 'XRP' in asset: return 0.5/1500, 1.0/1500
     return 0.5/150, 1.0/150
 
-# Individual Asset Tabs
+# ---------------------------------------------------------------------------
+# Render Individual Asset Tabs
+# ---------------------------------------------------------------------------
 for idx, asset in enumerate(ASSETS):
     clean_name = asset.replace('_USDC', '')
     with tabs[idx]:
@@ -660,43 +678,84 @@ for idx, asset in enumerate(ASSETS):
         # 1. Scatter with Spot & DVOL
         st.plotly_chart(
             plot_scatter_with_spot_and_dvol(df_asset, hist_spot, dvol_s, spot_px, clean_name, m_size),
-            use_container_width=True
+            use_container_width=True,
+            key=f"tab_scatter_{asset}"
         )
         
         # 2. Strike vs Expiry
         st.plotly_chart(
             plot_strike_vs_expiry(df_asset, clean_name, s_mult),
-            use_container_width=True
+            use_container_width=True,
+            key=f"tab_strike_expiry_{asset}"
         )
         
         # 3. Heatmaps Side-by-Side
         col1, col2 = st.columns(2)
         with col1:
-            st.plotly_chart(plot_net_heatmap(df_asset, clean_name), use_container_width=True)
+            st.plotly_chart(
+                plot_net_heatmap(df_asset, clean_name), 
+                use_container_width=True,
+                key=f"tab_net_heatmap_{asset}"
+            )
         with col2:
-            st.plotly_chart(plot_cumulative_flow(df_asset, clean_name), use_container_width=True)
+            st.plotly_chart(
+                plot_cumulative_flow(df_asset, clean_name), 
+                use_container_width=True,
+                key=f"tab_cumulative_{asset}"
+            )
             
         # 4. Gross Volume Heatmap
-        st.plotly_chart(plot_gross_volume_heatmap(df_asset, clean_name), use_container_width=True)
+        st.plotly_chart(
+            plot_gross_volume_heatmap(df_asset, clean_name), 
+            use_container_width=True,
+            key=f"tab_gross_volume_{asset}"
+        )
 
-# ALL (2x2 Grid) Tab
+# ---------------------------------------------------------------------------
+# Render ALL (2x2 Grid) Tab
+# ---------------------------------------------------------------------------
 with tabs[len(ASSETS)]:
     st.markdown('<div class="asset-header">📊 ALL Block Trades Overview</div>', unsafe_allow_html=True)
     
-    grid_assets = ['BTC', 'ETH', 'SOL_USDC', 'XRP_USDC']
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(plot_scatter_with_spot_and_dvol(asset_data_dict['BTC'], hist_spot_dict['BTC'], dvol_dict['BTC'], spot_dict['BTC'], 'BTC', 0.15), use_container_width=True)
+        st.plotly_chart(
+            plot_scatter_with_spot_and_dvol(
+                asset_data_dict['BTC'], hist_spot_dict['BTC'], dvol_dict['BTC'], spot_dict['BTC'], 'BTC', 0.15
+            ), 
+            use_container_width=True,
+            key="grid_scatter_btc"
+        )
     with c2:
-        st.plotly_chart(plot_scatter_with_spot_and_dvol(asset_data_dict['ETH'], hist_spot_dict['ETH'], dvol_dict['ETH'], spot_dict['ETH'], 'ETH', 0.5/15), use_container_width=True)
+        st.plotly_chart(
+            plot_scatter_with_spot_and_dvol(
+                asset_data_dict['ETH'], hist_spot_dict['ETH'], dvol_dict['ETH'], spot_dict['ETH'], 'ETH', 0.5/15
+            ), 
+            use_container_width=True,
+            key="grid_scatter_eth"
+        )
         
     c3, c4 = st.columns(2)
     with c3:
-        st.plotly_chart(plot_scatter_with_spot_and_dvol(asset_data_dict['SOL_USDC'], hist_spot_dict['SOL_USDC'], pd.Series(dtype=float), spot_dict['SOL_USDC'], 'SOL', 0.5/150), use_container_width=True)
+        st.plotly_chart(
+            plot_scatter_with_spot_and_dvol(
+                asset_data_dict['SOL_USDC'], hist_spot_dict['SOL_USDC'], pd.Series(dtype=float), spot_dict['SOL_USDC'], 'SOL', 0.5/150
+            ), 
+            use_container_width=True,
+            key="grid_scatter_sol"
+        )
     with c4:
-        st.plotly_chart(plot_scatter_with_spot_and_dvol(asset_data_dict['XRP_USDC'], hist_spot_dict['XRP_USDC'], pd.Series(dtype=float), spot_dict['XRP_USDC'], 'XRP', 0.5/1500), use_container_width=True)
+        st.plotly_chart(
+            plot_scatter_with_spot_and_dvol(
+                asset_data_dict['XRP_USDC'], hist_spot_dict['XRP_USDC'], pd.Series(dtype=float), spot_dict['XRP_USDC'], 'XRP', 0.5/1500
+            ), 
+            use_container_width=True,
+            key="grid_scatter_xrp"
+        )
 
-# Statistics Tab
+# ---------------------------------------------------------------------------
+# Render Statistics Tab
+# ---------------------------------------------------------------------------
 with tabs[len(ASSETS) + 1]:
     st.markdown('<div class="asset-header">📋 Block Trade Statistics (Greeks & Expiry Breakdown)</div>', unsafe_allow_html=True)
     
@@ -708,6 +767,7 @@ with tabs[len(ASSETS) + 1]:
             if not df_asset.empty:
                 exp_table = create_expiry_table(df_asset)
                 st.subheader(f"{clean} Greeks & Volume by Expiry")
+                # Keys are not required for st.dataframe
                 st.dataframe(style_statistics_table(exp_table), use_container_width=True)
             else:
                 st.info(f"No block trades found for {clean} in the selected time range.")
