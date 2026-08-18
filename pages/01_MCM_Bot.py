@@ -158,26 +158,66 @@ def render_output(fig, df, text, key_prefix: str = "out",
 
 
 def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> bool:
-    """Send one command result. Charts are exported light for readability."""
+    """
+    Send command results matching the FalconX bot format:
+    1. Table image sent first (with summary banner if present)
+    2. Charts sent with their layout title as the caption
+    3. HTML formatting for message/caption delivery
+    """
     ok = False
-    caption = f"{asset} /{cmd_name}"
+    caption_base = f"{asset} /{cmd_name}"
     figs = fig if isinstance(fig, list) else ([fig] if fig is not None else [])
-    for i, f in enumerate(figs):
+
+    # 1. Table image first
+    if df is not None and not getattr(df, "empty", True):
+        has_header = bool(text) and any(
+            c in df.columns for c in ("ATM σ%", "RV%", "Basis % (1Y APR)", "Basis %", "4hr Chg")
+        )
+        
+        # Render table as image with top summary banner
+        png = fx_style.dataframe_to_table_image(df, header_text=text if has_header else None)
+        
+        if png:
+            caption = f"<b>{caption_base}</b>" if has_header else caption_base
+            # If your telegram wrapper supports parse_mode, pass parse_mode="HTML"
+            try:
+                sent = telegram.send_photo(png, caption, parse_mode="HTML")
+            except TypeError:
+                sent = telegram.send_photo(png, caption)
+            if sent:
+                ok = True
+        else:
+            # Fallback to monospace text block if table image generation fails
+            msg = f"<b>{caption_base}</b>\n<pre>{df.to_string(index=False)}</pre>"
+            if telegram.send_message(msg):
+                ok = True
+
+    # 2. Charts next (using each chart's title as the caption)
+    for f in figs:
         if f is None:
             continue
-        png = fx_style.fig_to_png(fx_style.apply_theme(f, "light"),
-                                  width=1200, height=800)
-        if png and telegram.send_photo(png, caption if i == 0 else ""):
-            ok = True
-    if df is not None and not getattr(df, "empty", True):
-        png = fx_style.dataframe_to_table_image(df, header_text=text or caption)
-        if png and telegram.send_photo(png, caption):
-            ok = True
-        elif png is None:
-            ok = telegram.send_message(
-                f"<b>{caption}</b>\n<pre>{df.to_string(index=False)}</pre>") or ok
+
+        # Extract title from the Plotly layout for dynamic captioning
+        title_obj = getattr(getattr(f, "layout", None), "title", None)
+        title_text = getattr(title_obj, "text", None) if title_obj else None
+        caption = str(title_text) if title_text else caption_base
+
+        # Render light theme chart
+        png = fx_style.fig_to_png(fx_style.apply_theme(f, "light"), width=1200, height=800)
+        if png:
+            try:
+                sent = telegram.send_photo(png, caption, parse_mode="HTML")
+            except TypeError:
+                sent = telegram.send_photo(png, caption)
+            if sent:
+                ok = True
+
+    # 3. Fallback text if no charts or table were produced
     if not figs and (df is None or getattr(df, "empty", True)) and text:
-        ok = telegram.send_message(f"<b>{caption}</b>\n{text}") or ok
+        msg = f"<b>{caption_base}</b>\n\n{text}"
+        if telegram.send_message(msg):
+            ok = True
+
     return ok
 
 
