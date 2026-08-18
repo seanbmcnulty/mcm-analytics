@@ -149,11 +149,10 @@ def get_current_spot(asset: str) -> float:
     url = f'https://deribit.com/api/v2/public/get_index_price?index_name={index_name}'
     try:
         r = requests.get(url, timeout=5)
-        time.sleep(0.1) # Pace API limit
+        time.sleep(0.15) # Pace API limit
         r.raise_for_status()
         return float(r.json()['result']['index_price'])
-    except Exception as e:
-        print(f"Error fetching spot for {asset}: {e}")
+    except Exception:
         return 0.0
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -170,13 +169,12 @@ def fetch_public_trades(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
     all_trades = []
     try:
         r = requests.get(url, timeout=10)
-        time.sleep(0.2) # Pace API limit
+        time.sleep(0.15) # Pace API limit safely
         r.raise_for_status()
         data = r.json()
         if 'result' in data and 'trades' in data['result']:
             all_trades = data['result']['trades']
-    except Exception as e:
-        print(f"Error fetching trades for {asset}: {e}")
+    except Exception:
         return pd.DataFrame()
 
     if not all_trades:
@@ -184,7 +182,7 @@ def fetch_public_trades(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
 
     df = pd.DataFrame(all_trades)
     
-    # Filter by instrument prefix for USDC settled
+    # Filter by instrument prefix for USDC settled (SOL, XRP, AVAX, HYPE, TRX)
     if "_USDC" in asset:
         prefix = f"{asset}-"
         if "instrument_name" in df.columns:
@@ -228,19 +226,20 @@ def fetch_historical_spot(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
         'instrument_name': instrument,
         'start_timestamp': start_ms,
         'end_timestamp': end_ms,
-        'resolution': '1'  # 1-minute resolution
+        'resolution': '5'  # 5-minute candles to safely avoid the 1000 limit
     }
     try:
         r = requests.get(url, params=params, timeout=10)
-        time.sleep(0.2) # Pace API limit
+        time.sleep(0.15) # Pace API limit safely
         r.raise_for_status()
         chart = r.json().get('result', {})
         if chart.get('status') == 'ok' and chart.get('ticks') and chart.get('close'):
             ts = pd.to_datetime(chart['ticks'], unit='ms', utc=True).dt.tz_convert(SGT)
             return pd.DataFrame({'timestamp': ts, 'close': chart['close']})
+        else:
+            print(f"Tradingview API did not return OK for {asset}: {chart}")
     except Exception as e:
         print(f"Error fetching historical spot for {asset}: {e}")
-        pass
     return pd.DataFrame()
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -260,7 +259,7 @@ def fetch_dvol(asset: str, start_dt_utc: datetime) -> pd.Series:
     }
     try:
         r = requests.get(url, params=params, timeout=10)
-        time.sleep(0.2) # Pace API limit
+        time.sleep(0.15) # Pace API limit safely
         r.raise_for_status()
         result = r.json().get('result', {})
         data = result.get('data', [])
@@ -270,8 +269,7 @@ def fetch_dvol(asset: str, start_dt_utc: datetime) -> pd.Series:
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert(SGT)
             df.set_index('timestamp', inplace=True)
             return df['close'].sort_index()
-    except Exception as e:
-        print(f"Error fetching DVOL for {asset}: {e}")
+    except Exception:
         pass
     return pd.Series(dtype=float)
 
@@ -384,12 +382,15 @@ def style_statistics_table(df: pd.DataFrame):
                 return ''
         return ''
 
-    # Handle pandas >= 2.1.0 .map() deprecation of .applymap()
-    styled = df_disp.style
-    try:
-        return styled.map(color_val, subset=['Delta', 'Vega', 'Gamma (1%)', 'Net Puts', 'Net Calls'])
-    except AttributeError:
-        return styled.applymap(color_val, subset=['Delta', 'Vega', 'Gamma (1%)', 'Net Puts', 'Net Calls'])
+    # Handle pandas >= 2.1.0 .map() deprecation safely
+    styler = df_disp.style
+    subset_cols = ['Delta', 'Vega', 'Gamma (1%)', 'Net Puts', 'Net Calls']
+    subset_cols = [c for c in subset_cols if c in df_disp.columns]
+    
+    if hasattr(styler, 'map'):
+        return styler.map(color_val, subset=subset_cols)
+    else:
+        return styler.applymap(color_val, subset=subset_cols)
 
 # ---------------------------------------------------------------------------
 # Plotting Functions (Deribit Style)
@@ -446,7 +447,7 @@ def plot_scatter_with_spot_and_dvol(data, hist_spot, dvol_series, current_spot, 
         hist_ts = hist_spot['timestamp'].dt.tz_localize(None)
         fig.add_trace(go.Scatter(
             x=hist_ts, y=hist_spot['close'], mode='lines',
-            name='Historical Spot Price', line=dict(color=SECONDARY_COLOR, width=1.5),
+            name=f'{asset} Perpetual', line=dict(color=SECONDARY_COLOR, width=1.5),
             yaxis='y2'
         ))
 
@@ -464,7 +465,7 @@ def plot_scatter_with_spot_and_dvol(data, hist_spot, dvol_series, current_spot, 
         xaxis_title='Timestamp (SGT)',
         yaxis_title='Option Strike',
         yaxis=dict(type='linear', autorange=True),
-        yaxis2=dict(title='Historical Spot Price', overlaying='y', side='right', showgrid=False, autorange=True),
+        yaxis2=dict(title=f'{asset} Perpetual', overlaying='y', side='right', showgrid=False, autorange=True),
         paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
         height=600,
