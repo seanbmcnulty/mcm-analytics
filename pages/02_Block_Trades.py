@@ -149,9 +149,11 @@ def get_current_spot(asset: str) -> float:
     url = f'https://deribit.com/api/v2/public/get_index_price?index_name={index_name}'
     try:
         r = requests.get(url, timeout=5)
+        time.sleep(0.1) # Pace API limit
         r.raise_for_status()
         return float(r.json()['result']['index_price'])
-    except Exception:
+    except Exception as e:
+        print(f"Error fetching spot for {asset}: {e}")
         return 0.0
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -168,10 +170,13 @@ def fetch_public_trades(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
     all_trades = []
     try:
         r = requests.get(url, timeout=10)
+        time.sleep(0.2) # Pace API limit
+        r.raise_for_status()
         data = r.json()
         if 'result' in data and 'trades' in data['result']:
             all_trades = data['result']['trades']
-    except Exception:
+    except Exception as e:
+        print(f"Error fetching trades for {asset}: {e}")
         return pd.DataFrame()
 
     if not all_trades:
@@ -179,7 +184,7 @@ def fetch_public_trades(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
 
     df = pd.DataFrame(all_trades)
     
-    # Filter by instrument prefix for USDC settled (SOL, XRP, AVAX, HYPE, TRX)
+    # Filter by instrument prefix for USDC settled
     if "_USDC" in asset:
         prefix = f"{asset}-"
         if "instrument_name" in df.columns:
@@ -223,15 +228,18 @@ def fetch_historical_spot(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
         'instrument_name': instrument,
         'start_timestamp': start_ms,
         'end_timestamp': end_ms,
-        'resolution': '5'  # 5-minute candles for smooth line
+        'resolution': '1'  # 1-minute resolution
     }
     try:
         r = requests.get(url, params=params, timeout=10)
+        time.sleep(0.2) # Pace API limit
+        r.raise_for_status()
         chart = r.json().get('result', {})
         if chart.get('status') == 'ok' and chart.get('ticks') and chart.get('close'):
             ts = pd.to_datetime(chart['ticks'], unit='ms', utc=True).dt.tz_convert(SGT)
             return pd.DataFrame({'timestamp': ts, 'close': chart['close']})
-    except Exception:
+    except Exception as e:
+        print(f"Error fetching historical spot for {asset}: {e}")
         pass
     return pd.DataFrame()
 
@@ -252,6 +260,8 @@ def fetch_dvol(asset: str, start_dt_utc: datetime) -> pd.Series:
     }
     try:
         r = requests.get(url, params=params, timeout=10)
+        time.sleep(0.2) # Pace API limit
+        r.raise_for_status()
         result = r.json().get('result', {})
         data = result.get('data', [])
         if data:
@@ -260,7 +270,8 @@ def fetch_dvol(asset: str, start_dt_utc: datetime) -> pd.Series:
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert(SGT)
             df.set_index('timestamp', inplace=True)
             return df['close'].sort_index()
-    except Exception:
+    except Exception as e:
+        print(f"Error fetching DVOL for {asset}: {e}")
         pass
     return pd.Series(dtype=float)
 
@@ -373,7 +384,12 @@ def style_statistics_table(df: pd.DataFrame):
                 return ''
         return ''
 
-    return df_disp.style.applymap(color_val, subset=['Delta', 'Vega', 'Gamma (1%)', 'Net Puts', 'Net Calls'])
+    # Handle pandas >= 2.1.0 .map() deprecation of .applymap()
+    styled = df_disp.style
+    try:
+        return styled.map(color_val, subset=['Delta', 'Vega', 'Gamma (1%)', 'Net Puts', 'Net Calls'])
+    except AttributeError:
+        return styled.applymap(color_val, subset=['Delta', 'Vega', 'Gamma (1%)', 'Net Puts', 'Net Calls'])
 
 # ---------------------------------------------------------------------------
 # Plotting Functions (Deribit Style)
@@ -658,6 +674,9 @@ def get_asset_multipliers(asset):
     if asset == 'ETH': return 0.5/15, 1.0/15
     if 'SOL' in asset: return 0.5/150, 1.0/150
     if 'XRP' in asset: return 0.5/1500, 1.0/1500
+    if 'TRX' in asset: return 0.5/1500, 1.0/1500
+    if 'AVAX' in asset: return 0.5/150, 1.0/150
+    if 'HYPE' in asset: return 0.5/150, 1.0/150
     return 0.5/150, 1.0/150
 
 # ---------------------------------------------------------------------------
