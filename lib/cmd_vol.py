@@ -15,10 +15,9 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from lib import history, surface
-from lib.fx_style import (AMBER, BLUE, GREEN, GREY, NAVY, ORANGE, PURPLE, RED,
-                          SMILE_SNAPSHOT_STYLE, TEMPLATE, TIME_TICKFORMAT,
-                          TERM_STRUCTURE_SERIES_STYLE, XAXIS_TIME,
-                          add_watermark, finalize, to_local)
+# Define the colors locally in cmd_vol.py so it stops looking for them in fx_style
+NAVY, BLUE, GREEN, RED, GREY, ORANGE, AMBER, PURPLE = "#13314F", "#3790C7", "#0E7A38", "#C0392B", "#888888", "#E65100", "#EF8A00", "#7B1FA2"
+from lib.fx_style import (add_watermark, finalize, to_local)
 
 _finite = surface.finite
 
