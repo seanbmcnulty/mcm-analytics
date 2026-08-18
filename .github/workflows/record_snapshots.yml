@@ -1,0 +1,71 @@
+name: Record vol snapshots
+
+# Runs independently of Streamlit Community Cloud so history keeps
+# accumulating even while the app is asleep, crashed, or mid-redeploy.
+#
+# Publishes to the "snapshots" branch, NOT main — Streamlit Cloud only
+# redeploys on pushes to the branch it's configured to watch (main), so an
+# hourly commit here never interrupts the live app. lib/history.py reads
+# this branch's CSVs over HTTPS (raw.githubusercontent.com) at request
+# time and merges them with whatever the running app has recorded locally
+# since its last redeploy.
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # hourly, on the hour (UTC)
+  workflow_dispatch: {}    # allow manual "Run workflow" from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: record-snapshots
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check requests pandas numpy scipy
+
+      - name: Restore accumulated snapshot history
+        # Pull in whatever the branch has accumulated so far so this run
+        # appends to it instead of starting over from main's copy (which
+        # may be stale, empty, or not tracked at all).
+        run: |
+          git fetch origin snapshots 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/origin/snapshots; then
+            git checkout origin/snapshots -- data/snapshots
+          else
+            echo "No existing snapshots branch yet — starting fresh."
+          fi
+
+      - name: Record snapshot
+        run: python scripts/record_snapshot.py
+
+      - name: Publish to snapshots branch
+        run: |
+          git config user.name "mcm-snapshot-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -f data/snapshots
+          if git diff --cached --quiet; then
+            echo "No new snapshot rows; nothing to publish."
+            exit 0
+          fi
+          git commit -m "snapshot: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          # Force-push: this branch is a data mirror, not a code history —
+          # each run republishes main's current tree plus the latest
+          # accumulated CSVs, so a clean linear history isn't meaningful here.
+          git push --force origin HEAD:refs/heads/snapshots
