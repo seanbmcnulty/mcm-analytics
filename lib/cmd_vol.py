@@ -16,9 +16,9 @@ import plotly.graph_objects as go
 
 from lib import history, surface
 from lib.fx_style import (AMBER, BLUE, GREEN, GREY, NAVY, ORANGE, PURPLE, RED,
-                          SMILE_SNAPSHOT_STYLE, TEMPLATE,
-                          TERM_STRUCTURE_SERIES_STYLE, XAXIS_EST,
-                          add_watermark, to_est)
+                          SMILE_SNAPSHOT_STYLE, TEMPLATE, TIME_TICKFORMAT,
+                          TERM_STRUCTURE_SERIES_STYLE, XAXIS_TIME,
+                          add_watermark, finalize, to_local)
 
 _finite = surface.finite
 
@@ -98,12 +98,9 @@ def cmd_vol_term_structure(asset: str, **kwargs):
         height=450, template=TEMPLATE, xaxis=dict(type="category"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
     )
-    if estimated and len(series) > 1:
-        fig.add_annotation(
-            x=0.0, y=1.13, xref="paper", yref="paper", showarrow=False,
-            align="left", font=dict(size=10.5, color="#666"),
-            text=f"Lagged snapshots reconstructed from {src} — Deribit serves no option-IV history.")
-    add_watermark(fig)
+    note = (f"Lagged snapshots reconstructed from {src} — Deribit serves no "
+            "option-IV history." if (estimated and len(series) > 1) else None)
+    finalize(fig, note=note, legend_rows=1)
     return fig, None, None
 
 
@@ -163,9 +160,8 @@ def cmd_skew_term_structure(asset: str, **kwargs):
         xaxis_title="Expiry (Deribit)", yaxis_title="25 Delta Skew (Call - Put)",
         height=450, template=TEMPLATE, xaxis=dict(type="category"),
         yaxis=dict(zeroline=True, zerolinewidth=1, zerolinecolor="rgba(0,0,0,0.3)"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
     )
-    add_watermark(fig)
+    finalize(fig, legend_rows=1)
     return fig, None, None
 
 
@@ -301,10 +297,8 @@ def build_vol_surface_figure(asset: str, dte: int) -> go.Figure | None:
         title=f"{asset} {expiry_str} Vol Surface",
         xaxis_title="Call Delta", yaxis_title="Implied Volatility (IV)",
         xaxis=dict(autorange="reversed"), height=450, template=TEMPLATE,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
-        margin=dict(t=70),
     )
-    add_watermark(fig)
+    finalize(fig, legend_rows=2)
     return fig
 
 
@@ -482,9 +476,8 @@ def cmd_forward_vols(asset: str, **kwargs):
         title=f"{asset} Combined Forward Vols (ATM / 25d Call / 25d Put)",
         xaxis_title="Expiry (Deribit)", yaxis_title="Implied Volatility (IV)",
         height=500, template=TEMPLATE,
-        xaxis=dict(type="category", categoryorder="array", categoryarray=x_cat),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0))
-    add_watermark(fig)
+        xaxis=dict(type="category", categoryorder="array", categoryarray=x_cat))
+    finalize(fig, legend_rows=2)
     return fig, None, None
 
 
@@ -560,9 +553,7 @@ def _carry_waterfall(asset: str, delta_key: str, vol_label: str,
         xaxis=dict(type="category", tickangle=-30),
         yaxis=dict(zeroline=True, zerolinewidth=1, zerolinecolor="rgba(0,0,0,0.35)"),
         margin=dict(b=120))
-    fig.add_annotation(x=0.0, y=1.08, xref="paper", yref="paper", showarrow=False,
-                       text=note, font=dict(size=11, color="#666"), align="left")
-    add_watermark(fig)
+    finalize(fig, note=note, legend_rows=0)
     return fig, None, None
 
 
@@ -621,9 +612,8 @@ def cmd_forward_vol_steepness_multidelta(asset: str, **kwargs):
         barmode="group", height=460, template=TEMPLATE,
         xaxis=dict(type="category", tickangle=-35),
         yaxis=dict(zeroline=True, zerolinewidth=1, zerolinecolor="rgba(0,0,0,0.35)"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
         margin=dict(b=110))
-    add_watermark(fig)
+    finalize(fig, legend_rows=1)
     return fig, None, None
 
 
@@ -678,7 +668,7 @@ def _forward_vol_matrix(asset: str, delta_key: str, vol_label: str):
         yaxis=dict(type="category", autorange="reversed"),
         height=400 + max(0, (n - 6) * 28), template=TEMPLATE,
         margin=dict(b=80, l=100))
-    add_watermark(fig)
+    finalize(fig, legend_rows=0, keep_margin=True)
     return fig, None, None
 
 
@@ -852,7 +842,7 @@ def cmd_atm_iv_box_plot(asset: str, lookback_days: int = 90, **kwargs):
                            showarrow=False, font=dict(size=9, color="#555"),
                            text=f"σ {stds[i]:.1f}<br>IQR {iqrs[i]:.1f}<br>"
                                 f"<b>P{pcts[i]:.0f}</b>")
-    add_watermark(fig)
+    finalize(fig, legend_rows=1, keep_margin=True)
     return fig, None, None
 
 
@@ -888,13 +878,12 @@ def _align(a: pd.Series, b: pd.Series) -> tuple[pd.Series, pd.Series] | None:
     return a.reindex(b2.index), b2
 
 
-def _est_note(fig, estimated: bool, src: str):
+def _est_note(estimated: bool, src: str) -> str | None:
+    """Text for the reconstruction caveat, or None when the data is recorded."""
     if estimated and src != "none":
-        fig.add_annotation(x=0.0, y=1.10, xref="paper", yref="paper",
-                           showarrow=False, align="left",
-                           font=dict(size=10.5, color="#666"),
-                           text=f"Reconstructed from {src} — Deribit serves no "
-                                "historical option IV.")
+        return (f"Reconstructed from {src} — Deribit serves no historical "
+                "option IV.")
+    return None
 
 
 def _vol_series_chart(asset: str, dte: int, days: int, title: str,
@@ -918,7 +907,7 @@ def _vol_series_chart(asset: str, dte: int, days: int, title: str,
         if s is None:
             continue
         fig.add_trace(go.Scatter(
-            x=to_est(s.index), y=s.values, name=name,
+            x=to_local(s.index), y=s.values, name=name,
             mode="lines+markers" if intraday else "lines",
             line=dict(color=color, dash=dash, shape="spline")))
 
@@ -928,7 +917,7 @@ def _vol_series_chart(asset: str, dte: int, days: int, title: str,
             px = px[px.index >= frames["delta50"].index[0]]
             if not px.empty:
                 fig.add_trace(go.Scatter(
-                    x=to_est(px.index), y=px["close"].values, name="Perp",
+                    x=to_local(px.index), y=px["close"].values, name="Perp",
                     line=dict(color=ORANGE, width=1.5, dash="dot", shape="spline"),
                     mode="lines", yaxis="y2", connectgaps=False))
                 fig.update_layout(yaxis2=dict(overlaying="y", side="right",
@@ -936,15 +925,15 @@ def _vol_series_chart(asset: str, dte: int, days: int, title: str,
                                               tickformat=",.0f"))
 
     fig.update_layout(
-        title=title, xaxis_title=XAXIS_EST,
+        title=title, xaxis_title=XAXIS_TIME,
         yaxis_title="Implied Volatility (IV)" if intraday else "Implied Volatility (IV %)",
         height=450, template=TEMPLATE,
-        xaxis=dict(type="date", tickformat="%d-%b %I:%M %p", tickangle=-90),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0))
+        xaxis=dict(type="date", tickformat=TIME_TICKFORMAT, tickangle=-90))
     if not intraday:
         fig.update_layout(yaxis=dict(ticksuffix="%"))
-    _est_note(fig, estimated, src)
-    add_watermark(fig)
+    n_series = len(fig.data)
+    finalize(fig, note=_est_note(estimated, src),
+             legend_rows=2 if n_series > 3 else 1)
     return fig, None, None
 
 
@@ -979,7 +968,7 @@ def _skew_series_chart(asset: str, dte: int, days: int, title: str,
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=to_est(s25.index), y=s25.values, name="25Δ Skew (Call − Put)",
+        x=to_local(s25.index), y=s25.values, name="25Δ Skew (Call − Put)",
         mode="lines+markers" if intraday else "lines",
         line=dict(color=NAVY, shape="spline")))
 
@@ -988,13 +977,13 @@ def _skew_series_chart(asset: str, dte: int, days: int, title: str,
         if pair10 is not None:
             s10 = (pair10[0] - pair10[1]).dropna()
             fig.add_trace(go.Scatter(
-                x=to_est(s10.index), y=s10.values, name="10Δ Skew (Call − Put)",
+                x=to_local(s10.index), y=s10.values, name="10Δ Skew (Call − Put)",
                 line=dict(color=BLUE, dash="dot", shape="spline"), yaxis="y2"))
             spread_pair = _align(s10, s25)
             if spread_pair is not None:
                 spread = (spread_pair[0] - spread_pair[1]).dropna()
                 fig.add_trace(go.Scatter(
-                    x=to_est(spread.index), y=spread.values,
+                    x=to_local(spread.index), y=spread.values,
                     name="Spread (10Δ − 25Δ)",
                     line=dict(color=GREEN, width=1.5, dash="dash", shape="spline")))
             fig.update_layout(yaxis2=dict(overlaying="y", side="right",
@@ -1006,7 +995,7 @@ def _skew_series_chart(asset: str, dte: int, days: int, title: str,
             px = px[px.index >= s25.index[0]]
             if not px.empty:
                 fig.add_trace(go.Scatter(
-                    x=to_est(px.index), y=px["close"].values, name="Perp",
+                    x=to_local(px.index), y=px["close"].values, name="Perp",
                     line=dict(color=ORANGE, width=1.5, dash="dot", shape="spline"),
                     mode="lines", yaxis="y2", connectgaps=False))
                 fig.update_layout(yaxis2=dict(overlaying="y", side="right",
@@ -1014,13 +1003,13 @@ def _skew_series_chart(asset: str, dte: int, days: int, title: str,
                                               tickformat=",.0f"))
 
     fig.update_layout(
-        title=title, xaxis_title=XAXIS_EST, yaxis_title="Skew (pp)",
+        title=title, xaxis_title=XAXIS_TIME, yaxis_title="Skew (pp)",
         height=450, template=TEMPLATE,
-        xaxis=dict(type="date", tickformat="%d-%b %I:%M %p", tickangle=-90),
-        yaxis=dict(title="25Δ Skew (pp)", side="left"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0))
-    _est_note(fig, estimated, src)
-    add_watermark(fig)
+        xaxis=dict(type="date", tickformat=TIME_TICKFORMAT, tickangle=-90),
+        yaxis=dict(title="25Δ Skew (pp)", side="left"))
+    n_series = len(fig.data)
+    finalize(fig, note=_est_note(estimated, src),
+             legend_rows=2 if n_series > 3 else 1)
     return fig, None, None
 
 

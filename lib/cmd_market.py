@@ -19,7 +19,8 @@ from scipy.stats import norm
 
 from lib import deribit, history, surface
 from lib.fx_style import (BLUE, GREEN, GREY, NAVY, ORANGE, RED, TEMPLATE,
-                          XAXIS_EST, add_watermark, to_est)
+                          TIME_TICKFORMAT, XAXIS_TIME, add_watermark,
+                          finalize, to_local, to_local_ts)
 
 _finite = surface.finite
 
@@ -179,7 +180,7 @@ def cmd_basis_run(asset: str, lookback_days: int = 90, **kwargs):
         xaxis=dict(type="category", tickangle=-45),
         yaxis=dict(zeroline=True, zerolinewidth=1, zerolinecolor="rgba(0,0,0,0.3)"),
         showlegend=False, height=400, template=TEMPLATE, margin=dict(b=120))
-    add_watermark(fig)
+    finalize(fig, legend_rows=0)
     return fig, df, header
 
 
@@ -210,22 +211,22 @@ def cmd_intraday_basis(asset: str, dte: int | None = None, **kwargs):
 
     expiry_str = (_now().date() + timedelta(days=resolved)).strftime("%d-%b-%Y")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=to_est(basis.index), y=basis.values,
+    fig.add_trace(go.Scatter(x=to_local(basis.index), y=basis.values,
                             name="USD Basis", mode="lines+markers",
                             line=dict(color=NAVY, shape="spline")))
-    fig.add_trace(go.Scatter(x=to_est(idx), y=perp_s.reindex(idx).values,
+    fig.add_trace(go.Scatter(x=to_local(idx), y=perp_s.reindex(idx).values,
                             name="Perp", mode="lines", yaxis="y2",
                             line=dict(color=ORANGE, width=1.5, dash="dot",
                                       shape="spline"), connectgaps=False))
     fig.update_layout(
-        title=f"{asset} {expiry_str} Basis", xaxis_title=XAXIS_EST,
+        title=f"{asset} {expiry_str} Basis", xaxis_title=XAXIS_TIME,
         yaxis=dict(title="USD Basis", tickprefix="$"),
         yaxis2=dict(overlaying="y", side="right", title="Perp",
                     showgrid=False, tickformat=",.0f"),
         height=450, template=TEMPLATE,
-        xaxis=dict(type="date", tickformat="%d-%b %I:%M %p", tickangle=-90),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0))
-    add_watermark(fig)
+        xaxis=dict(type="date", tickformat=TIME_TICKFORMAT, tickangle=-90),
+    )
+    finalize(fig, legend_rows=1)
     return fig, None, None
 
 
@@ -246,7 +247,7 @@ def cmd_rv_plot(asset: str, **kwargs):
         closes = pd.to_numeric(ohlc["close"], errors="coerce").dropna()
         if not closes.empty:
             fig.add_trace(go.Bar(
-                x=to_est(ohlc.index), y=ohlc["close"].values, name="Spot",
+                x=to_local(ohlc.index), y=ohlc["close"].values, name="Spot",
                 marker=dict(color="rgba(130,140,155,0.30)", line=dict(width=0)),
                 yaxis="y2", hovertemplate="Spot %{y:$,.0f}<extra></extra>"))
             fig.update_layout(yaxis2=dict(
@@ -260,16 +261,16 @@ def cmd_rv_plot(asset: str, **kwargs):
         s = history.parkinson_rv(ohlc, win).dropna()
         if s.empty:
             continue
-        fig.add_trace(go.Scatter(x=to_est(s.index), y=s.values, name=name,
+        fig.add_trace(go.Scatter(x=to_local(s.index), y=s.values, name=name,
                                 line=dict(color=color, shape="spline")))
 
     fig.update_layout(
         title=f"{asset} Realized Volatility (Parkinson)",
-        xaxis_title=XAXIS_EST, yaxis_title="Realized Volatility (RV)",
-        xaxis=dict(type="date", tickformat="%d-%b %I:%M %p", tickangle=-90),
+        xaxis_title=XAXIS_TIME, yaxis_title="Realized Volatility (RV)",
+        xaxis=dict(type="date", tickformat=TIME_TICKFORMAT, tickangle=-90),
         height=450, template=TEMPLATE, barmode="overlay",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0))
-    add_watermark(fig)
+    )
+    finalize(fig, legend_rows=2)
     return fig, None, None
 
 
@@ -310,20 +311,20 @@ def cmd_plot_funding_rates(asset: str, days: int = 30, **kwargs):
     if apr.empty:
         return None, None, "No funding rate data from Deribit."
 
-    fig = go.Figure(go.Scatter(x=to_est(apr.index), y=apr.values, name="Deribit",
+    fig = go.Figure(go.Scatter(x=to_local(apr.index), y=apr.values, name="Deribit",
                               mode="lines",
                               line=dict(color="#7B68EE", shape="spline")))
-    last_x, last_y = to_est(apr.index)[-1], float(apr.iloc[-1])
+    last_x, last_y = to_local(apr.index)[-1], float(apr.iloc[-1])
     fig.update_layout(
         title=f"{asset} Historical Funding Rate (Deribit Perpetual)",
-        xaxis_title=XAXIS_EST, yaxis_title="Funding Rate (Yearly APR %)",
-        xaxis=dict(type="date", tickformat="%d-%b %I:%M %p", tickangle=-90),
+        xaxis_title=XAXIS_TIME, yaxis_title="Funding Rate (Yearly APR %)",
+        xaxis=dict(type="date", tickformat=TIME_TICKFORMAT, tickangle=-90),
         yaxis=dict(ticksuffix="%"), height=450, template=TEMPLATE,
         annotations=[dict(x=last_x, y=last_y, text=f"Deribit<br>{last_y:+.2f}%",
                           showarrow=True, arrowhead=2, arrowsize=0.8, ax=40, ay=0,
                           xref="x", yref="y", font=dict(size=10, color="#7B68EE"),
                           bgcolor="rgba(255,255,255,0.8)", borderpad=4)])
-    add_watermark(fig)
+    finalize(fig, legend_rows=1)
     return fig, None, None
 
 
@@ -529,7 +530,7 @@ def cmd_moonphase(asset: str, **kwargs):
     y_span = max(1e-9, y_max - y_min)
 
     fig = go.Figure(go.Scatter(
-        x=to_est(px.index), y=px.values, name="Perp close",
+        x=to_local(px.index), y=px.values, name="Perp close",
         line=dict(color=NAVY, width=2, shape="spline")))
 
     phase_colors = {"New Moon": "#1a1a1a", "First Quarter": "#4a90d9",
@@ -537,13 +538,9 @@ def cmd_moonphase(asset: str, **kwargs):
     phase_emojis = {"New Moon": "🌑", "First Quarter": "🌓",
                     "Full Moon": "🌕", "Last Quarter": "🌗"}
     shapes, annotations = [], []
-    est_index = pd.DatetimeIndex(to_est(px.index))
 
     def _x(ts):
-        try:
-            return pd.Timestamp(ts).tz_convert("US/Eastern").tz_localize(None).isoformat()
-        except Exception:
-            return pd.Timestamp(ts).isoformat()
+        return to_local_ts(ts).isoformat()
 
     for t, name in events:
         band = 2.0 if name == "Full Moon" else 1.5
@@ -641,11 +638,11 @@ def cmd_moonphase(asset: str, **kwargs):
     fig.update_layout(
         title=dict(text=f"{asset} price vs moon phases (past 3 months)",
                    x=0.5, xanchor="center"),
-        xaxis=dict(title=XAXIS_EST, type="date", tickformat="%b %d", tickangle=-90),
+        xaxis=dict(title=XAXIS_TIME, type="date", tickformat="%b %d", tickangle=-90),
         yaxis=dict(title="Price (USD)", side="left"),
         shapes=shapes, annotations=annotations, showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
         height=420, margin=dict(t=100, b=50, l=60, r=40),
         template=TEMPLATE, hovermode="x unified")
-    add_watermark(fig)
+    finalize(fig, legend_rows=1, keep_margin=True)
     return fig, None, None

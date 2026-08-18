@@ -28,7 +28,13 @@ HEADER_NAVY = "#13314F"
 RULE_BLUE = "#2E6CB5"
 
 TEMPLATE = "plotly_white"
-XAXIS_EST = "Date (US Eastern)"
+
+# All timestamps are displayed in this zone.
+DISPLAY_TZ = "Asia/Singapore"
+DISPLAY_TZ_LABEL = "Singapore"
+XAXIS_EST = f"Date ({DISPLAY_TZ_LABEL})"      # kept under the old name for callers
+XAXIS_TIME = XAXIS_EST
+TIME_TICKFORMAT = "%d-%b %H:%M"                # 24h, matching SGT convention
 EXPIRY_LABEL_FONT_SIZE = 12
 
 # Snapshot styling for term-structure charts.
@@ -52,15 +58,35 @@ _COL_WIDTHS = {"Token": 0.60, "Expiry": 1.12, "DTE": 0.50,
                "Daily Move %": 1.28, "BE Move %": 1.12}
 
 
-def to_est(index) -> pd.Index:
-    """Convert a UTC datetime index to US/Eastern, tz-naive for plotting."""
+def to_local(index) -> pd.Index:
+    """Convert a UTC datetime index to the display zone, tz-naive for plotting."""
     try:
         idx = pd.DatetimeIndex(index)
         if idx.tz is None:
             idx = idx.tz_localize("UTC")
-        return idx.tz_convert("US/Eastern").tz_localize(None)
+        return idx.tz_convert(DISPLAY_TZ).tz_localize(None)
     except Exception:
         return index
+
+
+def local_now() -> "pd.Timestamp":
+    """Current wall-clock time in the display zone."""
+    return pd.Timestamp.now(tz="UTC").tz_convert(DISPLAY_TZ)
+
+
+def to_local_ts(ts):
+    """Convert a single timestamp to the display zone (tz-naive)."""
+    try:
+        t = pd.Timestamp(ts)
+        if t.tz is None:
+            t = t.tz_localize("UTC")
+        return t.tz_convert(DISPLAY_TZ).tz_localize(None)
+    except Exception:
+        return pd.Timestamp(ts)
+
+
+# Legacy alias — the codebase used US/Eastern before the move to Singapore.
+to_est = to_local
 
 
 def base_layout(**overrides) -> dict:
@@ -70,15 +96,71 @@ def base_layout(**overrides) -> dict:
 
 
 def add_watermark(fig: go.Figure, text: str = "MCM Analytics") -> None:
-    """Faint corner watermark, matching the FalconX branding slot."""
+    """
+    Faint branding mark, pinned to the top-right of the header block.
+
+    It used to sit below the plot, where rotated date ticks pushed it into the
+    axis labels; the top-right corner is always free because legends are
+    left-anchored.
+    """
     try:
         fig.add_annotation(
-            x=0.995, y=-0.16, xref="paper", yref="paper",
+            x=1.0, y=1.0, xref="paper", yref="paper",
             xanchor="right", yanchor="bottom", text=text, showarrow=False,
-            font=dict(size=10, color="rgba(19,49,79,0.35)"),
+            font=dict(size=10, color="rgba(138,138,138,0.65)"),
         )
     except Exception:
         pass
+
+
+def _title_text(fig) -> str:
+    """Read a figure's current title text across plotly/stub layout shapes."""
+    try:
+        layout = fig.layout
+        title = layout.get("title") if isinstance(layout, dict) else getattr(layout, "title", None)
+        if title is None:
+            return ""
+        if isinstance(title, str):
+            return title
+        if isinstance(title, dict):
+            return title.get("text") or ""
+        return getattr(title, "text", "") or ""
+    except Exception:
+        return ""
+
+
+def finalize(fig, note: str | None = None, legend_rows: int = 1,
+             extra_top: int = 0, keep_margin: bool = False):
+    """
+    Lay out the header block so the title, note and legend never collide.
+
+    The note used to be a free-floating paper annotation just above the plot,
+    which is exactly where a horizontal legend grows when it wraps to a second
+    row — so on the five-series charts the two drew on top of each other.  It
+    is now a second line of the title, and the top margin is sized from the
+    number of legend rows the chart can actually produce.
+    """
+    if fig is None:
+        return fig
+    try:
+        if note:
+            base = _title_text(fig)
+            marker = "<span style='font-size:11px"
+            if marker not in base:
+                fig.update_layout(title=dict(
+                    text=f"{base}<br><span style='font-size:11px;color:#8a8a8a'>{note}</span>",
+                    x=0.0, xanchor="left", y=0.985, yanchor="top"))
+        rows = max(1, int(legend_rows))
+        if not keep_margin:
+            top = 52 + 24 * rows + (22 if note else 0) + int(extra_top)
+            fig.update_layout(margin=dict(t=top))
+        fig.update_layout(legend=dict(
+            orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0,
+            font=dict(size=11)))
+        add_watermark(fig)
+    except Exception:
+        pass
+    return fig
 
 
 def add_table_banner(fig: go.Figure, header_text: str, plot_h: float) -> None:

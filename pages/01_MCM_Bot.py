@@ -227,7 +227,8 @@ except Exception:
 
 st.title("🤖 MCM Bot")
 st.caption("Crypto derivatives analytics · Deribit public API · "
-           f"{datetime.now(timezone.utc):%d-%b-%Y %H:%M} UTC")
+           f"{fx_style.local_now():%d-%b-%Y %H:%M} "
+           f"{fx_style.DISPLAY_TZ_LABEL} time")
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -394,7 +395,7 @@ with st.expander("What each report shows (guide)"):
 | **ATM IV box plot** | 90-day ATM IV distribution per tenor with today's curve overlaid; P-number = current percentile. |
 | **Forward vol matrix** | Forward vol between every pair of expiries, as a heatmap. |
 | **Intraday basis / vol / skew** | Last 24 hours for the selected expiry; perp price on the secondary axis. |
-| **Vol time series** | Last month of ATM and 25Δ/10Δ vol for the selected expiry (US Eastern time). |
+| **Vol time series** | Last month of ATM and 25Δ/10Δ vol for the selected expiry (Singapore time). |
 | **Skew time series** | 25Δ and 10Δ skew (call − put) over the last month. |
 | **Vol smile** | Implied vol across deltas for current, 1d ago, 1w ago, 1m ago. |
 | **Funding rates** | Annualized Deribit perpetual funding APR (last 30 days). |
