@@ -15,9 +15,9 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from lib import history, surface
-# Define the colors locally in cmd_vol.py so it stops looking for them in fx_style
-NAVY, BLUE, GREEN, RED, GREY, ORANGE, AMBER, PURPLE = "#13314F", "#3790C7", "#0E7A38", "#C0392B", "#888888", "#E65100", "#EF8A00", "#7B1FA2"
-from lib.fx_style import (add_watermark, finalize, to_local)
+
+# Import EVERYTHING from fx_style (Colors, TEMPLATE, Styles, Timezone helpers, etc.)
+from lib.fx_style import *
 
 _finite = surface.finite
 
@@ -233,7 +233,7 @@ def build_vol_surface_figure(asset: str, dte: int) -> go.Figure | None:
                                  hoverinfo="skip", showlegend=True,
                                  name=f"High–Low ({cloud_days}d)"))
 
-    for label, color, dash in SMILE_SNAPSHOT_STYLE:
+    for label, style in SMILE_SNAPSHOT_STYLE.items():
         pts = snaps.get(label)
         if not pts or len(pts) < 3:
             continue
@@ -241,8 +241,8 @@ def build_vol_surface_figure(asset: str, dte: int) -> go.Figure | None:
         name = label if label == "Current" or not estimated else f"{label} (est.)"
         fig.add_trace(go.Scatter(
             x=xs, y=[pts[x] for x in xs], name=name,
-            line=dict(color=color, dash=dash,
-                      width=2 if label == "Current" else 1, shape="spline"),
+            line=dict(color=style["color"], dash=style["dash"],
+                      width=style["width"], shape="spline"),
             mode="lines+markers",
         ))
 
