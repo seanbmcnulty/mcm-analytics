@@ -44,12 +44,29 @@ jobs:
         # Pull in whatever the branch has accumulated so far so this run
         # appends to it instead of starting over from main's copy (which
         # may be stale, empty, or not tracked at all).
+        #
+        # git ls-remote's exit code tells "branch doesn't exist" (2) apart
+        # from "couldn't even ask" (anything else, e.g. a transient network
+        # or auth failure). That distinction matters: if we treated every
+        # failure to reach the branch as "starting fresh," a flaky network
+        # blip would make this job silently force-push over and WIPE every
+        # row recorded so far. Only a confirmed-absent branch is safe to
+        # treat as a fresh start.
         run: |
-          git fetch origin snapshots 2>/dev/null || true
-          if git show-ref --verify --quiet refs/remotes/origin/snapshots; then
+          set +e
+          git ls-remote --exit-code --heads origin snapshots >/dev/null 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "HAVE_BRANCH=1" >> "$GITHUB_ENV"
+            git fetch origin snapshots
             git checkout origin/snapshots -- data/snapshots
-          else
+          elif [ "$rc" -eq 2 ]; then
+            echo "HAVE_BRANCH=0" >> "$GITHUB_ENV"
             echo "No existing snapshots branch yet — starting fresh."
+          else
+            echo "::error::Could not reach the snapshots branch (exit $rc) — aborting rather than risk force-pushing over existing history."
+            exit 1
           fi
 
       - name: Record snapshot
@@ -60,7 +77,12 @@ jobs:
           git config user.name "mcm-snapshot-bot"
           git config user.email "actions@users.noreply.github.com"
           git add -f data/snapshots
-          if git diff --cached --quiet; then
+          # Compare against what's already published (origin/snapshots), not
+          # against HEAD (main) — data/snapshots is gitignored on main, so it
+          # never appears in HEAD's tree and a HEAD-relative diff would look
+          # "changed" on every run even when record_snapshot.py wrote nothing
+          # new, causing a pointless commit+force-push every hour.
+          if [ "$HAVE_BRANCH" = "1" ] && git diff --cached --quiet origin/snapshots -- data/snapshots; then
             echo "No new snapshot rows; nothing to publish."
             exit 0
           fi

@@ -135,6 +135,50 @@ def _snapshot_path(asset: str) -> Path:
     return SNAPSHOT_DIR / f"{asset}_surface.csv"
 
 
+# Hourly recording (the GitHub Actions recorder) would otherwise grow each
+# snapshot CSV without bound forever. Cap it: keep full hourly resolution for
+# the recent window, collapse anything older to one row per UTC calendar day.
+_THIN_AFTER_DAYS = 14
+_THIN_MIN_ROWS = 400   # skip the read/rewrite cost until there's something to gain
+
+
+def _thin_snapshot_file(path: Path) -> None:
+    """
+    Best-effort compaction so ``path`` stops growing once it's old enough to
+    matter. Any failure here just leaves the file as-is -- this must never
+    be the reason a recording run fails.
+    """
+    try:
+        df = pd.read_csv(path)
+        if len(df) < _THIN_MIN_ROWS or "timestamp" not in df:
+            return
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True,
+                                          format="ISO8601", errors="coerce")
+        df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_THIN_AFTER_DAYS)
+        recent = df[df.index >= cutoff]
+        old = df[df.index < cutoff]
+        if old.empty:
+            return
+        day_counts = old.index.floor("D")
+        if len(old) <= day_counts.nunique():
+            return  # already thinned, nothing to save
+        old = old.groupby(day_counts).first()
+        out = pd.concat([old, recent]).sort_index()
+        out = out[~out.index.duplicated(keep="last")]
+        # Write timestamps in the exact same format record_snapshot() uses for
+        # fresh appends (Python's datetime.isoformat(), "T" separator) -- NOT
+        # pandas' default CSV serialization ("YYYY-MM-DD HH:MM:SS..."), which
+        # differs just enough that mixing the two in one file can make pandas'
+        # fast-path CSV datetime parser silently drop rows as unparseable on
+        # a later read.
+        out = out.reset_index()
+        out["timestamp"] = out["timestamp"].map(lambda t: t.isoformat())
+        out.to_csv(path, index=False)
+    except Exception:
+        pass
+
+
 def record_snapshot(asset: str, min_interval_s: float = 1800.0) -> bool:
     """
     Append the current surface to the snapshot store.
@@ -142,6 +186,9 @@ def record_snapshot(asset: str, min_interval_s: float = 1800.0) -> bool:
     No-ops when the last row is younger than ``min_interval_s``.  Returns True
     when a row was written.  Best-effort: on a read-only or ephemeral
     filesystem (Streamlit Community Cloud) this silently does nothing.
+
+    Also runs ``_thin_snapshot_file`` after a successful write, so the file
+    stays bounded in size no matter how long recording runs for.
     """
     try:
         SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -151,7 +198,8 @@ def record_snapshot(asset: str, min_interval_s: float = 1800.0) -> bool:
             try:
                 tail = pd.read_csv(path).tail(1)
                 if not tail.empty:
-                    last = pd.to_datetime(tail["timestamp"].iloc[0], utc=True)
+                    last = pd.to_datetime(tail["timestamp"].iloc[0], utc=True,
+                                          format="ISO8601")
                     if (now - last).total_seconds() < min_interval_s:
                         return False
             except Exception:
@@ -169,6 +217,7 @@ def record_snapshot(asset: str, min_interval_s: float = 1800.0) -> bool:
                 row[f"{field}_{dte}"] = round(float(v), 6) if surface.finite(v) else ""
         header = not path.exists()
         pd.DataFrame([row]).to_csv(path, mode="a", header=header, index=False)
+        _thin_snapshot_file(path)
         return True
     except Exception:
         return False
@@ -179,7 +228,8 @@ def _parse_snapshot_csv(text: str) -> pd.DataFrame | None:
         df = pd.read_csv(io.StringIO(text))
         if df.empty or "timestamp" not in df:
             return None
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True,
+                                          format="ISO8601", errors="coerce")
         df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
         return df if not df.empty else None
     except Exception:
