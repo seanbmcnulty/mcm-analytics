@@ -53,13 +53,11 @@ def local_now() -> datetime:
     """Return current UTC time."""
     return datetime.now(timezone.utc)
 
-
 def to_local(dt):
     """Convert datetime object to display format or timezone."""
     if dt is None:
         return None
     return dt
-
 
 def to_local_ts(idx):
     """Convert DatetimeIndex or Series timestamps for chart display."""
@@ -83,7 +81,6 @@ def add_watermark(fig: go.Figure) -> None:
     """Optional watermark hook for charts (clean/no-op)."""
     return
 
-
 def apply_theme(fig: go.Figure, theme: str = "auto") -> go.Figure:
     """Apply standard clean styling and template to a Plotly figure."""
     if fig is None:
@@ -96,7 +93,6 @@ def apply_theme(fig: go.Figure, theme: str = "auto") -> go.Figure:
         plot_bgcolor="white" if theme.lower() == "light" else None,
     )
     return fig
-
 
 def finalize(fig: go.Figure, height: int = 450, title: str = None) -> go.Figure:
     """Apply final sizing and standard layout adjustments to a figure."""
@@ -112,7 +108,6 @@ def finalize(fig: go.Figure, height: int = 450, title: str = None) -> go.Figure:
         
     fig.update_layout(**layout_update)
     return fig
-
 
 def fig_to_png(fig: go.Figure, width: int = 1200, height: int = 800) -> bytes:
     """Convert a Plotly figure into PNG image bytes."""
