@@ -26,6 +26,24 @@ TIME_TICKFORMAT = "%d-%b %H:%M"
 XAXIS_TIME = "Time (SGT)"
 DISPLAY_TZ_LABEL = "SGT"
 
+# ---------------------------------------------------------------------------
+# Chart Styling Dictionaries (Required by cmd_vol / cmd_market)
+# ---------------------------------------------------------------------------
+
+TERM_STRUCTURE_SERIES_STYLE = {
+    "Current": {"color": "#1F3A93", "dash": "solid", "marker_symbol": "circle", "width": 2.4},
+    "24h Ago": {"color": "#C2185B", "dash": "dash", "marker_symbol": "diamond", "width": 1.8},
+    "1 Week Ago": {"color": "#00897B", "dash": "dot", "marker_symbol": "square", "width": 1.8},
+    "1 Month Ago": {"color": "#F57C00", "dash": "dashdot", "marker_symbol": "triangle-up", "width": 1.8},
+}
+
+SMILE_SNAPSHOT_STYLE = {
+    "Current": {"color": "#1F3A93", "dash": "solid", "width": 2},
+    "Yesterday": {"color": "#C2185B", "dash": "dash", "width": 1.5},
+    "Week Ago": {"color": "#00897B", "dash": "dot", "width": 1.5},
+    "1 Month Ago": {"color": "#F57C00", "dash": "dashdot", "width": 1.5},
+}
+
 # Table image styling
 _TBL_HEADER_FILL = "#13314F"
 _TBL_HEADER_FONT = "#FFFFFF"
@@ -53,11 +71,13 @@ def local_now() -> datetime:
     """Return current UTC time."""
     return datetime.now(timezone.utc)
 
+
 def to_local(dt):
     """Convert datetime object to display format or timezone."""
     if dt is None:
         return None
     return dt
+
 
 def to_local_ts(idx):
     """Convert DatetimeIndex or Series timestamps for chart display."""
@@ -81,6 +101,7 @@ def add_watermark(fig: go.Figure) -> None:
     """Optional watermark hook for charts (clean/no-op)."""
     return
 
+
 def apply_theme(fig: go.Figure, theme: str = "auto") -> go.Figure:
     """Apply standard clean styling and template to a Plotly figure."""
     if fig is None:
@@ -94,8 +115,9 @@ def apply_theme(fig: go.Figure, theme: str = "auto") -> go.Figure:
     )
     return fig
 
-def finalize(fig: go.Figure, height: int = 450, title: str = None) -> go.Figure:
-    """Apply final sizing and standard layout adjustments to a figure."""
+
+def finalize(fig: go.Figure, height: int = 450, title: str = None, **kwargs) -> go.Figure:
+    """Apply final sizing and standard layout adjustments to a figure, safely swallowing extra kwargs."""
     if fig is None:
         return None
     
@@ -108,6 +130,7 @@ def finalize(fig: go.Figure, height: int = 450, title: str = None) -> go.Figure:
         
     fig.update_layout(**layout_update)
     return fig
+
 
 def fig_to_png(fig: go.Figure, width: int = 1200, height: int = 800) -> bytes:
     """Convert a Plotly figure into PNG image bytes."""
