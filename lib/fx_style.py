@@ -1,9 +1,32 @@
-import re
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
+"""
+Plotly styling, color palettes, timezone utilities, and table image generation for MCM Analytics.
+"""
 
-# MCM Brand Palette matching the original FalconX style
+import re
+from datetime import datetime, timezone
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.io as pio
+
+# ---------------------------------------------------------------------------
+# Color Palette & Constants
+# ---------------------------------------------------------------------------
+
+NAVY = "#13314F"
+BLUE = "#3790C7"
+GREEN = "#0E7A38"
+RED = "#C0392B"
+GREY = "#888888"
+ORANGE = "#E65100"
+AMBER = "#EF8A00"
+
+TEMPLATE = "plotly_white"
+TIME_TICKFORMAT = "%d-%b %H:%M"
+XAXIS_TIME = "Time (SGT)"
+DISPLAY_TZ_LABEL = "SGT"
+
+# Table image styling
 _TBL_HEADER_FILL = "#13314F"
 _TBL_HEADER_FONT = "#FFFFFF"
 _TBL_ROW_EVEN = "#FFFFFF"
@@ -21,8 +44,92 @@ _TBL_BANNER_SUB = "#5A6675"
 _TBL_FONT_FAMILY = "DejaVu Sans, Arial, Helvetica, sans-serif"
 _TBL_BLANK = "–"
 
+
+# ---------------------------------------------------------------------------
+# Timezone Helpers
+# ---------------------------------------------------------------------------
+
+def local_now() -> datetime:
+    """Return current UTC time."""
+    return datetime.now(timezone.utc)
+
+
+def to_local(dt):
+    """Convert datetime object to display format or timezone."""
+    if dt is None:
+        return None
+    return dt
+
+
+def to_local_ts(idx):
+    """Convert DatetimeIndex or Series timestamps for chart display."""
+    if idx is None or (hasattr(idx, "__len__") and len(idx) == 0):
+        return idx
+    try:
+        if hasattr(idx, "tz"):
+            if idx.tz is None:
+                return idx.tz_localize("UTC")
+            return idx.tz_convert("UTC")
+        return idx
+    except Exception:
+        return idx
+
+
+# ---------------------------------------------------------------------------
+# Chart Theming & Watermarking
+# ---------------------------------------------------------------------------
+
+def add_watermark(fig: go.Figure) -> None:
+    """Optional watermark hook for charts (clean/no-op)."""
+    return
+
+
+def apply_theme(fig: go.Figure, theme: str = "auto") -> go.Figure:
+    """Apply standard clean styling and template to a Plotly figure."""
+    if fig is None:
+        return None
+    
+    fig.update_layout(
+        template=TEMPLATE,
+        font=dict(family=_TBL_FONT_FAMILY, color=_TBL_TEXT),
+        paper_bgcolor="white" if theme.lower() == "light" else None,
+        plot_bgcolor="white" if theme.lower() == "light" else None,
+    )
+    return fig
+
+
+def finalize(fig: go.Figure, height: int = 450, title: str = None) -> go.Figure:
+    """Apply final sizing and standard layout adjustments to a figure."""
+    if fig is None:
+        return None
+    
+    layout_update = dict(
+        height=height,
+        template=TEMPLATE,
+    )
+    if title:
+        layout_update["title"] = title
+        
+    fig.update_layout(**layout_update)
+    return fig
+
+
+def fig_to_png(fig: go.Figure, width: int = 1200, height: int = 800) -> bytes:
+    """Convert a Plotly figure into PNG image bytes."""
+    if fig is None:
+        return None
+    try:
+        return fig.to_image(format="png", width=width, height=height)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Table Image Generation
+# ---------------------------------------------------------------------------
+
 def _add_table_banner(fig: go.Figure, header_text: str, plot_h: float) -> None:
-    """Bakes the summary line (Spot, DVOL, RV) into the image banner."""
+    """Renders the summary banner at the top of table images."""
     if not header_text or plot_h <= 0:
         return
     parts = [p for p in re.split(r"\s{6,}", header_text.strip()) if p]
@@ -37,13 +144,10 @@ def _add_table_banner(fig: go.Figure, header_text: str, plot_h: float) -> None:
     def _y(px: float) -> float:
         return 1.0 + px / plot_h
 
-    # Add background banner and accent line
     fig.add_shape(type="rect", xref="paper", yref="paper", x0=0, x1=1,
                   y0=_y(4), y1=_y(96), fillcolor=_TBL_BANNER_BG, line=dict(width=0), layer="below")
     fig.add_shape(type="line", xref="paper", yref="paper", x0=0, x1=1,
                   y0=_y(6), y1=_y(6), line=dict(color=_TBL_ACCENT, width=2))
-    
-    # Add text elements
     fig.add_annotation(text=_fmt(lead), xref="paper", yref="paper", x=0.012, y=_y(66),
                        xanchor="left", yanchor="middle", showarrow=False, align="left",
                        font=dict(size=18, color=_TBL_HEADER_FILL, family=_TBL_FONT_FAMILY))
@@ -52,11 +156,11 @@ def _add_table_banner(fig: go.Figure, header_text: str, plot_h: float) -> None:
                            xanchor="left", yanchor="middle", showarrow=False, align="left",
                            font=dict(size=13, color=_TBL_BANNER_SUB, family=_TBL_FONT_FAMILY))
 
+
 def dataframe_to_table_image(df: pd.DataFrame, header_text: str = None, width: int = 1180, max_height: int = 1400) -> bytes:
-    """Renders the DataFrame into a highly styled PNG image."""
+    """Renders a pandas DataFrame as a styled table image for Telegram."""
     if df is None or df.empty:
         return None
-    
     try:
         disp = df.copy()
         raw = df.copy()
@@ -75,11 +179,15 @@ def dataframe_to_table_image(df: pd.DataFrame, header_text: str = None, width: i
                 disp[col] = disp[col].apply(lambda v: f"${float(v):,.2f}" if pd.notna(v) and np.isfinite(v) else _TBL_BLANK)
             elif col == "Basis $":
                 disp[col] = disp[col].apply(lambda v: f"${float(v):,.0f}" if pd.notna(v) and np.isfinite(v) else _TBL_BLANK)
+            elif col in ("Delta", "Vega", "Gamma (1%)"):
+                disp[col] = disp[col].apply(lambda v: f"${float(v):,.0f}" if pd.notna(v) and np.isfinite(v) else _TBL_BLANK)
+            elif col in ("Net Puts", "Net Calls", "Gross Notional"):
+                disp[col] = disp[col].apply(lambda v: f"{int(v):,}" if pd.notna(v) and np.isfinite(v) else _TBL_BLANK)
             else:
                 disp[col] = disp[col].apply(lambda v: _TBL_BLANK if pd.isna(v) else str(v))
 
-        # 2. Conditional Color Matrix (Green/Red highlights)
-        color_cols = {"ATM 3h", "ATM Open", "IV−RV", "4hr Chg", "24hr Chg", "Basis % (1Y APR)", "Basis %"}
+        # 2. Conditional Color Matrix
+        color_cols = {"ATM 3h", "ATM Open", "IV−RV", "4hr Chg", "24hr Chg", "Basis % (1Y APR)", "Basis %", "Delta", "Vega", "Gamma (1%)"}
         row_colors = [_TBL_ROW_EVEN if r % 2 == 0 else _TBL_ROW_ODD for r in range(nrows)]
         fill_color = [row_colors[:] for _ in range(ncols)]
         font_color = []
@@ -102,7 +210,6 @@ def dataframe_to_table_image(df: pd.DataFrame, header_text: str = None, width: i
             else:
                 font_color.append([_TBL_TEXT_MUTED if str(v) == _TBL_BLANK else _TBL_TEXT for v in disp[c]])
 
-        # 3. Size and Dimensions
         header_h = 42
         row_h = 31
         has_banner = bool(header_text)
@@ -110,7 +217,7 @@ def dataframe_to_table_image(df: pd.DataFrame, header_text: str = None, width: i
         bottom_margin = 46
         height = min(max_height, header_h + row_h * nrows + top_margin + bottom_margin)
 
-        # 4. Build Plotly Table
+        # 3. Build Plotly Table
         fig = go.Figure(data=[go.Table(
             header=dict(
                 values=[f"<b>{c}</b>" for c in disp.columns],
@@ -139,13 +246,10 @@ def dataframe_to_table_image(df: pd.DataFrame, header_text: str = None, width: i
             font=dict(family=_TBL_FONT_FAMILY, color=_TBL_TEXT),
         )
 
-        # 5. Attach Summary Banner
         if has_banner:
             _add_table_banner(fig, header_text, plot_h=height - top_margin - bottom_margin)
-        
-        # 6. Export to PNG bytes
-        return fig.to_image(format="png", width=width, height=height)
 
+        return fig.to_image(format="png", width=width, height=height)
     except Exception as e:
-        print(f"Error generating table image: {e}")  # Exposes the error in your terminal if it fails
+        print(f"Error generating table image: {e}")
         return None
