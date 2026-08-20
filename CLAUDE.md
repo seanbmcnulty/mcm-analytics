@@ -238,6 +238,50 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-08-20 — basis_run / block_trades_summary get dedicated full-width rows
+
+User feedback: `/basis_run` and `/block_trades_summary` (both wide,
+column-heavy tables) were being squeezed into a 1/3-width grid column
+alongside chart commands, same as `/vol_term_structure` etc., and getting
+visually cut off. Wanted them to render full-width, like `/vol_run`'s
+table already does.
+
+The dashboard grid (`pages/01_MCM_Bot.py`, the `asset_tabs` loop) used to
+chunk each asset's commands into fixed groups of 3 straight from
+`MCM_ORDER`, rendered via `st.columns(3)` — `vol_run` only got full-width
+treatment because it happens to return a `list` fig, which trips the
+pre-existing `multi_idx` special case (skip_figures + full-width render,
+then its 2 row-mates get pulled into a smaller column row below it).
+`basis_run` and `block_trades_summary` return a single (non-list) fig/df,
+so they never hit that path.
+
+Added a `FULL_ROW_COMMANDS = {"basis_run", "block_trades_summary"}` set
+and rewrote the chunking from a fixed `range(0, len(order_a), 3)` to a
+`while` loop: a command in that set renders alone via `render_output`
+directly (no `st.columns` wrapper) and advances by 1; everything else is
+still gathered into runs of up to 3, but the run stops early if the next
+item is a full-row command, so that command starts clean on its own row
+instead of being pulled into the preceding chunk. Also fixed a latent bug
+this surfaced: the non-multi branch always did `st.columns(3)` regardless
+of how many items were actually in the row, which would have left a
+partial last row (now possible, since full-row commands can produce
+uneven remainders) with 1-2 populated columns and dead blank space beside
+them — changed to `st.columns(len(row_items))`.
+
+Verified offline (no live Streamlit available in this sandbox — see
+Testing below): built a richer streamlit stub than existed before
+(`_Col` context-manager columns/tabs/popover, session_state attribute
+access, widget `key=` duplicate detection) at `/tmp/stubs/streamlit.py`
+in the sandbox (not committed — sandbox-local, rebuild next time per the
+Testing section), ran `pages/01_MCM_Bot.py` through `runpy.run_path` with
+a fully populated `mcm_all_results` cache (all 4 assets × 21 commands via
+`fake_deribit`) so the grid loop actually executes end-to-end, and
+additionally instrumented `st.caption`/column nesting depth to confirm
+`basis_run` and `block_trades_summary` land at the same depth as
+`vol_run`'s table (own row) while their former row-mates stay one level
+deeper inside a shared `st.columns()` block. No duplicate-key errors, no
+exceptions. No live/visual check — flagged to the user per usual.
+
 ### 2026-08-20 — persistent storage, code review, UI overhaul, project setup
 
 Starting point: a live `AttributeError` on `fx_style.local_now()` that

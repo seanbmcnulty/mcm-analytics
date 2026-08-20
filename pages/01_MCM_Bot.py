@@ -33,6 +33,12 @@ _TODAY = datetime.now(timezone.utc).date()
 # Fixed display order: every asset, each command in COMMANDS order.
 MCM_ORDER = [(a, cn) for a in ASSETS for cn in cmdreg.COMMAND_NAMES]
 
+# These render wide tables (not charts) that get cut off when squeezed into a
+# 1/3-width grid column, so each gets a dedicated full-width row instead of
+# sharing a row of 3 with neighboring commands — same treatment vol_run's
+# table already gets (see the dashboard grid loop below).
+FULL_ROW_COMMANDS = {"basis_run", "block_trades_summary"}
+
 for _k, _v in (("mcm_all_results", None), ("mcm_all_results_ts", None),
                ("mcm_fig", None), ("mcm_df", None), ("mcm_text", None)):
     st.session_state.setdefault(_k, _v)
@@ -446,13 +452,37 @@ asset_tabs = st.tabs(_tab_labels)
 for ia, a in enumerate(visible_assets):
     with asset_tabs[ia]:
         order_a = [(x, cn) for x, cn in MCM_ORDER if x == a]
-        for i in range(0, len(order_a), 3):
-            row_items = order_a[i:i + 3]
+        n_a = len(order_a)
+        i = 0
+        while i < n_a:
+            cn0 = order_a[i][1]
+            if cn0 in FULL_ROW_COMMANDS:
+                st.caption(f"**{a}** /{cn0}")
+                if (a, cn0) in results:
+                    f2, d2, t2 = results[(a, cn0)]
+                    render_output(f2, d2, t2, key_prefix=f"{a}_{cn0}")
+                else:
+                    st.caption("Not loaded. Use **Load all** or "
+                               "**Load selected…** above.")
+                i += 1
+                if i < n_a:
+                    st.write("")
+                continue
+
+            # Next row: up to 3 items, stopping before a full-row command so
+            # that command starts its own row instead of being pulled in.
+            row_items = []
+            j = i
+            while j < n_a and len(row_items) < 3 and order_a[j][1] not in FULL_ROW_COMMANDS:
+                row_items.append(order_a[j])
+                j += 1
+            i = j
+
             multi_idx = None
-            for j, (_, cn) in enumerate(row_items):
+            for k, (_, cn) in enumerate(row_items):
                 entry = results.get((a, cn))
                 if entry and isinstance(entry[0], list) and entry[0]:
-                    multi_idx = j
+                    multi_idx = k
                     break
 
             if multi_idx is not None:
@@ -473,9 +503,9 @@ for ia, a in enumerate(visible_assets):
                                 st.caption("Not loaded. Use **Load all** or "
                                            "**Load selected…** above.")
             else:
-                cols = st.columns(3)
-                for j, (_, cn) in enumerate(row_items):
-                    with cols[j]:
+                cols = st.columns(len(row_items))
+                for k, (_, cn) in enumerate(row_items):
+                    with cols[k]:
                         st.caption(f"**{a}** /{cn}")
                         if (a, cn) in results:
                             f2, d2, t2 = results[(a, cn)]
@@ -485,7 +515,7 @@ for ia, a in enumerate(visible_assets):
                         else:
                             st.caption("Not loaded. Use **Load all** or "
                                        "**Load selected…** above.")
-            if i + 3 < len(order_a):
+            if i < n_a:
                 st.write("")
 
         if (a, "vol_run") in results:
