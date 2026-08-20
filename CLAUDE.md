@@ -238,6 +238,49 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-08-20 — Telegram send spacing: proper 429 handling, not just a bigger delay
+
+Follow-up to the images-only rewrite below: user reported it "looked good
+overall" but a few charts were still missing after a "Send all". Root
+cause: `lib/telegram.py`'s `_MIN_SEND_INTERVAL` was 1.5s (~40 sends/min)
+flat, with no handling at all for Telegram's 429 "Too Many Requests" —
+`send_photo`/`send_message` just returned `False` and the caller silently
+dropped that image. Telegram's Bot API caps a single chat at ~1 msg/sec,
+and specifically caps *group* chats at 20/min — if `chat_id` is a group,
+1.5s spacing (40/min) blows straight through that, and "Send all" queues
+100+ photos to one chat, so hitting it was likely, not an edge case.
+
+Two independent fixes, deliberately not just "increase the delay":
+1. Raised `_MIN_SEND_INTERVAL` to 3.2s — under the 20/min group cap with
+   a buffer. This alone would probably have fixed the reported symptom.
+2. Added `_post_with_backoff()`, used by both `send_message` and
+   `send_photo`: on a 429, Telegram's response body includes
+   `parameters.retry_after` — the exact number of seconds it wants you to
+   wait. Sleep that (+0.5s buffer) and retry, up to `_MAX_429_RETRIES=3`
+   times, instead of treating 429 as a hard failure. This is the part
+   that actually matters: (1) alone is a best-effort guess at a safe
+   pace, but a burst can still get through (right after a redeploy,
+   another process hitting the same chat_id, Telegram-side variance) —
+   without backoff, that single burst silently eats whichever image was
+   mid-flight, which is exactly what was reported. `send_photo` rebuilds
+   its `io.BytesIO` fresh on every retry attempt since a consumed stream
+   can't be replayed.
+
+Verified offline with a fake clock (`time.time`/`time.sleep` monkeypatched
+so the test doesn't actually take 3.2s+ per case) and fake
+`requests.post` responses: (1) two consecutive sends are correctly
+>=3.2s apart, (2) a 429 with `retry_after=7` is followed by a real ~7.5s
+sleep and then succeeds on retry, (3) persistent 429s give up cleanly
+after exactly `_MAX_429_RETRIES + 1` attempts rather than looping
+forever, (4) a network exception returns `False` without raising. Also
+re-ran the earlier images-only unit tests and the full page smoke test —
+all still pass. No live Telegram check possible from here (same
+limitation as the images-only fix); the group-vs-private/channel chat
+type is an assumption, not confirmed — if images are still occasionally
+missing after this, the next thing to check is whether `chat_id` is
+actually a group (20/min) vs. a channel/private chat (looser), since that
+changes how tight `_MIN_SEND_INTERVAL` needs to be.
+
 ### 2026-08-20 — Telegram sends: images-only, per-asset send buttons
 
 User feedback: Telegram sends were coming through as text instead of
