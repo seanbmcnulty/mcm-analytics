@@ -238,6 +238,66 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-08-20 — Telegram sends: images-only, per-asset send buttons
+
+User feedback: Telegram sends were coming through as text instead of
+chart/table images, and there was only one "Send all → Telegram" button
+(no way to send just one asset).
+
+**Root cause (best guess, unverified live — no Telegram/Streamlit Cloud
+access from this sandbox):** `requirements.txt` pinned `kaleido>=0.2.1`
+with no upper bound. Kaleido 1.x (released after that pin was written)
+dropped its bundled Chromium and needs a separate browser install step;
+on a headless host like Streamlit Cloud, `fig.to_image()` /
+`write_image()` fails under kaleido 1.x, and the old
+`send_result_to_telegram` caught that failure and silently fell back to
+dumping the table as a raw `<pre>` text block (or, for charts, just
+dropped them with no fallback at all). Pinned to `kaleido>=0.2.1,<0.3.0`
+(the legacy bundled-Chromium branch) in `requirements.txt`. If sends are
+still text after this ships, the pin wasn't the (whole) cause — check the
+GitHub Action / Streamlit Cloud build logs for the kaleido version
+actually installed, and whether a Chrome binary is reachable at runtime.
+
+**`send_result_to_telegram` rewritten** (`pages/01_MCM_Bot.py`) to be
+images-only: table → `fx_style.dataframe_to_table_image` → photo, each
+chart → `fx_style.fig_to_png` → photo, one retry each if the first
+attempt returns `None` (kaleido's headless Chromium occasionally misfires
+cold). The raw-text-dump fallback for a failed table image is gone
+entirely — a failed render is now just not sent, and shows up as a
+"failed to render/send" count in the toolbar's success/error toast
+instead of masquerading as the chart. The *only* remaining text message
+is the command's own status string (e.g. "No basis data available."),
+and only when there's neither a table nor a chart to render in the first
+place — that's not a fallback, there was never an image to send.
+
+**Per-asset send buttons.** The single "Send all → Telegram" button is
+now a row of 5: one per asset (`BTC`/`ETH`/`SOL`/`HYPE`, generated from
+`ASSETS` so it stays correct if that list changes) plus `All`. Refactored
+the queue-building and load-then-send logic (previously inlined under
+`if send_all_btn:`) into two shared helpers so both paths use the same
+code: `_telegram_queue(assets, results)` builds the ordered
+(asset, cmd, fig, df, text) list (handles the `vol_run` table / vol
+surface expansion, same as before), `_send_to_telegram(assets, label)`
+loads only whatever commands aren't already cached for those assets
+(not a full 4-asset reload for a single-asset button) then sends the
+queue and reports sent/failed counts.
+
+Verified offline: unit-tested `send_result_to_telegram` in isolation
+(monkeypatched `fx_style.dataframe_to_table_image`/`fig_to_png` and
+`telegram.send_photo`/`send_message`) across 4 scenarios — normal
+table+chart send, first-attempt image failure with a successful retry,
+total image failure (confirms no text fallback fires), and the genuine
+text-only case — all passed. Also ran the full page under the same rich
+streamlit stub as the row-layout change above, with all 4×21 results
+pre-cached and `st.button` patched so only the BTC send button reports
+"clicked," then captured every `telegram.send_photo`/`send_message` call
+made: exactly BTC's reports went out, nothing from ETH/SOL/HYPE — confirms
+the per-asset scoping actually works, not just that it doesn't crash. No
+live Telegram delivery or Streamlit Cloud check possible from here —
+ask the user to try one asset button after deploying and report whether
+images now come through; if not, revisit the kaleido-version hypothesis
+above.
+
 ### 2026-08-20 — basis_run / block_trades_summary get dedicated full-width rows
 
 User feedback: `/basis_run` and `/block_trades_summary` (both wide,

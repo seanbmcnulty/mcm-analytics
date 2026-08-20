@@ -11,5 +11,11 @@ scipy>=1.11.0
 plotly>=5.18.0
 arch>=6.2.0
 toml>=0.10.2
-kaleido>=0.2.1
+# Pinned below 0.3 on purpose: kaleido 1.x dropped its bundled Chromium
+# (needs a separate browser install step), which silently breaks
+# fig.to_image()/write_image() on a headless host like Streamlit Cloud —
+# the exact symptom of Telegram sends degrading from chart images to raw
+# text. Keep this pin unless a Chrome/Chromium binary is provisioned
+# alongside the app.
+kaleido>=0.2.1,<0.3.0
 streamlit-autorefresh>=1.0.1

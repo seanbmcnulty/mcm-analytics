@@ -166,55 +166,112 @@ def render_output(fig, df, text, key_prefix: str = "out",
         st.markdown(text)
 
 
+def _send_photo(png: bytes | None, caption: str) -> bool:
+    """Send one PNG to Telegram, retrying once if rendering or the send
+    itself failed — kaleido's headless Chromium occasionally misfires cold
+    (e.g. right after a Streamlit Cloud redeploy), and a second attempt
+    often succeeds where the first didn't."""
+    if not png:
+        return False
+    try:
+        return telegram.send_photo(png, caption, parse_mode="HTML")
+    except TypeError:
+        return telegram.send_photo(png, caption)
+
+
 def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> bool:
-    """Send command results matching the FalconX bot format: Table first, then titled charts."""
+    """Send one command's result to Telegram as image(s) only: a table
+    image for the dataframe (if any), one photo per chart (if any).
+
+    This never dumps a table or chart as raw text — if image rendering
+    fails, that piece just isn't sent (the caller's sent/failed tally
+    surfaces it, see _send_to_telegram). The only text message ever sent
+    is the command's own status text, and only when there's no table or
+    chart to render in the first place (e.g. "No basis data available.").
+    """
     ok = False
-    caption_base = f"{asset} /{cmd_name}"
+    has_table = df is not None and not getattr(df, "empty", True)
     figs = fig if isinstance(fig, list) else ([fig] if fig is not None else [])
+    figs = [f for f in figs if f is not None]
+    caption_base = f"{asset} /{cmd_name}"
 
-    # 1. Send Table Image First
-    if df is not None and not getattr(df, "empty", True):
-        # Uses your original fx_style engine, but now it won't fail because kaleido is installed
+    if has_table:
         png = fx_style.dataframe_to_table_image(df, header_text=text or caption_base)
-        
-        if png:
-            try:
-                sent = telegram.send_photo(png, f"<b>{caption_base}</b>", parse_mode="HTML")
-            except TypeError:
-                sent = telegram.send_photo(png, caption_base)
-            if sent:
-                ok = True
-        else:
-            # Fallback if image generation fails
-            msg = f"<b>{caption_base}</b>\n<pre>{df.to_string(index=False)}</pre>"
-            if telegram.send_message(msg):
-                ok = True
+        if png is None:
+            png = fx_style.dataframe_to_table_image(df, header_text=text or caption_base)
+        if _send_photo(png, f"<b>{caption_base}</b>"):
+            ok = True
 
-    # 2. Send Charts with Layout Titles
     for f in figs:
-        if f is None:
-            continue
-
         title_obj = getattr(getattr(f, "layout", None), "title", None)
         title_text = getattr(title_obj, "text", None) if title_obj else None
         caption = str(title_text) if title_text else caption_base
 
         png = fx_style.fig_to_png(fx_style.apply_theme(f, "light"), width=1200, height=800)
-        if png:
-            try:
-                sent = telegram.send_photo(png, caption, parse_mode="HTML")
-            except TypeError:
-                sent = telegram.send_photo(png, caption)
-            if sent:
-                ok = True
+        if png is None:
+            png = fx_style.fig_to_png(fx_style.apply_theme(f, "light"), width=1200, height=800)
+        if _send_photo(png, caption):
+            ok = True
 
-    # 3. Fallback text if no charts or table were produced
-    if not figs and (df is None or getattr(df, "empty", True)) and text:
-        msg = f"<b>{caption_base}</b>\n\n{text}"
-        if telegram.send_message(msg):
+    if not has_table and not figs and text:
+        if telegram.send_message(f"<b>{caption_base}</b>\n\n{text}"):
             ok = True
 
     return ok
+
+
+def _telegram_queue(assets: list[str], results: dict) -> list[tuple]:
+    """Ordered (asset, cmd_name, fig, df, text) tuples to send for `assets`,
+    in dashboard order. vol_run's table is queued under its own command
+    name; its per-expiry vol-surface charts are queued right after
+    moonphase, matching where they render in the dashboard."""
+    order = [(a, cn) for a in assets for cn in cmdreg.COMMAND_NAMES]
+    to_send = []
+    for (a, cn) in order:
+        if (a, cn) not in results:
+            continue
+        fig, df, text = results[(a, cn)]
+        to_send.append((a, cn, None, df, text) if cn == "vol_run"
+                       else (a, cn, fig, df, text))
+        if cn == "moonphase" and (a, "vol_run") in results:
+            f_list, _, _ = results[(a, "vol_run")]
+            if isinstance(f_list, list):
+                for i, f in enumerate(f_list):
+                    if f is not None:
+                        to_send.append((a, f"vol_surface_{i}", f, None, None))
+    return to_send
+
+
+def _send_to_telegram(assets: list[str], label: str) -> None:
+    """Ensure every command is loaded for `assets` (running only what's
+    missing — a single-asset button doesn't force-load the other 3), then
+    send them all to Telegram as images. Shared by the per-asset buttons
+    and the "All" button."""
+    results = st.session_state.mcm_all_results or {}
+    missing = [a for a in assets
+              if any((a, cn) not in results for cn in cmdreg.COMMAND_NAMES)]
+    if missing:
+        with st.spinner(f"Running commands for {', '.join(missing)}…"):
+            fresh = run_reports(missing, list(cmdreg.COMMAND_NAMES),
+                                st.session_state.get("mcm_dte_days", 30))
+            results = {**results, **fresh}
+            st.session_state.mcm_all_results = results
+            st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
+
+    to_send = _telegram_queue(assets, results)
+    sent = failed = 0
+    with st.spinner(f"Sending {label} to Telegram…"):
+        for (a, cn, fig, df, text) in to_send:
+            if send_result_to_telegram(a, cn, fig, df, text):
+                sent += 1
+            else:
+                failed += 1
+    if sent:
+        st.success(f"Sent {sent} report(s) to Telegram."
+                   + (f" ({failed} failed to render/send — retry if this "
+                      "persists.)" if failed else ""))
+    else:
+        st.error("Failed to send reports to Telegram.")
 
 
 def run_reports(assets: list[str], cmd_names: list[str], target_days: int) -> dict:
@@ -303,7 +360,7 @@ st.caption("Crypto derivatives analytics · Deribit public API · "
 _expiries, _using_fallback = _expiry_options()
 _default_idx = _expiries.index(min(_expiries, key=lambda d: abs(d - 30)))
 
-_tb1, _tb2, _tb3, _tb4, _tb5 = st.columns([2.2, 1, 1, 1.4, 1.1])
+_tb1, _tb2, _tb3, _tb4 = st.columns([2.6, 1.2, 1.2, 1.3])
 with _tb1:
     st.selectbox(
         "Default expiry", options=_expiries, index=_default_idx,
@@ -325,14 +382,6 @@ with _tb3:
                                      "with the latest data.")
 with _tb4:
     st.write("")
-    send_all_btn = st.button("Send all → Telegram", key="mcm_send_all", **_stretch(),
-                             disabled=not telegram.is_configured(),
-                             help="Send every loaded report to Telegram, in dashboard "
-                                  "order. Charts as images, tables as table images. "
-                                  "If not everything is loaded yet, Load all runs "
-                                  "first.")
-with _tb5:
-    st.write("")
     with st.popover("Load selected…", **_stretch()):
         st.caption("Pick specific assets/commands instead of loading everything.")
         st.multiselect("Assets", ASSETS, default=list(ASSETS), key="mcm_sel_assets")
@@ -341,6 +390,29 @@ with _tb5:
                        help="Select at least one command. Reports appear in the "
                             "asset tabs below.")
         load_selected_btn = st.button("Load selected", key="mcm_load_selected")
+
+# Send to Telegram — one button per asset plus "All", instead of a single
+# all-or-nothing send. A per-asset button only loads that asset's commands
+# if they aren't cached yet, rather than forcing a full 4-asset run.
+_sb_label, *_sb_asset_cols, _sb_all = st.columns(
+    [1.5] + [0.8] * len(ASSETS) + [0.9])
+with _sb_label:
+    st.write("")
+    st.caption("Send to Telegram (as images):")
+send_asset_clicked = {}
+for _a, _col in zip(ASSETS, _sb_asset_cols):
+    with _col:
+        send_asset_clicked[_a] = st.button(
+            _a, key=f"mcm_send_{_a}", **_stretch(),
+            disabled=not telegram.is_configured(),
+            help=f"Send {_a}'s reports to Telegram as images. Loads {_a}'s "
+                 "commands first if they aren't cached yet.")
+with _sb_all:
+    send_all_btn = st.button(
+        "All", key="mcm_send_all", **_stretch(),
+        disabled=not telegram.is_configured(),
+        help="Send every asset's reports to Telegram as images, in "
+             "dashboard order. Loads anything not already cached first.")
 
 if load_all_btn or refresh_all_btn:
     with st.spinner(f"Running all commands for {', '.join(ASSETS)}…"):
@@ -367,42 +439,12 @@ if load_selected_btn:
         st.success(f"Loaded {len(sel_assets) * len(sel_cmds)} report(s).")
         st.rerun()
 
+for _a in ASSETS:
+    if send_asset_clicked.get(_a):
+        _send_to_telegram([_a], _a)
+
 if send_all_btn:
-    results = st.session_state.mcm_all_results or {}
-    if not results or len(results) < len(MCM_ORDER):
-        with st.spinner("Running all commands, then sending to Telegram…"):
-            results = run_reports(list(ASSETS), list(cmdreg.COMMAND_NAMES),
-                                  st.session_state.get("mcm_dte_days", 30))
-            st.session_state.mcm_all_results = results
-            st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
-
-    # vol_run sends its table here; its vol-surface charts follow moonphase.
-    to_send = []
-    for (a, cn) in MCM_ORDER:
-        if (a, cn) not in results:
-            continue
-        fig, df, text = results[(a, cn)]
-        to_send.append((a, cn, None, df, text) if cn == "vol_run"
-                       else (a, cn, fig, df, text))
-        if cn == "moonphase" and (a, "vol_run") in results:
-            f_list, _, _ = results[(a, "vol_run")]
-            if isinstance(f_list, list):
-                for i, f in enumerate(f_list):
-                    if f is not None:
-                        to_send.append((a, f"vol_surface_{i}", f, None, None))
-
-    sent = failed = 0
-    with st.spinner("Sending reports to Telegram…"):
-        for (a, cn, fig, df, text) in to_send:
-            if send_result_to_telegram(a, cn, fig, df, text):
-                sent += 1
-            else:
-                failed += 1
-    if sent:
-        st.success(f"Sent {sent} report(s) to Telegram."
-                   + (f" ({failed} failed.)" if failed else ""))
-    else:
-        st.error("Failed to send reports to Telegram.")
+    _send_to_telegram(list(ASSETS), "all assets")
 
 # Drop very old results rather than showing stale data indefinitely.
 _ts = st.session_state.get("mcm_all_results_ts")
