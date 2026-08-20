@@ -230,3 +230,78 @@ add_workflow.bat                user-run: move staged .github/workflows file int
   high/low band) are a minor pandas anti-pattern — low-risk to vectorize,
   but not currently a real bottleneck since history frames are now
   size-bounded by the thinning logic above.
+
+## Session log
+
+Keep this updated: when a session makes a non-trivial change, decision, or
+finds a bug worth remembering, add a dated entry below before the session
+ends. Newest entry on top. This is how continuity works across sessions —
+nothing here persists otherwise.
+
+### 2026-08-20 — persistent storage, code review, UI overhaul, project setup
+
+Starting point: a live `AttributeError` on `fx_style.local_now()` that
+persisted after a push (turned out to be a stale Streamlit Cloud worker,
+not a code bug — confirmed via `WebFetch` on the raw GitHub content).
+
+- **Full code review** surfaced and fixed a real regression in
+  `lib/fx_style.py` (SGT timezone conversion, chart watermark, and
+  legend/note collision-avoidance had all silently broken from an earlier
+  edit) — fixed surgically, not via blind revert, since dependent code had
+  co-evolved. Extended the same timezone/theme/watermark treatment to 5
+  pages that never had it (`02, 06, 07, 08, 10`), cleaned up ~27 deprecated
+  `use_container_width` usages app-wide.
+- **Fixed a real bug behind the user's "make lookback periods honest"
+  request**: `history.surface_row_at()` always returned *some* row with no
+  distance check, so short-history assets silently showed the same stale
+  row under two different wrong labels ("1 Week Ago" and "1 Month Ago").
+  Added `surface_row_near()` + `_lookback_points()`/`_fmt_ago()` to relabel
+  honestly and dedupe.
+- **Performance**: found `surface.option_vols_by_dte()` being recomputed up
+  to 113x per asset per "Load all" pass; added a 10s cache
+  (`_VOLS_CACHE`), verified 113→1 calls.
+- **Built the persistent-storage pipeline** (this session's main feature):
+  `scripts/record_snapshot.py` + `.github/workflows/record_snapshots.yml`
+  (hourly cron, commits to a `snapshots` branch, not `main`, to avoid
+  triggering redeploys) + `lib/history.py` remote-fetch/merge. Then a
+  follow-up **code review of that pipeline itself** caught and fixed two
+  real bugs before they could bite in production: (1) the workflow's
+  "does the branch exist" check swallowed *any* failure, including a
+  transient network blip, and would have force-pushed over — i.e.
+  destroyed — all accumulated history on a bad run; fixed via
+  `git ls-remote`'s exit code to distinguish "confirmed absent" from
+  "couldn't tell." (2) the "skip commit if nothing new" check compared
+  against the wrong git ref and would have committed every hour regardless
+  of whether new data existed; fixed to compare against `origin/snapshots`.
+  Also added CSV size-bounding (`_thin_snapshot_file` — full resolution for
+  14 days, 1 row/day beyond that) since hourly recording would otherwise
+  grow forever; caught a timestamp-format bug in that fix during
+  verification (thinned rows and fresh-appended rows used different
+  string formats, which made pandas silently drop rows on read) —
+  documented above under "Persistent snapshot storage," worth remembering
+  if this code is touched again.
+- **Fixed `pages/01_MCM_Bot.py`**: `history.record_snapshot(ASSETS[0])` was
+  only ever recording BTC locally, regardless of which asset the user was
+  viewing — the user caught this by noticing ETH/SOL/HYPE seemed to be on
+  "old methodology." Now loops over all 4 assets (still cheap — each is
+  independently throttled to once per 30 min).
+- **Fixed a GitHub Actions Node.js 20 deprecation warning** by bumping
+  `actions/checkout` and `actions/setup-python` to their latest majors
+  (both now run on Node 24).
+- **UI overhaul** on user's report of "confusing and cluttered, have to
+  scroll down to see everything": collapsed the Settings + Load-reports
+  sections (2 subheaders, 4 always-visible captions, several stacked
+  buttons) into one compact toolbar row, moved "Load selected" into a
+  popover, moved "What each report shows" to the sidebar. Replaced the
+  serial per-asset dashboard loop (scroll past all of BTC, then ETH, then
+  SOL, then HYPE, then the single-command tool at the very bottom) with
+  `st.tabs()` — one tab per asset plus a "Run single command" tab.
+  Built a purpose-made Streamlit stub (tracks widget `key=` uniqueness,
+  supports `session_state` attribute access, returns real context managers
+  from `columns`/`tabs`/`popover`) specifically to smoke-test this since
+  the existing offline harness never exercised `pages/*.py` — caught a
+  leftover duplicate-widget-key bug (would have crashed the live page)
+  before shipping.
+- **Set up this file** and a Cowork Project ("MCM Analytics") so future
+  sessions don't start from zero — see the top of this file for what it
+  covers.
