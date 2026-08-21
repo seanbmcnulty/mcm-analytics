@@ -211,25 +211,57 @@ def fetch_trades_by_currency(currency: str, start_dt_utc: datetime) -> pd.DataFr
     of this shared feed by instrument prefix in fetch_public_trades() below.
     Fetching here once per currency (cached) instead of once per asset avoids
     5 redundant, identical Deribit calls per page load.
+
+    Deribit caps each response at 1000 trades and sets `has_more=True` when
+    there are more in range. The old code made a single call and silently
+    dropped everything past the first 1000 - for a busy 12/24h BTC or ETH
+    window (or the combined USDC feed across 5 assets), that's enough
+    trading to blow past 1000 and quietly lose a large chunk of the window.
+    This walks forward page by page (advancing start_timestamp to just past
+    the last trade's timestamp each time, since sorting=asc) until Deribit
+    reports no more pages or a safety cap is hit.
     """
     start_ms = int(start_dt_utc.timestamp() * 1000)
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
     url = "https://www.deribit.com/api/v2/public/get_last_trades_by_currency_and_time"
-    params = {
-        'currency': currency, 'kind': 'option',
-        'start_timestamp': start_ms, 'end_timestamp': end_ms,
-        'count': 1000, 'sorting': 'asc',
-    }
-    data = _get_json_with_retry(url, params=params, timeout=10)
     all_trades = []
-    if data and 'result' in data and 'trades' in data['result']:
-        all_trades = data['result']['trades']
+    cursor_ms = start_ms
+    max_pages = 20  # 20 x 1000 = 20k trades/currency/load - comfortably above anything realistic
+    for _page in range(max_pages):
+        params = {
+            'currency': currency, 'kind': 'option',
+            'start_timestamp': cursor_ms, 'end_timestamp': end_ms,
+            'count': 1000, 'sorting': 'asc',
+        }
+        data = _get_json_with_retry(url, params=params, timeout=10)
+        if not data or 'result' not in data:
+            break
+        result = data['result']
+        page_trades = result.get('trades', [])
+        if not page_trades:
+            break
+        all_trades.extend(page_trades)
+        if not result.get('has_more'):
+            break
+        last_ts = page_trades[-1].get('timestamp')
+        if last_ts is None:
+            break
+        next_cursor = int(last_ts) + 1  # +1ms so the boundary trade isn't fetched twice
+        if next_cursor <= cursor_ms:
+            break  # cursor didn't move forward - stop rather than loop forever
+        cursor_ms = next_cursor
 
     if not all_trades:
         return pd.DataFrame()
 
     df = pd.DataFrame(all_trades)
+
+    # The +1ms page boundary above is a "should never overlap" guard, not a
+    # guarantee - if two trades ever land in the same millisecond, drop the
+    # duplicate by trade_id rather than double-counting it.
+    if 'trade_id' in df.columns:
+        df = df.drop_duplicates(subset='trade_id', keep='last')
 
     # Parse details
     if "timestamp" in df.columns:
