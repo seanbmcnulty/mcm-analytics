@@ -238,6 +238,66 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-08-20 — Telegram sends still failing after the spacing/429 fix — added diagnostics instead of guessing again
+
+User tried the spacing + 429-backoff fix live and reported it recurred:
+"Sent 21 report(s) to Telegram. (12 failed to render/send — retry if
+this persists.)" 12/33 image attempts failing is a lot, and — important
+tell — the earlier fix (3.2s spacing + honoring Telegram's `retry_after`
+on 429) *should* have resolved a pure rate-limit problem almost
+completely, since 3 retries with the exact wait Telegram asks for rarely
+fails to eventually get through. That it didn't budge is a signal the
+real cause may not be Telegram-side at all — could just as easily be
+kaleido/Chromium failing to render under Streamlit Cloud's constrained
+container (memory/subprocess limits), which the previous fix does
+nothing for.
+
+Rather than guess at a third fix with no way to verify it live (no
+Telegram or Streamlit Cloud access from this sandbox), made the failure
+mode observable instead:
+
+- `lib/fx_style.py:fig_to_png()` silently swallowed its exception with no
+  logging at all (unlike `dataframe_to_table_image()`, which already
+  printed the error). Added a matching `print(f"Error generating chart
+  image: {e}")` — this alone should make Streamlit Cloud's app logs
+  (Manage app → ⋮ → Logs) show the real exception next time a chart
+  fails to render, whether or not the UI-level diagnostics below get
+  used.
+- `send_result_to_telegram()` (`pages/01_MCM_Bot.py`) now returns
+  `(ok, reasons)` instead of a bare bool — `reasons` is a list of
+  per-piece failure strings, each explicitly tagged **render** (kaleido
+  never produced a PNG — a Deribit/rendering-side problem) or **send**
+  (the PNG was fine but Telegram rejected/didn't get it — rate limiting,
+  network, timeout, even after retries). This distinction is the whole
+  point: render vs. send point at completely different fixes, and a flat
+  "12 failed" collapses that.
+- `_send_to_telegram()` now collects every reason across the batch and
+  shows a `st.expander` breaking down "N failed to render, M failed to
+  send" with the full per-item list. The single-command tab's send
+  button surfaces the same reasons inline. Updated all three call sites
+  (`_send_to_telegram`, the "Run single command" tab) for the new tuple
+  return.
+
+**Not yet fixed — deliberately.** This change doesn't change send
+behavior at all, only what's reported. Next step depends entirely on
+what the expander (or the Streamlit Cloud logs) actually says next time
+someone sends: if it's mostly **render** failures, the fix is on the
+kaleido/rendering side (image size, subprocess/resource limits, possibly
+a persistent kaleido process instead of one-shot); if it's mostly
+**send** failures even after backoff, the 3.2s pacing needs to go higher
+still or `_MAX_429_RETRIES` needs raising. Guessing further without that
+signal risks another round-trip like this one — ask the user to check
+the expander (or paste the Streamlit Cloud log lines) after the next
+"Send" attempt before changing anything else here.
+
+Verified offline: updated the existing unit test for
+`send_result_to_telegram`'s new `(ok, reasons)` signature (all 4
+scenarios — normal, retry-succeeds, render-failure-no-text-fallback,
+text-only — still pass, with the render-failure case additionally
+asserting a "render" reason is present) and reran the full page smoke
+test and the button-scoping test; both still pass unmodified other than
+the signature adaptation.
+
 ### 2026-08-20 — Telegram send spacing: proper 429 handling, not just a bigger delay
 
 Follow-up to the images-only rewrite below: user reported it "looked good

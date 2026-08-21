@@ -179,17 +179,23 @@ def _send_photo(png: bytes | None, caption: str) -> bool:
         return telegram.send_photo(png, caption)
 
 
-def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> bool:
+def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> tuple[bool, list[str]]:
     """Send one command's result to Telegram as image(s) only: a table
     image for the dataframe (if any), one photo per chart (if any).
 
     This never dumps a table or chart as raw text — if image rendering
-    fails, that piece just isn't sent (the caller's sent/failed tally
-    surfaces it, see _send_to_telegram). The only text message ever sent
-    is the command's own status text, and only when there's no table or
+    fails, that piece just isn't sent. The only text message ever sent is
+    the command's own status text, and only when there's no table or
     chart to render in the first place (e.g. "No basis data available.").
+
+    Returns (ok, reasons): ok is True if at least one piece went out;
+    reasons lists exactly which piece(s) failed and at which stage
+    (render vs. send) — the render/send distinction matters because
+    they point at different root causes (kaleido vs. Telegram itself),
+    and a flat "failed" count doesn't tell you which one to chase.
     """
     ok = False
+    reasons: list[str] = []
     has_table = df is not None and not getattr(df, "empty", True)
     figs = fig if isinstance(fig, list) else ([fig] if fig is not None else [])
     figs = [f for f in figs if f is not None]
@@ -199,25 +205,36 @@ def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> bool:
         png = fx_style.dataframe_to_table_image(df, header_text=text or caption_base)
         if png is None:
             png = fx_style.dataframe_to_table_image(df, header_text=text or caption_base)
-        if _send_photo(png, f"<b>{caption_base}</b>"):
+        if png is None:
+            reasons.append(f"{caption_base}: table image failed to **render**")
+        elif _send_photo(png, f"<b>{caption_base}</b>"):
             ok = True
+        else:
+            reasons.append(f"{caption_base}: table image failed to **send**")
 
-    for f in figs:
+    for idx, f in enumerate(figs, start=1):
         title_obj = getattr(getattr(f, "layout", None), "title", None)
         title_text = getattr(title_obj, "text", None) if title_obj else None
         caption = str(title_text) if title_text else caption_base
+        label = f"{caption_base} chart {idx}/{len(figs)}"
 
         png = fx_style.fig_to_png(fx_style.apply_theme(f, "light"), width=1200, height=800)
         if png is None:
             png = fx_style.fig_to_png(fx_style.apply_theme(f, "light"), width=1200, height=800)
-        if _send_photo(png, caption):
+        if png is None:
+            reasons.append(f"{label}: failed to **render**")
+        elif _send_photo(png, caption):
             ok = True
+        else:
+            reasons.append(f"{label}: failed to **send**")
 
     if not has_table and not figs and text:
         if telegram.send_message(f"<b>{caption_base}</b>\n\n{text}"):
             ok = True
+        else:
+            reasons.append(f"{caption_base}: status text failed to **send**")
 
-    return ok
+    return ok, reasons
 
 
 def _telegram_queue(assets: list[str], results: dict) -> list[tuple]:
@@ -260,18 +277,37 @@ def _send_to_telegram(assets: list[str], label: str) -> None:
 
     to_send = _telegram_queue(assets, results)
     sent = failed = 0
+    all_reasons: list[str] = []
     with st.spinner(f"Sending {label} to Telegram…"):
         for (a, cn, fig, df, text) in to_send:
-            if send_result_to_telegram(a, cn, fig, df, text):
+            ok, reasons = send_result_to_telegram(a, cn, fig, df, text)
+            if ok:
                 sent += 1
             else:
                 failed += 1
+            all_reasons.extend(reasons)
     if sent:
         st.success(f"Sent {sent} report(s) to Telegram."
-                   + (f" ({failed} failed to render/send — retry if this "
-                      "persists.)" if failed else ""))
+                   + (f" ({failed} failed to render/send — see detail below.)"
+                      if failed else ""))
     else:
         st.error("Failed to send reports to Telegram.")
+
+    if all_reasons:
+        n_render = sum(1 for r in all_reasons if "render" in r)
+        n_send = sum(1 for r in all_reasons if "send" in r)
+        with st.expander(f"⚠️ {len(all_reasons)} image(s)/message(s) had "
+                         f"trouble — {n_render} failed to render, {n_send} "
+                         "failed to send. Click for detail."):
+            st.caption(
+                "**Render** failures happen before Telegram is ever "
+                "contacted (the chart/table image itself couldn't be "
+                "built — usually kaleido). **Send** failures mean the "
+                "image rendered fine but Telegram rejected or didn't "
+                "receive it (rate limiting, network, timeout) even after "
+                "the built-in retries.")
+            for r in all_reasons:
+                st.markdown(f"- {r}")
 
 
 def run_reports(assets: list[str], cmd_names: list[str], target_days: int) -> dict:
@@ -620,9 +656,14 @@ with asset_tabs[-1]:
     send_tg_btn = st.button("Send to Telegram", key="mcm_send_tg",
                             disabled=not (_has_output and telegram.is_configured()))
     if send_tg_btn and _has_output:
-        if send_result_to_telegram(asset, cmd_name, _fig, _df, _text):
-            st.success("Sent to Telegram.")
+        _ok, _reasons = send_result_to_telegram(asset, cmd_name, _fig, _df, _text)
+        if _ok:
+            st.success("Sent to Telegram."
+                       + (f" ({len(_reasons)} piece(s) had trouble — see below.)"
+                          if _reasons else ""))
         else:
             st.error("Failed to send to Telegram.")
+        for _r in _reasons:
+            st.caption(_r)
 
 st.caption("Data provided by the Deribit public API.")

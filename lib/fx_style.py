@@ -184,7 +184,12 @@ def fig_to_png(fig: go.Figure, width: int = 1200, height: int = 800) -> bytes:
         return None
     try:
         return fig.to_image(format="png", width=width, height=height)
-    except Exception:
+    except Exception as e:
+        # Previously silent — a chart-image failure was indistinguishable
+        # from "there was no chart." Printed so it shows up in Streamlit
+        # Cloud's app logs (Manage app -> ... -> Logs) alongside the
+        # matching message from dataframe_to_table_image below.
+        print(f"Error generating chart image: {e}")
         return None
 
 
