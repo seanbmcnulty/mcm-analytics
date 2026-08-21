@@ -257,6 +257,19 @@ def fetch_trades_by_currency(currency: str, start_dt_utc: datetime) -> pd.DataFr
 
     df = pd.DataFrame(all_trades)
 
+    # Deribit tags trades forced by a margin call with a "liquidation" field
+    # ("M"/"T"/"MT" - maker/taker/both side under liquidation), separately
+    # from genuine negotiated block trades. These aren't real block-trade
+    # flow - a single cascading liquidation can fire off many same-direction
+    # trades in a burst, above min size, which is what was cluttering the
+    # ALL-tab scatter grid (and every per-asset tab, since they all share
+    # this fetch) with noise. Drop them at the source so every view here
+    # only shows genuine block trades.
+    if 'liquidation' in df.columns:
+        df = df[df['liquidation'].isna()].copy()
+        if df.empty:
+            return df
+
     # The +1ms page boundary above is a "should never overlap" guard, not a
     # guarantee - if two trades ever land in the same millisecond, drop the
     # duplicate by trade_id rather than double-counting it.

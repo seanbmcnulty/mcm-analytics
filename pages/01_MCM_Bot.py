@@ -474,11 +474,11 @@ with _tb4:
                             "asset tabs below.")
         load_selected_btn = st.button("Load selected", key="mcm_load_selected")
 
-# Send to Telegram — one button per asset plus "All", instead of a single
-# all-or-nothing send. A per-asset button only loads that asset's commands
-# if they aren't cached yet, rather than forcing a full 4-asset run.
-_sb_label, *_sb_asset_cols, _sb_all = st.columns(
-    [1.5] + [0.8] * len(ASSETS) + [0.9])
+# Send to Telegram — one button per asset, a BTC+ETH combo, plus "All",
+# instead of a single all-or-nothing send. A per-asset (or combo) button
+# only loads whatever's missing rather than forcing a full 4-asset run.
+_sb_label, *_sb_asset_cols, _sb_pair, _sb_all = st.columns(
+    [1.5] + [0.8] * len(ASSETS) + [1.0, 0.9])
 with _sb_label:
     st.write("")
     st.caption("Send to Telegram (as images):")
@@ -490,6 +490,13 @@ for _a, _col in zip(ASSETS, _sb_asset_cols):
             disabled=not telegram.is_configured(),
             help=f"Send {_a}'s reports to Telegram as images. Loads {_a}'s "
                  "commands first if they aren't cached yet.")
+_BTC_ETH = [a for a in ASSETS if a in ("BTC", "ETH")]
+with _sb_pair:
+    send_btc_eth_btn = st.button(
+        "BTC+ETH", key="mcm_send_btc_eth", **_stretch(),
+        disabled=not telegram.is_configured() or not _BTC_ETH,
+        help="Send BTC and ETH's reports to Telegram as images. Loads "
+             "whichever of the two aren't cached yet first.")
 with _sb_all:
     send_all_btn = st.button(
         "All", key="mcm_send_all", **_stretch(),
@@ -525,6 +532,9 @@ if load_selected_btn:
 for _a in ASSETS:
     if send_asset_clicked.get(_a):
         _send_to_telegram([_a], _a)
+
+if send_btc_eth_btn and _BTC_ETH:
+    _send_to_telegram(_BTC_ETH, "BTC+ETH")
 
 if send_all_btn:
     _send_to_telegram(list(ASSETS), "all assets")

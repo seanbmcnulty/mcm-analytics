@@ -238,6 +238,76 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-08-21 — Block Trades page: filtered out liquidation-driven trades
+
+User reported "too many liquidation feeds are showing up in the all tab" —
+the only "All" tab in the app is `pages/02_Block_Trades_-_Deribit.py`'s
+"📊 ALL (2x2 Grid)".
+
+**Root cause:** Deribit's `get_last_trades_by_currency_and_time` tags
+trades forced by a margin call with an optional `liquidation` field
+(`"M"` = maker side liquidated, `"T"` = taker side, `"MT"` = both —
+confirmed against Deribit's own API docs, since this repo had no prior
+reference to it). Neither `fetch_trades_by_currency()` on this page nor
+`_fetch_trades_paginated()`/`cmd_block_trades_summary()` in
+`lib/cmd_market.py` filtered on this field — every trade above the
+per-asset min size was treated as a genuine negotiated block trade. A
+cascading liquidation can fire off many same-direction trades in a burst,
+all comfortably above min size, which is exactly what was cluttering the
+ALL-tab scatter grid (and, less visibly, every per-asset tab too, since
+they all share the same `fetch_trades_by_currency()` call).
+
+**Fix:** drop any trade where `liquidation` is set, in both places:
+- `pages/02_Block_Trades_-_Deribit.py`: `fetch_trades_by_currency()` now
+  filters `df[df['liquidation'].isna()]` right after building the
+  DataFrame — fixes every tab on the page (ALL grid + all per-asset tabs +
+  statistics), not just the one the user noticed it in.
+- `lib/cmd_market.py`: `cmd_block_trades_summary()`'s per-trade loop now
+  `continue`s on `t.get("liquidation")` truthy — same bug, same fix,
+  applied to the MCM Bot dashboard's `block_trades_summary` command since
+  it pulls from the same underlying Deribit trades feed and would have
+  had inflated Net Puts/Calls/Gross Notional from the same noise.
+
+Verified offline: a fabricated trade list with 3 liquidation-tagged trades
+(400/300/200 lots) mixed with 1 genuine 50-lot trade confirms
+`cmd_block_trades_summary`'s Net Calls total is exactly 50 (the
+liquidation trades don't leak in at all). Page 02's own `st.cache_data`
+top-level Streamlit run isn't covered by the offline stub harness (never
+was, even before this session), so its filter was verified by reproducing
+the exact same `df['liquidation'].isna()` pandas expression against a
+fabricated DataFrame built the same way (mixed present/missing key ->
+NaN vs "M"/"T"/"MT") to confirm the semantics are correct.
+
+### 2026-08-21 — Added a "BTC+ETH" combined Telegram send button
+
+Small follow-up to the per-asset send buttons. User asked for a button that
+sends just BTC and ETH's reports (not all 4 assets, not one at a time).
+Added a `BTC+ETH` button in `pages/01_MCM_Bot.py`'s toolbar, between the
+per-asset buttons and "All" — reuses the existing `_send_to_telegram()`
+helper (already shared by the per-asset loop and "All") with
+`_BTC_ETH = [a for a in ASSETS if a in ("BTC", "ETH")]` as its asset list,
+so it gets the same caching/loading behavior (only fetches whichever of
+BTC/ETH aren't cached yet) and the same render/send failure breakdown as
+every other send button. Disabled if Telegram isn't configured or (in
+principle, though this can't currently happen) if `_BTC_ETH` were empty.
+
+Verified offline with a new `tests/_smoke_btc_eth_button.py` (adapted from
+the existing `_smoke_button.py`): simulates clicking `mcm_send_btc_eth`
+with all 4 assets' results cached, confirms BTC and ETH captions are sent
+and SOL/HYPE are not.
+
+**Bridge gotcha hit again this session** (documented here since it bit a
+second time): calling `device_stage_files` on a path to refresh its mtime
+before a commit *overwrites the local edited copy* with whatever's
+currently on the device — if that happens after an edit but before a
+commit, the edit is silently lost from the local file (though not from
+disk, since it was never committed). Recovered by restoring from the
+offline test copy at `/tmp/mcm/pages/01_MCM_Bot.py` (which still had the
+correct content, since it was copied there before the re-stage). Lesson:
+either commit immediately after an edit (don't leave edits uncommitted
+across a re-stage call), or keep a known-good copy outside the uploads
+path to restore from if a re-stage clobbers it.
+
 ### 2026-08-20 — Telegram sends: found the actual root cause (not rate limiting)
 
 Follow-up to the diagnostics added just below. User ran a send with the

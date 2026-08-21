@@ -380,6 +380,14 @@ def cmd_block_trades_summary(asset: str, **kwargs):
 
     recs = []
     for t in trades:
+        # Skip trades Deribit tags as forced liquidations ("liquidation":
+        # "M"/"T"/"MT") - these aren't genuine negotiated block trades, and
+        # a cascading liquidation can fire off many of them in a burst,
+        # which inflates Net Puts/Calls and Gross Notional with noise
+        # rather than real desk flow. Same fix as the ALL-tab scatter grid
+        # on the Block Trades page (see CLAUDE.md session log).
+        if t.get("liquidation"):
+            continue
         instr = t.get("instrument_name") or ""
         if not instr or "-" not in instr:
             continue
