@@ -139,41 +139,97 @@ def _post_with_backoff(request_fn):
     return None
 
 
-def send_message(text: str, parse_mode: str = "HTML") -> bool:
-    """Send a text message to the configured Telegram chat."""
+def _log_failure(kind: str, resp) -> None:
+    """Print Telegram's own error message so it shows up in Streamlit
+    Cloud's app logs — a failed send used to just be a bool with no trace
+    of *why*. Caption-formatting bugs (unescaped '<'/'&' triggering
+    Telegram's "can't parse entities") were previously indistinguishable
+    from rate limiting or a network blip; this is what actually let that
+    get diagnosed instead of guessed at."""
+    if resp is None:
+        print(f"Telegram {kind}: request failed (network error/timeout).")
+        return
+    try:
+        body = resp.json()
+    except Exception:
+        body = resp.text[:300] if hasattr(resp, "text") else ""
+    print(f"Telegram {kind} failed: HTTP {resp.status_code} — {body}")
+
+
+def send_message(text: str, parse_mode: str | None = "HTML") -> bool:
+    """Send a text message to the configured Telegram chat.
+
+    If `parse_mode` is set and Telegram rejects the message with a 400
+    (almost always "can't parse entities" — an unescaped '<' or '&' in
+    the text), automatically retries once as plain text rather than
+    losing the message outright. 429s are handled separately by
+    `_post_with_backoff`."""
     token, chat_id = credentials()
     if not (token and chat_id):
         return False
-    _throttle()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    resp = _post_with_backoff(lambda: requests.post(url, data={
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": parse_mode,
-    }, timeout=10))
-    return resp is not None and resp.status_code == 200
+
+    def _data(pm):
+        d = {"chat_id": chat_id, "text": text}
+        if pm:
+            d["parse_mode"] = pm
+        return d
+
+    _throttle()
+    resp = _post_with_backoff(lambda: requests.post(url, data=_data(parse_mode), timeout=10))
+
+    if parse_mode and resp is not None and resp.status_code == 400:
+        _throttle()
+        resp = _post_with_backoff(lambda: requests.post(url, data=_data(None), timeout=10))
+
+    if resp is None or resp.status_code != 200:
+        _log_failure("sendMessage", resp)
+        return False
+    return True
 
 
-def send_photo(image_bytes: bytes, caption: str = "") -> bool:
-    """Send a photo (PNG bytes) to the configured Telegram chat."""
+def send_photo(image_bytes: bytes, caption: str = "", parse_mode: str | None = "HTML") -> bool:
+    """Send a photo (PNG bytes) to the configured Telegram chat.
+
+    Same 400 -> plain-text-caption downgrade as send_message, for the
+    same reason: a caption built from a Plotly chart title can carry
+    Plotly's own markup (<br>, <span style=...>) plus literal characters
+    like the "<=" in "excludes <=3DTE" that aren't markup at all — sent
+    verbatim under parse_mode=HTML, Telegram's parser chokes on that
+    every single time (not a rate limit, which is why spacing/429
+    handling alone didn't fix it). Callers should still sanitize captions
+    up front (see _caption_from_title in pages/01_MCM_Bot.py) — this is
+    the safety net for whatever that doesn't catch."""
     token, chat_id = credentials()
     if not (token and chat_id):
         return False
-    _throttle()
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
-    data = {"chat_id": chat_id}
-    if caption:
-        data["caption"] = caption[:1024]
-        data["parse_mode"] = "HTML"
 
-    def _post():
+    def _data(pm):
+        d = {"chat_id": chat_id}
+        if caption:
+            d["caption"] = caption[:1024]
+            if pm:
+                d["parse_mode"] = pm
+        return d
+
+    def _post(pm):
         # Rebuilt fresh on every attempt — a BytesIO consumed by one POST
         # can't be replayed on a retry.
         files = {"photo": ("chart.png", io.BytesIO(image_bytes), "image/png")}
-        return requests.post(url, files=files, data=data, timeout=30)
+        return requests.post(url, files=files, data=_data(pm), timeout=30)
 
-    resp = _post_with_backoff(_post)
-    return resp is not None and resp.status_code == 200
+    _throttle()
+    resp = _post_with_backoff(lambda: _post(parse_mode))
+
+    if parse_mode and resp is not None and resp.status_code == 400:
+        _throttle()
+        resp = _post_with_backoff(lambda: _post(None))
+
+    if resp is None or resp.status_code != 200:
+        _log_failure("sendPhoto", resp)
+        return False
+    return True
 
 
 def _throttle():

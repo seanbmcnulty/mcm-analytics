@@ -238,6 +238,85 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-08-20 — Telegram sends: found the actual root cause (not rate limiting)
+
+Follow-up to the diagnostics added just below. User ran a send with the
+diagnostics live: "Sent 28 report(s)... (5 failed to render/send)" — all
+5 tagged **send**, 0 **render**, and specifically:
+`forward_vol_steepness`, `forward_vol_steepness_25d_call`,
+`forward_vol_steepness_25d_put`, `atm_iv_box_plot`, `forward_vol_matrix`
+(each chart 1/1). This confirmed the earlier spacing/429 fix was
+treating the wrong disease: a *genuine* 429 with 3 retries honoring
+Telegram's own `retry_after` essentially never fails outright — that it
+kept failing meant it probably wasn't 429 at all.
+
+**Root cause, found by reading the actual code, not guessing:**
+`lib/cmd_vol.py`'s `cmd_forward_vol_steepness` (and its 25d_call/25d_put
+variants, which share the same helper) builds a chart note: `"Assumes
+static curve shape; excludes <=3DTE; carry normalized to..."`. That note
+gets folded into the figure's `title.text` by `fx_style.finalize()` as
+`f"{base}<br><span style='...'>{note}</span>"`. `send_result_to_telegram`
+was using that raw `title.text` as the Telegram caption verbatim, under
+`parse_mode="HTML"`. The `<=3DTE` is literal text, not markup — but
+followed later in the same string by a real `</span>` closing tag, it
+reads to Telegram's HTML parser as one long malformed tag stretching
+from `<=3DTE` to `</span>`, and Telegram rejects the whole send with
+HTTP 400 ("can't parse entities"). This is 100% deterministic — every
+send of these 3 commands' charts would hit it, every time, which is
+exactly what was observed. `atm_iv_box_plot` and `forward_vol_matrix`
+have clean plain-text titles (verified by reading their code — no `<` or
+`&` anywhere), so their 2 failures are NOT explained by this and remain
+genuinely unexplained; see below for how those are now covered anyway.
+
+**Fix, two layers:**
+1. `pages/01_MCM_Bot.py:_caption_from_title()` — the correct, targeted
+   fix for the 3 confirmed cases: converts `<br>` to a newline, strips
+   Plotly's `<span style=...>` tags (regex anchored to literally start
+   with "span" so it can't accidentally swallow unrelated `<...>` text
+   the way a generic `<[^>]+>` strip would have — that was tried and
+   rejected during this fix because it would silently eat the `<=3DTE`
+   note text up to the next real `>`), then `html.escape()`s whatever
+   text remains so a literal `<=`/`&`/`>` displays as itself instead of
+   being parsed as markup. Also truncates to 700 chars before escaping
+   (escaping can expand length; do this before any 1024-char API-side
+   cap, not after, so a cut can't land mid-entity).
+2. `lib/telegram.py:send_message`/`send_photo` — a defensive safety net,
+   not the primary fix: on any HTTP 400 while `parse_mode="HTML"` was
+   used, automatically retries once with `parse_mode=None` (plain
+   caption/text) rather than losing the message. This is what actually
+   covers the 2 unexplained `atm_iv_box_plot`/`forward_vol_matrix`
+   failures — whatever caused those (still unknown), if it was any kind
+   of entity-parsing issue, this catches it too. Also added
+   `_log_failure()`: any send that still fails after all retries now
+   `print()`s Telegram's actual error body, so it shows up in Streamlit
+   Cloud's logs — previously a failure was just `False`, no trace of why.
+
+Removed the old `try: telegram.send_photo(..., parse_mode="HTML") except
+TypeError: ...` dance in `pages/01_MCM_Bot.py:_send_photo()` now that
+`send_photo` takes `parse_mode` as a real (optional, default `"HTML"`)
+parameter — that dance existed only because the signature didn't used to
+accept it.
+
+Verified offline: reproduced the *exact* broken caption
+(`"{base}<br><span style='...'>excludes <=3DTE...</span>"`) in a unit
+test and confirmed `_caption_from_title` removes every unescaped `<`
+while preserving the literal "<=3DTE" text (as `&lt;=3DTE`) and dropping
+the Plotly span styling — this is a direct reproduction of the live bug,
+not a synthetic one. Separately unit-tested the 400-downgrade path in
+isolation (400 → auto-retry plain-text → succeeds; a 400 that also fails
+plain-text gives up after exactly 2 attempts, no infinite loop; a 429
+never touches the 400 path, stays on HTML throughout). Reran the full
+existing suite (page smoke test, button-scoping test, 429-backoff tests,
+math tests, full 21×4 command matrix) — all still pass.
+
+**Still open:** the `atm_iv_box_plot`/`forward_vol_matrix` failures
+aren't explained by this fix — their titles are clean. The 400-downgrade
+safety net should paper over them if they're any variant of an
+entities-parsing problem, but if they recur with the safety net in
+place, `_log_failure`'s new log line is the next thing to check (or the
+render/send + reason breakdown already in the UI, if it's not actually a
+send-layer issue at all).
+
 ### 2026-08-20 — Telegram sends still failing after the spacing/429 fix — added diagnostics instead of guessing again
 
 User tried the spacing + 429-backoff fix live and reported it recurred:

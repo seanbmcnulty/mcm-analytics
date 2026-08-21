@@ -9,6 +9,8 @@ sidebar as reference material.
 """
 
 import sys
+import html
+import re
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -166,17 +168,58 @@ def render_output(fig, df, text, key_prefix: str = "out",
         st.markdown(text)
 
 
+_SPAN_TAG_RE = re.compile(r"</?span[^>]*>", re.IGNORECASE)
+_CAPTION_SAFE_LEN = 700  # generous for a chart title; keeps well under
+                          # Telegram's 1024-char caption cap even after
+                          # HTML-escaping expands some characters
+
+
+def _caption_from_title(title_text: str | None, fallback: str) -> str:
+    """Turn a Plotly figure's title.text into a safe Telegram HTML-mode
+    caption.
+
+    Plotly titles carry Plotly's own light markup (<br> for a line
+    break, <span style=...> for the smaller reconstruction-note line
+    that fx_style.finalize() adds) — but note text itself can contain
+    literal characters that aren't markup at all, e.g.
+    forward_vol_steepness's note reads "excludes <=3DTE". Sent verbatim
+    under Telegram's parse_mode=HTML, that "<=" combined with a real
+    closing </span> tag later in the string reads as one huge malformed
+    tag to Telegram's parser, which rejects the whole message with a 400
+    ("can't parse entities") — every single time, deterministically, for
+    any chart whose note/title contains that pattern. That's why
+    forward_vol_steepness and its 25d_call/25d_put variants failed to
+    send 100% of the time while spacing/rate-limit fixes did nothing for
+    them: it was never a rate limit.
+
+    Fix: convert <br> to a newline, strip Plotly's <span> tags (Telegram
+    doesn't support arbitrary style attributes on <span> anyway), then
+    html.escape() whatever's left so any remaining literal '<'/'&'/'>'
+    renders as itself instead of being parsed as markup. This does mean
+    a title's own bold/italic styling (none currently used in title text)
+    would render as escaped text rather than formatting — an acceptable
+    trade for "always delivers."
+    """
+    if not title_text:
+        return fallback
+    text = (title_text.replace("<br>", "\n")
+                       .replace("<br/>", "\n")
+                       .replace("<br />", "\n"))
+    text = _SPAN_TAG_RE.sub("", text).strip()
+    if len(text) > _CAPTION_SAFE_LEN:
+        text = text[:_CAPTION_SAFE_LEN].rstrip() + "…"
+    text = html.escape(text)
+    return text or fallback
+
+
 def _send_photo(png: bytes | None, caption: str) -> bool:
-    """Send one PNG to Telegram, retrying once if rendering or the send
-    itself failed — kaleido's headless Chromium occasionally misfires cold
-    (e.g. right after a Streamlit Cloud redeploy), and a second attempt
-    often succeeds where the first didn't."""
+    """Send one PNG to Telegram. telegram.send_photo already retries a
+    429 (rate limit) with Telegram's own retry_after, and separately
+    downgrades to a plain-text caption if HTML parsing is ever still
+    rejected — this wrapper just guards against a missing image."""
     if not png:
         return False
-    try:
-        return telegram.send_photo(png, caption, parse_mode="HTML")
-    except TypeError:
-        return telegram.send_photo(png, caption)
+    return telegram.send_photo(png, caption)
 
 
 def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> tuple[bool, list[str]]:
@@ -215,7 +258,7 @@ def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> tuple[b
     for idx, f in enumerate(figs, start=1):
         title_obj = getattr(getattr(f, "layout", None), "title", None)
         title_text = getattr(title_obj, "text", None) if title_obj else None
-        caption = str(title_text) if title_text else caption_base
+        caption = _caption_from_title(title_text, caption_base)
         label = f"{caption_base} chart {idx}/{len(figs)}"
 
         png = fx_style.fig_to_png(fx_style.apply_theme(f, "light"), width=1200, height=800)
@@ -229,7 +272,11 @@ def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> tuple[b
             reasons.append(f"{label}: failed to **send**")
 
     if not has_table and not figs and text:
-        if telegram.send_message(f"<b>{caption_base}</b>\n\n{text}"):
+        # text here is a command's own status/error string (can carry an
+        # exception message verbatim, e.g. cmd_block_trades_summary's
+        # "Failed to fetch trades: {exc}") — escape it too, same reason
+        # as chart captions above.
+        if telegram.send_message(f"<b>{caption_base}</b>\n\n{html.escape(str(text))}"):
             ok = True
         else:
             reasons.append(f"{caption_base}: status text failed to **send**")
