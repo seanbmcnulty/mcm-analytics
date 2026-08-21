@@ -2,7 +2,7 @@
 Block Trades — Deribit public block trade analysis.
 
 Replicates the Deribit Block Trades page:
-- Scatter Plot overlaid with Historical Spot Price (yaxis2) and DVOL Index (yaxis3)
+- Scatter Plot overlaid with Perpetual Price (yaxis2) and DVOL Index (yaxis3)
 - Strike vs Expiry Bubble Maps (Log scale)
 - Net Flow Heatmaps & Gross Volume Heatmaps
 - Cumulative Volume Breakdown (Buys/Sells/Calls/Puts)
@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import time
+import concurrent.futures
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -82,6 +83,16 @@ DEFAULT_MIN_SIZES = {
 
 ASSETS = list(DEFAULT_MIN_SIZES.keys())
 
+# Deribit groups every USDC-settled option under a single "USDC" currency
+# feed (SOL/XRP/TRX/AVAX/HYPE options are filtered out of it client-side by
+# instrument prefix) - so there are really only 3 distinct trades feeds to
+# fetch, not 7. Fetching by currency once and reusing it across assets cuts
+# out 4 redundant identical API calls per page load.
+CURRENCY_MAP = {
+    'BTC': 'BTC', 'ETH': 'ETH', 'SOL_USDC': 'USDC', 'XRP_USDC': 'USDC',
+    'TRX_USDC': 'USDC', 'AVAX_USDC': 'USDC', 'HYPE_USDC': 'USDC',
+}
+
 PLOTLY_LAYOUT = dict(
     paper_bgcolor=BACKGROUND_COLOR,
     plot_bgcolor=BACKGROUND_COLOR,
@@ -140,6 +151,40 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # API Fetching Helpers
 # ---------------------------------------------------------------------------
+def _get_json_with_retry(url, params=None, timeout=10, max_retries=2, pace=0.15):
+    """GET + .json() with a couple of retries and real 429 backoff.
+
+    Previously every call here was try/except-swallowed with zero retries, so
+    a single transient timeout or rate-limit response silently turned into an
+    empty DataFrame downstream (e.g. the perp line vanishing from a chart)
+    with no sign of why. This keeps the same "never raise, just return None
+    on failure" contract callers already rely on, but gives a request an
+    actual chance to succeed first.
+    """
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 429:
+                wait = 1.0
+                try:
+                    wait = float(r.headers.get('Retry-After', wait))
+                except (TypeError, ValueError):
+                    pass
+                time.sleep(min(max(wait, 0.5), 3.0))
+                continue
+            r.raise_for_status()
+            if pace:
+                time.sleep(pace)  # Pace API limit
+            return r.json()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                time.sleep(0.3 * (attempt + 1))
+    if last_exc is not None:
+        print(f"Deribit request failed after retries ({url}): {last_exc}")
+    return None
+
 @st.cache_data(ttl=30, show_spinner=False)
 def get_current_spot(asset: str) -> float:
     index_map = {
@@ -148,69 +193,76 @@ def get_current_spot(asset: str) -> float:
         'AVAX_USDC': 'avax_usdc', 'HYPE_USDC': 'hype_usdc'
     }
     index_name = index_map.get(asset, f"{asset.lower()}_usd")
-    url = f'https://deribit.com/api/v2/public/get_index_price?index_name={index_name}'
+    url = 'https://deribit.com/api/v2/public/get_index_price'
+    data = _get_json_with_retry(url, params={'index_name': index_name}, timeout=5)
+    if not data:
+        return 0.0
     try:
-        r = requests.get(url, timeout=5)
-        time.sleep(0.15) # Pace API limit
-        r.raise_for_status()
-        return float(r.json()['result']['index_price'])
-    except Exception:
+        return float(data['result']['index_price'])
+    except (KeyError, TypeError, ValueError):
         return 0.0
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_public_trades(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
-    currency = "USDC" if "_USDC" in asset else asset
+def fetch_trades_by_currency(currency: str, start_dt_utc: datetime) -> pd.DataFrame:
+    """Fetch+parse the raw trades feed for one Deribit currency (BTC/ETH/USDC).
+
+    Deribit exposes all USDC-settled option flow (SOL, XRP, TRX, AVAX, HYPE)
+    under a single "USDC" currency - the individual assets are filtered out
+    of this shared feed by instrument prefix in fetch_public_trades() below.
+    Fetching here once per currency (cached) instead of once per asset avoids
+    5 redundant, identical Deribit calls per page load.
+    """
     start_ms = int(start_dt_utc.timestamp() * 1000)
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-    url = (
-        f"https://www.deribit.com/api/v2/public/get_last_trades_by_currency_and_time?"
-        f"currency={currency}&kind=option&start_timestamp={start_ms}&end_timestamp={end_ms}&count=1000&sorting=asc"
-    )
-    
+    url = "https://www.deribit.com/api/v2/public/get_last_trades_by_currency_and_time"
+    params = {
+        'currency': currency, 'kind': 'option',
+        'start_timestamp': start_ms, 'end_timestamp': end_ms,
+        'count': 1000, 'sorting': 'asc',
+    }
+    data = _get_json_with_retry(url, params=params, timeout=10)
     all_trades = []
-    try:
-        r = requests.get(url, timeout=10)
-        time.sleep(0.15) # Pace API limit safely
-        r.raise_for_status()
-        data = r.json()
-        if 'result' in data and 'trades' in data['result']:
-            all_trades = data['result']['trades']
-    except Exception:
-        return pd.DataFrame()
+    if data and 'result' in data and 'trades' in data['result']:
+        all_trades = data['result']['trades']
 
     if not all_trades:
         return pd.DataFrame()
 
     df = pd.DataFrame(all_trades)
-    
-    # Filter by instrument prefix for USDC settled (SOL, XRP, AVAX, HYPE, TRX)
-    if "_USDC" in asset:
-        prefix = f"{asset}-"
-        if "instrument_name" in df.columns:
-            df = df[df['instrument_name'].str.startswith(prefix)].copy()
-
-    if df.empty:
-        return pd.DataFrame()
 
     # Parse details
     if "timestamp" in df.columns:
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert(SGT)
-    
+
     if "amount" in df.columns:
         df['abs_amount'] = df['amount'].abs()
         df['amount'] = np.where(df['direction'] == 'buy', df['abs_amount'], -df['abs_amount'])
-    
+
     # Parse strikes and expiries
     if "instrument_name" in df.columns:
         df['strike'] = pd.to_numeric(df['instrument_name'].str.extract(r'-(\d+(?:\.\d+)*)-')[0], errors='coerce')
         df['expiry'] = pd.to_datetime(df['instrument_name'].str.extract(r'^[^-]*-([0-9]{1,2}[A-Z]{3}[0-9]{2})-')[0], format='%d%b%y', errors='coerce')
         df['option_type'] = df['instrument_name'].str.extract(r'-(C|P)$')[0]
-    
+
     if 'mark_price' not in df.columns and 'price' in df.columns:
         df['mark_price'] = df['price']
-    
+
     return df.dropna(subset=['strike', 'expiry']).reset_index(drop=True)
+
+def fetch_public_trades(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
+    """Per-asset view over the shared per-currency trades feed."""
+    currency = CURRENCY_MAP.get(asset, asset)
+    df = fetch_trades_by_currency(currency, start_dt_utc)
+    if df.empty:
+        return df
+
+    # Filter by instrument prefix for USDC settled (SOL, XRP, AVAX, HYPE, TRX)
+    if "_USDC" in asset and "instrument_name" in df.columns:
+        prefix = f"{asset}-"
+        df = df[df['instrument_name'].str.startswith(prefix)].copy()
+
+    return df.reset_index(drop=True) if not df.empty else df
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_historical_spot(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
@@ -230,25 +282,28 @@ def fetch_historical_spot(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
         'end_timestamp': end_ms,
         'resolution': '5'  # 5-minute candles to safely avoid the 1000 limit
     }
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        time.sleep(0.15) # Pace API limit safely
-        r.raise_for_status()
-        chart = r.json().get('result', {})
-        if chart.get('status') == 'ok' and chart.get('ticks') and chart.get('close'):
-            ts = pd.to_datetime(chart['ticks'], unit='ms', utc=True).dt.tz_convert(SGT)
-            return pd.DataFrame({'timestamp': ts, 'close': chart['close']})
-        else:
-            print(f"Tradingview API did not return OK for {asset}: {chart}")
-    except Exception as e:
-        print(f"Error fetching historical spot for {asset}: {e}")
+    data = _get_json_with_retry(url, params=params, timeout=10)
+    if not data:
+        return pd.DataFrame()
+    chart = data.get('result', {})
+    if chart.get('status') == 'ok' and chart.get('ticks') and chart.get('close'):
+        # NB: chart['ticks'] is a plain list, so pd.to_datetime(...) here
+        # returns a DatetimeIndex, not a Series - it has no `.dt` accessor
+        # (that only exists on Series). The old `.dt.tz_convert(...)` call
+        # raised AttributeError on every single invocation; wrapped in the
+        # try/except this used to live in, that made this function return an
+        # empty DataFrame 100% of the time, which is why the perp price line
+        # never actually appeared on the "Block Trades Over Time" chart.
+        ts = pd.to_datetime(chart['ticks'], unit='ms', utc=True).tz_convert(SGT)
+        return pd.DataFrame({'timestamp': ts, 'close': chart['close']})
+    print(f"Tradingview API did not return OK for {instrument}: {chart}")
     return pd.DataFrame()
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_dvol(asset: str, start_dt_utc: datetime) -> pd.Series:
     if asset not in ['BTC', 'ETH']:
         return pd.Series(dtype=float)
-    
+
     start_ms = int(start_dt_utc.timestamp() * 1000)
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -259,20 +314,16 @@ def fetch_dvol(asset: str, start_dt_utc: datetime) -> pd.Series:
         'end_timestamp': end_ms,
         'resolution': '60'
     }
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        time.sleep(0.15) # Pace API limit safely
-        r.raise_for_status()
-        result = r.json().get('result', {})
-        data = result.get('data', [])
-        if data:
+    data = _get_json_with_retry(url, params=params, timeout=10)
+    if data:
+        result = data.get('result', {})
+        rows = result.get('data', [])
+        if rows:
             cols = ['timestamp', 'open', 'high', 'low', 'close']
-            df = pd.DataFrame(data, columns=cols)
+            df = pd.DataFrame(rows, columns=cols)
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert(SGT)
             df.set_index('timestamp', inplace=True)
             return df['close'].sort_index()
-    except Exception:
-        pass
     return pd.Series(dtype=float)
 
 # ---------------------------------------------------------------------------
@@ -465,7 +516,7 @@ def plot_scatter_with_spot_and_dvol(data, hist_spot, dvol_series, current_spot, 
         ))
 
     layout = dict(
-        title=f'{asset} Block Trades Over Time (Spot & DVOL)',
+        title=f'{asset} Block Trades Over Time (Perp & DVOL)',
         xaxis_title='Timestamp (SGT)',
         yaxis_title='Option Strike',
         yaxis=dict(type='linear', autorange=True),
@@ -656,11 +707,54 @@ dvol_dict = {}
 spot_dict = {}
 
 with st.spinner("Fetching Block Trades, Spot, and DVOL data..."):
+    # Previously this looped over the 7 assets sequentially, issuing 4 blocking
+    # HTTP calls per asset (spot, trades, perp candles, DVOL) one after another
+    # - ~26 serial round-trips (5 of the "trades" calls were also fetching the
+    # exact same USDC currency feed redundantly, see fetch_public_trades).
+    # That serial waterfall is what made the page slow to load, and long
+    # enough that a rate-limited or timed-out call late in the sequence
+    # (e.g. a later asset's perp price) would silently come back empty with
+    # no retry - which is what could make the perp line look "missing" on a
+    # chart even though the plotting code for it is correct.
+    # Fetching every asset/currency concurrently cuts wall-clock time down to
+    # roughly the slowest single call instead of the sum of all of them, and
+    # the retry/backoff in _get_json_with_retry makes each call more likely
+    # to actually succeed.
+    unique_currencies = sorted(set(CURRENCY_MAP.get(a, a) for a in ASSETS))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+        spot_futures = {executor.submit(get_current_spot, a): a for a in ASSETS}
+        trades_futures = {
+            executor.submit(fetch_trades_by_currency, c, start_datetime_utc): c
+            for c in unique_currencies
+        }
+        hist_futures = {
+            executor.submit(fetch_historical_spot, a, start_datetime_utc): a
+            for a in ASSETS
+        }
+        dvol_futures = {
+            executor.submit(fetch_dvol, a, start_datetime_utc): a for a in ASSETS
+        }
+
+        for fut in concurrent.futures.as_completed(spot_futures):
+            spot_dict[spot_futures[fut]] = fut.result()
+
+        currency_trades = {}
+        for fut in concurrent.futures.as_completed(trades_futures):
+            currency_trades[trades_futures[fut]] = fut.result()
+
+        for fut in concurrent.futures.as_completed(hist_futures):
+            hist_spot_dict[hist_futures[fut]] = fut.result()
+
+        for fut in concurrent.futures.as_completed(dvol_futures):
+            dvol_dict[dvol_futures[fut]] = fut.result()
+
     for asset in ASSETS:
-        spot = get_current_spot(asset)
-        spot_dict[asset] = spot
-        
-        raw_trades = fetch_public_trades(asset, start_datetime_utc)
+        spot = spot_dict[asset]
+        raw_trades = currency_trades.get(CURRENCY_MAP.get(asset, asset), pd.DataFrame())
+        if not raw_trades.empty and "_USDC" in asset and "instrument_name" in raw_trades.columns:
+            raw_trades = raw_trades[raw_trades['instrument_name'].str.startswith(f"{asset}-")].copy()
+
         if not raw_trades.empty:
             filtered = raw_trades[raw_trades['abs_amount'] >= min_sizes[asset]].copy()
             filtered['index_price'] = spot
@@ -668,9 +762,6 @@ with st.spinner("Fetching Block Trades, Spot, and DVOL data..."):
             asset_data_dict[asset] = filtered
         else:
             asset_data_dict[asset] = pd.DataFrame()
-            
-        hist_spot_dict[asset] = fetch_historical_spot(asset, start_datetime_utc)
-        dvol_dict[asset] = fetch_dvol(asset, start_datetime_utc)
 
 # Summary Top Metrics
 m_cols = st.columns(len(ASSETS))
