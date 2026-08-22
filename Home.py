@@ -122,6 +122,7 @@ page_info = [
     ("07 Regime Identifier", "Vol regime classification (GARCH + implied vol)"),
     ("08 Spot-Vol Correlation", "DVOL vs spot analysis (BTC/ETH)"),
     ("10 Macro Event Impact", "CPI/FOMC/NFP surprise z-scores + price reactions"),
+    ("11 Fear & Greed Signal", "Contrarian delta-lean backtest vs alternative.me Fear & Greed Index"),
 ]
 
 grid_cols = st.columns(3)

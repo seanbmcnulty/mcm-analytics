@@ -16,6 +16,13 @@ Covers 4 assets: **BTC, ETH, SOL, HYPE** (`lib/constants.py:ASSET_CONFIG`).
 BTC/ETH have a Deribit DVOL index; SOL/HYPE don't (`has_dvol: False`) — that
 asymmetry is permanent and intentional, not a bug to "fix."
 
+**One deliberate exception to "Deribit-only":** `pages/11_Fear_Greed_Signal.py`
+pulls the Crypto Fear & Greed Index from alternative.me (`lib/fng.py`) since
+Deribit has no sentiment index at all. Confirmed with the user before adding
+it (2026-08-22) — see the Session log entry below and `lib/fng.py`'s module
+docstring. Everything else on that page (price data) is still Deribit perp
+OHLC via `lib/deribit.py`, same as every other page.
+
 Local repo lives on the owner's machine (Windows) — reached in Cowork
 sessions via the `mcp__remote-devices__*` device-bridge tools, folder name
 `mcm-analytics` (nested: the connected root contains a `mcm-analytics`
@@ -175,7 +182,9 @@ pages/02_Block_Trades.py        block trade flow — NOTE: calls Deribit directl
                                  not reckless, but not coordinated with the rest of the
                                  app either. Worth unifying eventually, not urgent.
 pages/06,07,08,10_*.py          secondary analytics pages (RV, regime, correlation, macro)
-pages/03,04,05,09,11,12,13,14   retired — moved to _to_delete/ on the device, not in git
+pages/11_Fear_Greed_Signal.py   contrarian delta-lean backtest vs alternative.me F&G Index
+                                 (the one non-Deribit data source in this app — see above)
+pages/03,04,05,09,12,13,14      retired — moved to _to_delete/ on the device, not in git
 
 lib/deribit.py                  Deribit public API client, caching, rate limiting
 lib/surface.py                  option chain parsing, BS delta search, vol surface math
@@ -188,6 +197,8 @@ lib/constants.py                ASSET_CONFIG, ASSETS, color scheme
 lib/fx_style.py                 plotly theming, SGT timezone helpers (local_now, to_local),
                                  watermark, chart title/legend/margin layout (finalize())
 lib/vol_math.py                 Black-Scholes, implied vol, delta math
+lib/fng.py                      alternative.me Crypto Fear & Greed Index client (pure
+                                 functions, no streamlit import — same shape as deribit.py)
 lib/instruments.py, telegram.py instrument parsing; Telegram send integration
 
 scripts/record_snapshot.py      standalone CLI recorder, run by the GH Action
@@ -237,6 +248,92 @@ Keep this updated: when a session makes a non-trivial change, decision, or
 finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
+
+### 2026-08-22 — New page: Fear & Greed Signal (contrarian delta-lean backtest)
+
+User asked for a new page answering: at what Crypto Fear & Greed Index
+levels has leaning delta long (fear) or short (greed) historically paid
+off, with a probability/confidence measure to gauge whether to follow the
+signal. Confirmed three design decisions with the user before building
+(all went with the recommended option): (1) OK to add alternative.me's
+Crypto Fear & Greed Index as a new external, non-Deribit data source —
+Deribit has nothing like it; (2) backtest against the perpetual (what
+delta lean is actually traded on), not spot/index; (3) let the page run
+against all 4 assets (F&G is one market-wide series, applied to each
+asset's own price), not BTC-only.
+
+**New files:** `lib/fng.py` (alternative.me client — pure functions, no
+streamlit import, same shape/testability as `lib/deribit.py`: retry/backoff,
+no in-process cache of its own since the page layer owns caching via
+`st.cache_data`) and `pages/11_Fear_Greed_Signal.py`.
+
+**What the page does:** merges daily F&G value against the asset's daily
+perp close, classifies each day into Extreme Fear/Fear/Neutral/Greed/
+Extreme Greed (thresholds adjustable via sidebar sliders, default matches
+alternative.me's own 25/45/55/75), then for each bucket × forward-return
+horizon computes: n, mean/median forward return, win rate (probability the
+contrarian call — long on fear, short on greed — was the right direction),
+a Wilson-score 95% CI on that win rate, and a two-sided binomial-test
+p-value vs. a coin flip. Also: a threshold-free decile view (same idea
+without picking bucket edges), a value-vs-forward-return scatter with
+OLS regression (slope/r/R²/p), and a daily-rebalanced equity curve
+(bucket signal × next-day return) vs. buy-and-hold. Current-signal panel
+up top surfaces today's F&G reading, its bucket, a suggested delta lean
+(±1 for Extreme, ±0.5 for Fear/Greed, scaled to a sidebar-set max %), and
+the historical win rate/CI/p-value for that exact bucket at the
+user-chosen "headline" horizon.
+
+**Deliberately flagged, not modeled:** funding, fees, slippage, leverage
+— this isolates the directional signal, it isn't a tradable strategy
+backtest. Also flagged: forward-return windows overlap (a 7d window
+starting today shares 6 days with tomorrow's), so the significance stats
+are indicative, not textbook independent-sample rigorous. Both caveats are
+in the page's docstring and footer caption, not just here — didn't want
+this framed as investment advice; kept language factual/descriptive per
+usual (win rate, CI, p-value) rather than issuing calls to action.
+
+**Verified offline** (no live network to api.alternative.me from this
+sandbox either — same constraint as Deribit, see Testing section):
+1. `lib/fng.py` unit-tested against a payload shaped exactly like
+   alternative.me's documented response (values/timestamps as strings,
+   per the real API): happy-path parsing + ascending sort, duplicate-date
+   collapse, HTTP 500 → `None` not an exception, malformed body (missing
+   `data`) → `None`, a 429 backing off and succeeding on retry, and
+   `classify()`'s bucket edges including the `None`/`NaN` → `"Unknown"`
+   path.
+2. Built a `/tmp/stubs/streamlit.py` + `/tmp/stubs/plotly/graph_objects.py`
+   pair (plotly wasn't installable in this sandbox either — no PyPI
+   egress — so it's a stub, not the real package; pandas/numpy/scipy are
+   real) rich enough to run `pages/*.py` end-to-end: sidebar/columns/
+   expander act as both context managers and no-op method targets (real
+   Streamlit lets you call `col.metric(...)` directly on a column object,
+   which the first stub draft missed and had to fix), widgets return their
+   coded default so the page exercises its actual cold-load path, and
+   `st.cache_data` is a no-op passthrough.
+3. **The real test, not just "doesn't crash":** generated 1500 days of
+   synthetic data with a *known* injected effect — an autocorrelated F&G
+   oscillator plus daily returns with a genuine (small, noisy) negative
+   loading on `(F&G − 50)` — and ran the full page via `runpy` for all 4
+   assets. Confirmed the statistics pipeline actually recovers the
+   injected relationship: regression slope negative and p≈0 over n≈1493,
+   Extreme Fear and Extreme Greed win rates both >50% with real sample
+   sizes, Wilson CI bounds sane (contain the point estimate, within
+   [0,1]), and the equity curve is finite and behaves sensibly (in this
+   synthetic world where price drifts down with a real contrarian tilt
+   baked in, the signal strategy beats buy-and-hold, as it should). Also
+   directly tested `classify()`'s edge behavior (boundary values fall into
+   the expected bucket, e.g. exactly 25 is `"Fear"` not `"Extreme Fear"`)
+   and `wilson_ci()`'s degenerate `n=0` case.
+
+No live Streamlit/browser check possible from this sandbox (same
+limitation as every other page here) — ask the user to sanity-check the
+live page after deploying, particularly the chart layout (dual y-axis
+price/F&G overlay, bar chart error bars) which can't be visually verified
+offline.
+
+Also added the page to `Home.py`'s page grid and reused `pages/11` for
+this — it had been vacated by an earlier retired page per the Code map
+below (not in git, so no actual collision).
 
 ### 2026-08-21 — Added a "BTC+ETH" combined Telegram send button
 
