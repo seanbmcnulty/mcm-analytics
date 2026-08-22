@@ -846,26 +846,28 @@ for idx, asset in enumerate(ASSETS):
             key=f"tab_strike_expiry_{asset}"
         )
         
-        # 3. Heatmaps Side-by-Side
+        # 3. Heatmaps Side-by-Side (equal-width columns, so both boxes match)
         col1, col2 = st.columns(2)
         with col1:
             st.plotly_chart(
-                plot_net_heatmap(df_asset, clean_name), 
+                plot_net_heatmap(df_asset, clean_name),
                 width="stretch",
                 key=f"tab_net_heatmap_{asset}"
             )
         with col2:
             st.plotly_chart(
-                plot_cumulative_flow(df_asset, clean_name), 
+                plot_gross_volume_heatmap(df_asset, clean_name),
                 width="stretch",
-                key=f"tab_cumulative_{asset}"
+                key=f"tab_gross_volume_{asset}"
             )
-            
-        # 4. Gross Volume Heatmap
+
+        # 4. Cumulative Flow (moved out of the heatmap row so both heatmaps
+        # above are equal-sized boxes instead of one being paired with this
+        # chart at half width and the other sitting full-width alone)
         st.plotly_chart(
-            plot_gross_volume_heatmap(df_asset, clean_name), 
+            plot_cumulative_flow(df_asset, clean_name),
             width="stretch",
-            key=f"tab_gross_volume_{asset}"
+            key=f"tab_cumulative_{asset}"
         )
 
 # ---------------------------------------------------------------------------

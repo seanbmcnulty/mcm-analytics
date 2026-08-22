@@ -437,13 +437,16 @@ st.caption("Crypto derivatives analytics · Deribit public API · "
 # Toolbar — expiry + load/refresh/send, one compact row instead of three
 # stacked sections. Everything here used to take ~40 lines of subheaders and
 # always-visible captions before a single chart appeared; the explanatory
-# text now lives in tooltips (hover ⓘ) and the "Load selected…" popover.
+# text now lives in tooltips (hover ⓘ). The old "Load selected…" popover
+# (pick assets + commands from two multiselects, then click through) was
+# replaced by a "Run <asset>" button inside each asset's own tab — one click
+# for whichever asset you're already looking at, instead of a menu.
 # ---------------------------------------------------------------------------
 
 _expiries, _using_fallback = _expiry_options()
 _default_idx = _expiries.index(min(_expiries, key=lambda d: abs(d - 30)))
 
-_tb1, _tb2, _tb3, _tb4 = st.columns([2.6, 1.2, 1.2, 1.3])
+_tb1, _tb2, _tb3 = st.columns([2.6, 1.2, 1.2])
 with _tb1:
     st.selectbox(
         "Default expiry", options=_expiries, index=_default_idx,
@@ -457,22 +460,14 @@ with _tb2:
     st.write("")
     load_all_btn = st.button("Load all", key="mcm_load_all", **_stretch(),
                              help=f"Run all {len(cmdreg.COMMAND_NAMES)} commands for "
-                                  f"{', '.join(ASSETS)}. May take several minutes.")
+                                  f"{', '.join(ASSETS)}. May take several minutes. "
+                                  "To load just one asset, use that asset's own "
+                                  "tab below instead.")
 with _tb3:
     st.write("")
     refresh_all_btn = st.button("Refresh all", key="mcm_refresh_all", **_stretch(),
-                                help="Re-run all commands and replace the dashboard "
-                                     "with the latest data.")
-with _tb4:
-    st.write("")
-    with st.popover("Load selected…", **_stretch()):
-        st.caption("Pick specific assets/commands instead of loading everything.")
-        st.multiselect("Assets", ASSETS, default=list(ASSETS), key="mcm_sel_assets")
-        st.multiselect("Commands", list(cmdreg.COMMAND_NAMES), default=[],
-                       key="mcm_sel_cmds",
-                       help="Select at least one command. Reports appear in the "
-                            "asset tabs below.")
-        load_selected_btn = st.button("Load selected", key="mcm_load_selected")
+                                help="Re-run all commands for every asset and "
+                                     "replace the dashboard with the latest data.")
 
 # Send to Telegram — one button per asset, a BTC+ETH combo, plus "All",
 # instead of a single all-or-nothing send. A per-asset (or combo) button
@@ -512,22 +507,6 @@ if load_all_btn or refresh_all_btn:
         st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
     st.success("All reports loaded." if load_all_btn else "All reports refreshed.")
     st.rerun()
-
-if load_selected_btn:
-    sel_assets = st.session_state.get("mcm_sel_assets", list(ASSETS))
-    sel_cmds = st.session_state.get("mcm_sel_cmds", [])
-    if not sel_assets or not sel_cmds:
-        st.warning("Select at least one asset and one command.")
-    else:
-        if st.session_state.mcm_all_results is None:
-            st.session_state.mcm_all_results = {}
-        with st.spinner("Running selected reports…"):
-            st.session_state.mcm_all_results.update(
-                run_reports(sel_assets, sel_cmds,
-                            st.session_state.get("mcm_dte_days", 30)))
-        st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
-        st.success(f"Loaded {len(sel_assets) * len(sel_cmds)} report(s).")
-        st.rerun()
 
 for _a in ASSETS:
     if send_asset_clicked.get(_a):
@@ -574,18 +553,33 @@ if _ts is not None and results:
         st.info(f"Data is {age_min} min old. Click **Refresh all** above for "
                 "the latest.")
 elif not results:
-    st.info("No reports loaded yet. Use **Load all** or **Load selected…** "
-            "above to run commands.")
+    st.info("No reports loaded yet. Use **Load all** above, or open an "
+            "asset's tab below and click its **Run <asset>** button to "
+            "load just that one.")
 
-visible_assets = [a for a in ASSETS
-                  if (not results) or any((a, cn) in results
-                                          for cn in cmdreg.COMMAND_NAMES)]
-
-_tab_labels = [f"📊 {a}" for a in visible_assets] + ["🔎 Run single command"]
+_tab_labels = [f"📊 {a}" for a in ASSETS] + ["🔎 Run single command"]
 asset_tabs = st.tabs(_tab_labels)
 
-for ia, a in enumerate(visible_assets):
+for ia, a in enumerate(ASSETS):
     with asset_tabs[ia]:
+        _run_a_col, _ = st.columns([1, 4])
+        with _run_a_col:
+            run_asset_btn = st.button(
+                f"Run {a}", key=f"mcm_run_{a}", **_stretch(),
+                help=f"Run all {len(cmdreg.COMMAND_NAMES)} commands for {a} "
+                     "only, and replace just this tab's data with the "
+                     "latest — quicker than Load all/Refresh all when you "
+                     "only need this asset.")
+        if run_asset_btn:
+            with st.spinner(f"Running all commands for {a}…"):
+                if st.session_state.mcm_all_results is None:
+                    st.session_state.mcm_all_results = {}
+                st.session_state.mcm_all_results.update(
+                    run_reports([a], list(cmdreg.COMMAND_NAMES),
+                                st.session_state.get("mcm_dte_days", 30)))
+                st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
+            st.rerun()
+
         order_a = [(x, cn) for x, cn in MCM_ORDER if x == a]
         n_a = len(order_a)
         i = 0
@@ -597,8 +591,8 @@ for ia, a in enumerate(visible_assets):
                     f2, d2, t2 = results[(a, cn0)]
                     render_output(f2, d2, t2, key_prefix=f"{a}_{cn0}")
                 else:
-                    st.caption("Not loaded. Use **Load all** or "
-                               "**Load selected…** above.")
+                    st.caption(f"Not loaded. Use **Load all** above, or "
+                               f"**Run {a}** at the top of this tab.")
                 i += 1
                 if i < n_a:
                     st.write("")
@@ -635,8 +629,9 @@ for ia, a in enumerate(visible_assets):
                                 f2, d2, t2 = results[(a, cn2)]
                                 render_output(f2, d2, t2, key_prefix=f"{a}_{cn2}")
                             else:
-                                st.caption("Not loaded. Use **Load all** or "
-                                           "**Load selected…** above.")
+                                st.caption(
+                                    f"Not loaded. Use **Load all** above, or "
+                                    f"**Run {a}** at the top of this tab.")
             else:
                 cols = st.columns(len(row_items))
                 for k, (_, cn) in enumerate(row_items):
@@ -648,8 +643,9 @@ for ia, a in enumerate(visible_assets):
                                           skip_figures=(cn == "vol_run"
                                                         and isinstance(f2, list)))
                         else:
-                            st.caption("Not loaded. Use **Load all** or "
-                                       "**Load selected…** above.")
+                            st.caption(
+                                f"Not loaded. Use **Load all** above, or "
+                                f"**Run {a}** at the top of this tab.")
             if i < n_a:
                 st.write("")
 

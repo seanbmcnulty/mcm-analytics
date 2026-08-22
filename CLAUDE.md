@@ -252,6 +252,115 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-08-22 — Replaced "Load selected…" popover with a per-tab "Run <asset>" button
+
+User found the "Load selected…" popover (pick assets + commands from two
+multiselects, then click through) cumbersome for the common case of "I'm
+already looking at BTC's tab, just run BTC." Removed the popover entirely
+and added a small "Run {asset}" button at the top of each asset tab in
+`pages/01_MCM_Bot.py` — one click runs all commands for just that asset
+and replaces that asset's cached data, no menu needed. "Load all" and
+"Refresh all" are unchanged.
+
+Also removed the `visible_assets` filter that used to hide an asset's tab
+entirely until it had at least one cached result (a holdover from
+"Load selected" letting you load a subset of assets — since every tab now
+has its own way to populate itself, hiding it first made no sense). All 4
+asset tabs are now always visible, each showing its own "Not loaded, click
+Run {asset}" hint per command when empty.
+
+Toolbar went from 4 columns (expiry, Load all, Refresh all, Load
+selected…) to 3 (expiry, Load all, Refresh all).
+
+**Testing gap found and fixed along the way:** no prior offline test had
+ever driven `run_reports()` through a full page run — every earlier test
+either pre-populated `mcm_all_results` directly via `cmdreg.run_command`
+(bypassing `run_reports`/`st.progress` entirely) or triggered a button
+whose data was already fully cached, so the "missing → run it" branch was
+never hit. The new "Run BTC" test is the first to actually exercise it,
+and it immediately hit a stub gap: `/tmp/stubs/streamlit.py` had no
+`st.progress()`, so `run_reports()`'s `bar = st.progress(0.0)` fell
+through to the generic no-op `__getattr__` (returns `None`), and the next
+line, `bar.progress(...)`, crashed with `AttributeError: 'NoneType' object
+has no attribute 'progress'`. Added a minimal `_Progress` class (`progress()`
+and `empty()` as no-ops) to the stub. Also needed `st._seen_keys.clear()`
+between two `runpy.run_path()` calls in the same test process — the
+stub's duplicate-widget-key tracking is module-global and doesn't reset
+between independent script runs on its own.
+
+Verified offline (new `tests/_smoke_run_asset_button.py`): (1) with an
+empty results cache, all 4 asset tabs still render with no duplicate-key
+errors (confirms dropping `visible_assets` is safe); (2) simulating a
+click on "Run BTC" with an empty cache loads exactly BTC's full command
+set into `mcm_all_results` and nothing for ETH/SOL/HYPE, then hits
+`st.rerun()` as expected (caught via the stub's intentional
+`RuntimeError`).
+
+### 2026-08-22 — Time Based Realized Vol: fixed slow/stuck cold load (sequential Deribit fetch -> shared thread pool)
+
+User reported the deployed Time Based Realized Vol page (previous entry
+below) "loaded fine just taking a long time," then clarified it actually
+**never finished** — the spinner ran indefinitely and no data was ever
+presented. Root cause: a cold load with the default "all 10 frequencies"
+selection needs ~68 paginated Deribit chunk requests (1m/30d alone is ~44
+chunks at 1000 bars/call), fetched **one at a time** in the original port —
+and `lib/deribit.py`'s own retry logic (`_request`: 3 attempts, 15s timeout
+each, backoff up to `2**attempt`s) means a single slow/failing chunk can
+alone take up to ~45-50s before giving up. Stacked sequentially across 68
+chunks, a handful of slow chunks (not even outright failures) is enough to
+turn "slow" into "looks hung."
+
+**Fix:** replaced the single-interval-at-a-time pagination
+(`fetch_deribit_klines_paginated` + a per-interval `load_or_fetch_klines`
+loop in the main script) with a batch fetch layer that dispatches **every**
+chunk request across **every** selected hedging frequency into one shared
+`concurrent.futures.ThreadPoolExecutor` (`max_workers=16`):
+`_build_chunk_plan` (time-range chunk boundaries), `_fetch_chunks_parallel`
+(one shared pool, `as_completed`), `_assemble_klines` (concat + dedupe,
+same pandas datetime64 fix as before), `load_klines_for_intervals` (new
+multi-interval entry point — preserves the existing per-interval UI-cache/
+snapshot-fallback semantics exactly), with `load_or_fetch_klines` kept as a
+thin single-interval wrapper for `maybe_recompute_suspicious_interval`'s
+call site. The main script now calls `load_klines_for_intervals` once for
+all `compare_intervals` instead of looping. Deliberately one shared pool
+rather than one pool per interval, to avoid a nested-executor deadlock risk.
+
+Also vectorized the `pa_var` pre-averaging loop in `compute_advanced_
+estimators` (was a per-bar Python `for` loop building a list; now a single
+`numpy.lib.stride_tricks.sliding_window_view` + matrix-vector product) — a
+secondary, much smaller win, but free correctness-preserving cleanup found
+while touching this section.
+
+**Verified offline** (same sandbox constraint — no live Deribit network
+here): re-ran the existing mock-streamlit/mock-plotly/fake-Deribit smoke
+test end-to-end against the refactored file — identical output (68 fetch
+calls, no exceptions, no `st.error`/`st.warning`, same RV numbers given the
+same synthetic seed). Confirmed `pa_var` vectorized vs. original loop are
+numerically identical (max diff ~1e-9 across n=1..2000, including the n<m
+edge cases) with a ~35x speedup at n=5000. Directly re-verified all cache/
+resilience semantics against the new `load_klines_for_intervals` (cold
+fetch, warm within-TTL reuse with zero network calls, hard-refresh bypass,
+forced-refresh-during-outage has no fallback by design, organic outage
+after TTL expiry correctly falls back to last-good snapshot, multi-interval
+batch call) — all matched the semantics verified against the old function.
+
+**Measured the actual fix, not just the model:** built a chunk-plan-exact
+timing harness (`_fetch_chunks_parallel` vs. a fully sequential loop over
+the identical 68-chunk plan) with the real `lib/deribit.py` rate limiter
+active. At the rate limiter's own floor (100ms/call, 10 req/s) old and new
+are equal (~6.9s) — the limiter is a hard floor no amount of concurrency
+beats. The real win shows up once per-call latency exceeds that floor: at a
+more realistic ~300ms/call, sequential = ~20.5s, parallel = ~7.1s (**~2.9x**),
+and the mechanism that fixes the "stuck" symptom specifically is that a
+single chunk's worst-case ~45-50s retry-with-backoff no longer blocks the
+other 67 chunks behind it — it just makes that one thread slow, not the
+whole page.
+
+**Not verified:** real Deribit connectivity/latency (same sandbox
+constraint as always) and the actual rendered page in a browser — ask the
+user to re-test the live cold load after this ships and confirm it now
+completes.
+
 ### 2026-08-22 — Renamed + rewrote Realized Vol -> Time Based Realized Vol (ported from exodus-analytics)
 
 User asked for `pages/06_Realized_Vol.py` to be rebuilt on the model of

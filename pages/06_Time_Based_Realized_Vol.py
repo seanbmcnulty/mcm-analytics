@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import concurrent.futures
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -236,29 +237,54 @@ def _resolution_bar_ms(resolution: str) -> int:
     return int(resolution) * 60_000
 
 
-def fetch_deribit_klines_paginated(instrument: str, resolution: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    """
-    Fetch Deribit tradingview candles across [start_ms, end_ms), chunking the
-    request so a long lookback at a fine resolution (e.g. 1m over 30d =
-    43,200 candles) isn't at risk of a single truncated response.
-    lib.deribit.get_tradingview_ohlc already retries/backs off per chunk.
-    """
-    bar_ms = _resolution_bar_ms(resolution)
+def _build_chunk_plan(start_ms: int, end_ms: int, bar_ms: int) -> List[Tuple[int, int]]:
+    """Time-range chunk boundaries covering [start_ms, end_ms) — each chunk is
+    an independent request, so unlike Binance-style cursor pagination these
+    don't need to be issued in order."""
     chunk_span_ms = _MAX_BARS_PER_CALL * bar_ms
-    frames: List[pd.DataFrame] = []
+    plan: List[Tuple[int, int]] = []
     cursor = int(start_ms)
     while cursor < end_ms:
         chunk_end = min(cursor + chunk_span_ms, end_ms)
-        df = get_tradingview_ohlc(instrument, resolution, cursor, chunk_end)
-        if df is not None and not df.empty:
-            frames.append(df)
+        plan.append((cursor, chunk_end))
         cursor = chunk_end
+    return plan
 
+
+def _fetch_chunks_parallel(
+    chunk_specs: List[Tuple[str, str, int, int]], max_workers: int = 16,
+) -> Dict[Tuple[str, str, int, int], Optional[pd.DataFrame]]:
+    """
+    Fetch every (instrument, resolution, start_ms, end_ms) chunk across every
+    hedging frequency in one shared thread pool. Each chunk is an independent
+    Deribit request — lib.deribit.py's own rate limiter (a module-level lock,
+    10 req/s) already serializes actual request starts across threads, so
+    this doesn't relax that; it just stops paying one request's network
+    latency, then the next's, in sequence. A cold load with all 10
+    frequencies selected at a 30d lookback is ~68 chunk requests — sequential,
+    that's ~20-25s of pure network wait; pooled, it's bound by the shared
+    rate limiter at ~7s.
+    """
+    results: Dict[Tuple[str, str, int, int], Optional[pd.DataFrame]] = {}
+    if not chunk_specs:
+        return results
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(chunk_specs))) as ex:
+        future_map = {ex.submit(get_tradingview_ohlc, *spec): spec for spec in chunk_specs}
+        for fut in concurrent.futures.as_completed(future_map):
+            spec = future_map[fut]
+            try:
+                results[spec] = fut.result()
+            except Exception:
+                results[spec] = None
+    return results
+
+
+def _assemble_klines(frames: List[Optional[pd.DataFrame]], bar_ms: int) -> pd.DataFrame:
     cols = ["open_time", "open", "high", "low", "close", "volume", "close_time"]
-    if not frames:
+    valid = [f for f in frames if f is not None and not f.empty]
+    if not valid:
         return pd.DataFrame(columns=cols)
-
-    out = pd.concat(frames, ignore_index=True)
+    out = pd.concat(valid, ignore_index=True)
     out = out.rename(columns={"timestamp": "open_time_dt"})
     # Cast explicitly to millisecond resolution before extracting the epoch
     # integer: pandas' default resolution for `pd.to_datetime(..., unit="ms")`
@@ -292,79 +318,116 @@ def _cache_key(asset: str, lookback: str, interval: str) -> str:
     return f"{_CACHE_SCHEMA_VERSION}|{asset.upper()}|{lookback}|{interval}"
 
 
+def load_klines_for_intervals(
+    asset: str, lookback: str, intervals: List[str],
+    force_refresh: bool = False, include_live_bar_fn=None,
+) -> Dict[str, FetchResult]:
+    """
+    Fetch klines for several hedging frequencies at once, with resilience: on
+    total failure for a given (asset, lookback, interval), fall back to the
+    last successfully-fetched snapshot for that combo rather than failing the
+    whole comparison. Every frequency's Deribit chunk requests are dispatched
+    into one shared thread pool (see `_fetch_chunks_parallel`) so the cold-load
+    wait is the slowest frequency's chunk count under the shared rate limit,
+    not the sum of all frequencies' chunk counts run one after another.
+    """
+    cfg = ASSET_CONFIG[asset]
+    instrument = cfg["perp"]
+    now_ms = int(time.time() * 1000)
+    now_utc = datetime.now(timezone.utc)
+    snaps = _snapshots()
+    if _UI_CACHE_KEY not in st.session_state:
+        st.session_state[_UI_CACHE_KEY] = {}
+    ui_cache: Dict[str, Any] = st.session_state[_UI_CACHE_KEY]
+
+    results: Dict[str, FetchResult] = {}
+    pending: Dict[str, Dict[str, Any]] = {}
+    chunk_specs: List[Tuple[str, str, int, int]] = []
+
+    for interval in intervals:
+        resolution = INTERVAL_TO_RESOLUTION[interval]
+        bar_ms = interval_to_ms(interval)
+        lb_ms = lookback_to_ms(lookback)
+        end_ms = floor_to_bar_ms(now_ms, bar_ms)
+        start_ms = end_ms - lb_ms
+        include_live = bool(include_live_bar_fn(interval)) if include_live_bar_fn else False
+        fetch_end_ms = now_ms if include_live else end_ms
+        filter_end_ms = (end_ms + bar_ms) if include_live else end_ms
+
+        key = _cache_key(asset, lookback, interval)
+        if include_live:
+            key = f"{key}|live"
+
+        if force_refresh and key in snaps:
+            del snaps[key]
+        if force_refresh and key in ui_cache:
+            del ui_cache[key]
+        if not force_refresh:
+            ent = ui_cache.get(key)
+            if ent and (time.time() - float(ent.get("ts", 0))) < _UI_CACHE_TTL_SEC:
+                results[interval] = FetchResult(
+                    df=ent["df"].copy(), from_cache_fallback=bool(ent.get("from_cache_fallback", False)),
+                    error_message=ent.get("error_message"),
+                    fetched_at_utc=ent.get("fetched_at_utc", now_utc), resolved_symbol=instrument,
+                )
+                continue
+
+        plan = _build_chunk_plan(start_ms, fetch_end_ms, bar_ms)
+        specs = [(instrument, resolution, c0, c1) for c0, c1 in plan]
+        pending[interval] = {
+            "specs": specs, "bar_ms": bar_ms, "start_ms": start_ms, "filter_end_ms": filter_end_ms, "key": key,
+        }
+        chunk_specs.extend(specs)
+
+    fetched = _fetch_chunks_parallel(chunk_specs) if chunk_specs else {}
+
+    for interval, plan in pending.items():
+        key = plan["key"]
+        try:
+            df = _assemble_klines([fetched.get(s) for s in plan["specs"]], plan["bar_ms"])
+            if df.empty:
+                raise RuntimeError(f"No candles returned for {instrument} ({interval})")
+            df = df[(df["open_time"] >= plan["start_ms"]) & (df["open_time"] < plan["filter_end_ms"])].copy()
+            if df.empty:
+                raise RuntimeError(f"No candles in requested window for {instrument} ({interval})")
+            snaps[key] = {"df": df.copy(), "fetched_at": now_utc}
+            res = FetchResult(df=df, from_cache_fallback=False, error_message=None,
+                               fetched_at_utc=now_utc, resolved_symbol=instrument)
+            ui_cache[key] = {
+                "df": df.copy(), "ts": time.time(), "from_cache_fallback": False,
+                "error_message": None, "fetched_at_utc": now_utc,
+            }
+        except Exception as e:
+            prev = snaps.get(key)
+            if prev and isinstance(prev.get("df"), pd.DataFrame) and not prev["df"].empty:
+                res = FetchResult(
+                    df=prev["df"].copy(), from_cache_fallback=True, error_message=str(e),
+                    fetched_at_utc=prev.get("fetched_at", now_utc), resolved_symbol=instrument,
+                )
+                ui_cache[key] = {
+                    "df": res.df.copy(), "ts": time.time(), "from_cache_fallback": True,
+                    "error_message": res.error_message, "fetched_at_utc": res.fetched_at_utc,
+                }
+            else:
+                res = FetchResult(df=pd.DataFrame(), from_cache_fallback=False, error_message=str(e),
+                                   fetched_at_utc=now_utc, resolved_symbol=instrument)
+        results[interval] = res
+
+    return results
+
+
 def load_or_fetch_klines(
     asset: str, lookback: str, interval: str,
     force_refresh: bool = False, include_live_bar: bool = False,
 ) -> FetchResult:
-    """
-    Fetch klines with resilience: on total failure, fall back to the last
-    successfully-fetched snapshot for this (asset, lookback, interval) combo
-    rather than failing the whole comparison.
-    """
-    cfg = ASSET_CONFIG[asset]
-    instrument = cfg["perp"]
-    resolution = INTERVAL_TO_RESOLUTION[interval]
-    bar_ms = interval_to_ms(interval)
-    lb_ms = lookback_to_ms(lookback)
-    now_ms = int(time.time() * 1000)
-    end_ms = floor_to_bar_ms(now_ms, bar_ms)
-    start_ms = end_ms - lb_ms
-    fetch_end_ms = now_ms if include_live_bar else end_ms
-    filter_end_ms = (end_ms + bar_ms) if include_live_bar else end_ms
-
-    key = _cache_key(asset, lookback, interval)
-    if include_live_bar:
-        key = f"{key}|live"
-    snaps = _snapshots()
-    now_utc = datetime.now(timezone.utc)
-
-    if force_refresh and key in snaps:
-        del snaps[key]
-    if _UI_CACHE_KEY not in st.session_state:
-        st.session_state[_UI_CACHE_KEY] = {}
-    ui_cache: Dict[str, Any] = st.session_state[_UI_CACHE_KEY]
-    if force_refresh and key in ui_cache:
-        del ui_cache[key]
-    if not force_refresh:
-        ent = ui_cache.get(key)
-        if ent and (time.time() - float(ent.get("ts", 0))) < _UI_CACHE_TTL_SEC:
-            return FetchResult(
-                df=ent["df"].copy(),
-                from_cache_fallback=bool(ent.get("from_cache_fallback", False)),
-                error_message=ent.get("error_message"),
-                fetched_at_utc=ent.get("fetched_at_utc", now_utc),
-                resolved_symbol=instrument,
-            )
-
-    try:
-        df = fetch_deribit_klines_paginated(instrument, resolution, start_ms, fetch_end_ms)
-        if df.empty:
-            raise RuntimeError(f"No candles returned for {instrument} ({interval})")
-        df = df[(df["open_time"] >= start_ms) & (df["open_time"] < filter_end_ms)].copy()
-        if df.empty:
-            raise RuntimeError(f"No candles in requested window for {instrument} ({interval})")
-        snaps[key] = {"df": df.copy(), "fetched_at": now_utc}
-        res = FetchResult(df=df, from_cache_fallback=False, error_message=None,
-                           fetched_at_utc=now_utc, resolved_symbol=instrument)
-        ui_cache[key] = {
-            "df": df.copy(), "ts": time.time(), "from_cache_fallback": False,
-            "error_message": None, "fetched_at_utc": now_utc,
-        }
-        return res
-    except Exception as e:
-        prev = snaps.get(key)
-        if prev and isinstance(prev.get("df"), pd.DataFrame) and not prev["df"].empty:
-            res = FetchResult(
-                df=prev["df"].copy(), from_cache_fallback=True, error_message=str(e),
-                fetched_at_utc=prev.get("fetched_at", now_utc), resolved_symbol=instrument,
-            )
-            ui_cache[key] = {
-                "df": res.df.copy(), "ts": time.time(), "from_cache_fallback": True,
-                "error_message": res.error_message, "fetched_at_utc": res.fetched_at_utc,
-            }
-            return res
-        return FetchResult(df=pd.DataFrame(), from_cache_fallback=False, error_message=str(e),
-                            fetched_at_utc=now_utc, resolved_symbol=instrument)
+    """Single-frequency convenience wrapper around `load_klines_for_intervals`
+    (used by the suspicious-interval recompute guardrail, which only ever
+    needs to refetch one frequency at a time)."""
+    res = load_klines_for_intervals(
+        asset, lookback, [interval], force_refresh=force_refresh,
+        include_live_bar_fn=lambda _iv: include_live_bar,
+    )
+    return res[interval]
 
 
 # ---------------------------------------------------------------------------
@@ -601,10 +664,15 @@ def compute_advanced_estimators(dfc: pd.DataFrame, interval: str, roll_win: int)
         m = max(2, int(np.sqrt(n_r)))
         g = np.array([min(j / m, 1.0 - j / m) for j in range(1, m)], dtype=float)
         if len(g) >= 1:
-            pre = []
-            for i in range(0, n_r - m):
-                pre.append(float(np.sum(g * x[i + 1: i + m])))
-            pre = np.asarray(pre, dtype=float)
+            n_pre = n_r - m
+            if n_pre > 0:
+                # Vectorized pre-averaging: each pre[i] = sum(g * x[i+1:i+m]), a
+                # sliding dot-product of x against g — equivalent to the original
+                # per-i Python loop but computed as one matrix-vector product.
+                windows = np.lib.stride_tricks.sliding_window_view(x[1:], m - 1)
+                pre = windows[:n_pre] @ g
+            else:
+                pre = np.asarray([], dtype=float)
             psi2 = float(np.sum(g * g) / m)
             if psi2 > 0 and len(pre) > 0:
                 pa_var = max(float(np.sum(pre * pre) / (len(pre) * psi2 * m)), 0.0)
@@ -1484,13 +1552,11 @@ if not detail_lookbacks:
 with st.spinner("Loading comparison dataset from Deribit across selected frequencies…"):
     lookback_data: Dict[str, Dict[str, Any]] = {}
     lookback_errors: Dict[str, List[str]] = {}
-    base_fetch: Dict[str, FetchResult] = {}
     max_lookback = max(lookbacks_to_run, key=lookback_to_ms)
-    for iv in compare_intervals:
-        base_fetch[iv] = load_or_fetch_klines(
-            asset, max_lookback, iv, force_refresh=refresh,
-            include_live_bar=should_use_live_bar(iv, use_live_bar),
-        )
+    base_fetch: Dict[str, FetchResult] = load_klines_for_intervals(
+        asset, max_lookback, compare_intervals, force_refresh=refresh,
+        include_live_bar_fn=lambda iv: should_use_live_bar(iv, use_live_bar),
+    )
 
     for lb in lookbacks_to_run:
         analyses = []
