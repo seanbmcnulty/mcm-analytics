@@ -20,9 +20,12 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from lib.deribit import get_tradingview_ohlc, get_atm_iv_by_dte, get_index_price
-from lib.constants import ASSET_CONFIG, ASSETS, ASSET_COLORS, PLOTLY_LAYOUT
+from lib.constants import (
+    ASSET_CONFIG, ASSETS, ASSET_COLORS, PLOTLY_LAYOUT, TTL_LONG, TTL_SLOW,
+)
 from lib.vol_math import close_to_close_vol
 from lib.telegram import send_message, is_configured
+from lib import cache as cache_lib
 from lib import fx_style
 
 # Try to import arch for GARCH
@@ -89,12 +92,15 @@ with st.sidebar:
         f"_Based on trailing 365d RV distribution_"
     )
 
+    st.divider()
+    cache_lib.render_refresh_button()
+
 
 # ---------------------------------------------------------------------------
 # Data fetching
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Fetching daily OHLC...", ttl=300)
+@st.cache_data(show_spinner="Fetching daily OHLC...", ttl=TTL_SLOW)
 def fetch_daily_ohlc(asset: str, days: int = 400) -> pd.DataFrame | None:
     """Fetch daily OHLC from Deribit for the perpetual.
     Extra days beyond 365 to have enough history for rolling windows."""
@@ -108,7 +114,7 @@ def fetch_daily_ohlc(asset: str, days: int = 400) -> pd.DataFrame | None:
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
-@st.cache_data(show_spinner="Fetching ATM IV...", ttl=120)
+@st.cache_data(show_spinner="Fetching ATM IV...", ttl=TTL_LONG)
 def fetch_atm_iv(asset: str) -> pd.DataFrame | None:
     """Fetch current ATM IV term structure from Deribit options chain."""
     currency = ASSET_CONFIG[asset]["deribit_ccy"]

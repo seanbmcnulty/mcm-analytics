@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
 
+from lib import cache as cache_lib
 from lib import commands as cmdreg
 from lib import fx_style, history, surface, telegram
 from lib.constants import ASSETS
@@ -392,10 +393,7 @@ with st.sidebar:
         st.caption(telegram.config_status())
     st.divider()
     if st.button("Clear data cache", **_stretch()):
-        from lib import deribit, surface as _surface, history as _history
-        deribit.clear_cache()
-        _surface.clear_cache()
-        _history.clear_cache()
+        cache_lib.clear_all_caches()
         st.rerun()
     st.divider()
     with st.expander("What each report shows"):

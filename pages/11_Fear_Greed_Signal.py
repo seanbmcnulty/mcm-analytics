@@ -30,8 +30,12 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from lib.deribit import get_tradingview_ohlc
-from lib.constants import ASSET_CONFIG, ASSETS, ASSET_COLORS, PLOTLY_LAYOUT
+from lib.constants import (
+    ASSET_CONFIG, ASSETS, ASSET_COLORS, PLOTLY_LAYOUT,
+    TTL_SLOW, TTL_DAILY_EXTERNAL,
+)
 from lib.telegram import send_message, is_configured
+from lib import cache as cache_lib
 from lib import fx_style
 from lib import fng
 
@@ -127,6 +131,9 @@ with st.sidebar:
              "below uses the ±1 / ±0.5 / 0 signal directly.",
     )
 
+    st.divider()
+    cache_lib.render_refresh_button()
+
 if not thresholds_valid:
     st.error(
         "Threshold ordering is invalid: Extreme Fear edge must be below the "
@@ -143,12 +150,12 @@ if not horizons:
 # Data fetching
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Fetching Fear & Greed Index history...", ttl=3600)
+@st.cache_data(show_spinner="Fetching Fear & Greed Index history...", ttl=TTL_DAILY_EXTERNAL)
 def fetch_fng() -> pd.DataFrame | None:
     return fng.get_fng_history(limit=0)
 
 
-@st.cache_data(show_spinner="Fetching perpetual OHLC...", ttl=300)
+@st.cache_data(show_spinner="Fetching perpetual OHLC...", ttl=TTL_SLOW)
 def fetch_price(asset: str, days: int) -> pd.DataFrame | None:
     instrument = ASSET_CONFIG[asset]["perp"]
     end_ms = int(time.time() * 1000)

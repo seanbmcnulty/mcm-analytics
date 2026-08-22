@@ -25,7 +25,9 @@ import requests
 from scipy.stats import norm
 import streamlit as st
 
+from lib import cache as cache_lib
 from lib import fx_style
+from lib.constants import TTL_SHORT, TTL_MEDIUM
 
 # ---------------------------------------------------------------------------
 # Page Config & Styles
@@ -147,6 +149,7 @@ with st.sidebar:
     if auto_refresh:
         time.sleep(60)
         st.rerun()
+    cache_lib.render_refresh_button()
 
 # ---------------------------------------------------------------------------
 # API Fetching Helpers
@@ -185,7 +188,7 @@ def _get_json_with_retry(url, params=None, timeout=10, max_retries=2, pace=0.15)
         print(f"Deribit request failed after retries ({url}): {last_exc}")
     return None
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=TTL_SHORT, show_spinner=False)
 def get_current_spot(asset: str) -> float:
     index_map = {
         'BTC': 'btc_usd', 'ETH': 'eth_usd', 'SOL_USDC': 'sol_usdc',
@@ -202,7 +205,7 @@ def get_current_spot(asset: str) -> float:
     except (KeyError, TypeError, ValueError):
         return 0.0
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=TTL_MEDIUM, show_spinner=False)
 def fetch_trades_by_currency(currency: str, start_dt_utc: datetime) -> pd.DataFrame:
     """Fetch+parse the raw trades feed for one Deribit currency (BTC/ETH/USDC).
 
@@ -296,7 +299,7 @@ def fetch_public_trades(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
 
     return df.reset_index(drop=True) if not df.empty else df
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=TTL_MEDIUM, show_spinner=False)
 def fetch_historical_spot(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
     perp_map = {
         'BTC': 'BTC-PERPETUAL', 'ETH': 'ETH-PERPETUAL', 'SOL_USDC': 'SOL_USDC-PERPETUAL',
@@ -331,7 +334,7 @@ def fetch_historical_spot(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
     print(f"Tradingview API did not return OK for {instrument}: {chart}")
     return pd.DataFrame()
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=TTL_MEDIUM, show_spinner=False)
 def fetch_dvol(asset: str, start_dt_utc: datetime) -> pd.Series:
     if asset not in ['BTC', 'ETH']:
         return pd.Series(dtype=float)

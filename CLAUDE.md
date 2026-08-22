@@ -101,13 +101,31 @@ redeploy on every commit):
 ## Caching layers (all in-process, per-asset-keyed, safely bounded)
 
 - `lib/deribit.py:_cache` — raw API responses, self-prunes at 500 entries.
+  Process-wide (one Streamlit Community Cloud process serves every page and
+  user), so this is already a shared cache across the whole app, not just
+  the page that happens to call it.
 - `lib/surface.py:_VOLS_CACHE` — 10s TTL, avoids redundant full option-chain
   + Black-Scholes-delta-search recomputation (was up to 113 redundant calls
   per asset per page load before this was added).
 - `lib/history.py:_DRIVER_CACHE` — 300s TTL, the DVOL/RV re-levelling series.
 - `lib/history.py:_REMOTE_SNAPSHOT_CACHE` — 300s TTL, the GitHub-branch fetch.
-- All four get cleared together by the sidebar "Clear data cache" button
-  in `pages/01_MCM_Bot.py` — if you add a new cache, wire it in there too.
+- Each page also layers its own `@st.cache_data(ttl=...)` around its
+  fetch functions. **2026-08-22: TTLs are now named tiers in
+  `lib/constants.py`** (`TTL_FAST=10` … `TTL_DAILY_EXTERNAL=3600`, see that
+  file) instead of ad hoc bare numbers, so the same kind of data gets the
+  same freshness window regardless of which page fetches it. Use one of
+  these for any new `ttl=` rather than inventing a new number, unless you
+  have a specific reason to deviate (say why in a comment if so).
+- **`lib/cache.py`** (added 2026-08-22) is now the single place that knows
+  about all of the above: `clear_all_caches()` clears `st.cache_data` +
+  all three lib-level caches in one call, and `render_refresh_button()`
+  renders a standard "🔄 Refresh data (clear cache)" button wired to it.
+  If you add a new cache anywhere, wire its clear function into
+  `clear_all_caches()` — don't hand-roll a page-local clear list again.
+  All 7 analytics pages now have a refresh button through this helper
+  (previously only `01_MCM_Bot.py` and `06_Time_Based_Realized_Vol.py`
+  did, and `06`'s only cleared `deribit`'s cache, not `surface`/`history` —
+  harmless only because that page doesn't read through those two).
 
 ## Working conventions for this session type
 
@@ -146,7 +164,10 @@ PYTHONPATH=/tmp/stubs:<repo> python3 tests/run_all.py BTC ETH SOL HYPE   # all 2
 `/tmp/stubs` needs minimal `plotly` and `streamlit` stub packages (pandas/
 numpy/scipy are real). Recreate them if missing — a `streamlit` stub whose
 `__getattr__` returns a no-op is enough for `lib/*.py` changes, since those
-modules don't touch `st` directly.
+modules don't touch `st` directly. The `plotly.graph_objects` stub needs at
+least `Scatter`/`Heatmap`/`Bar`/`Waterfall`/`Box` as no-op trace stand-ins —
+`tests/run_all.py` exercises `forward_vol_steepness*` and `atm_iv_box_plot`,
+which construct `go.Waterfall`/`go.Box` specifically.
 
 **`pages/*.py` files are a different story** — they call `st.tabs`,
 `st.columns`, `st.popover`, `st.session_state.x = y` (attribute-style),
@@ -192,6 +213,8 @@ pages/03,04,05,09,12,13,14      retired — moved to _to_delete/ on the device, 
 lib/deribit.py                  Deribit public API client, caching, rate limiting
 lib/surface.py                  option chain parsing, BS delta search, vol surface math
 lib/history.py                  historical IV reconstruction (see above), snapshot I/O
+lib/cache.py                    clear_all_caches() + render_refresh_button() — the one
+                                 place that clears every cache layer app-wide (added 2026-08-22)
 lib/cmd_vol.py                  vol-related chart/table commands (term structure, skew,
                                  smile, forward vols, ATM box plot, etc.)
 lib/cmd_market.py               market/basis/funding/block-trade commands
@@ -238,8 +261,11 @@ add_workflow.bat                user-run: move staged .github/workflows file int
 
 ## Known backlog (not urgent, flagged during review)
 
-- `pages/02_Block_Trades.py`'s direct Deribit calls could be routed through
-  `lib/deribit.py` for a single shared rate budget.
+- `pages/02_Block_Trades_-_Deribit.py`'s direct Deribit calls could still be
+  routed through `lib/deribit.py` for a single shared rate budget — it got
+  a refresh button and named TTLs on 2026-08-22 (see Session log), but its
+  fetch layer itself is still the page-local `requests.get`/
+  `_get_json_with_retry`, not `lib/deribit.py`'s shared cache.
 - A few `frame.iterrows()` loops in `lib/cmd_vol.py` (smile snapshot
   high/low band) are a minor pandas anti-pattern — low-risk to vectorize,
   but not currently a real bottleneck since history frames are now
@@ -251,6 +277,69 @@ Keep this updated: when a session makes a non-trivial change, decision, or
 finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
+
+### 2026-08-22 — Cache consolidation + refresh button on every page
+
+User asked two related questions: can data be cached efficiently across all
+the pages, and can every page get a button to pull the latest data. Read
+through `lib/deribit.py`, `lib/surface.py`, `lib/history.py`, and all 7
+analytics pages first to answer both from the actual code rather than
+guessing.
+
+Findings: `lib/deribit.py`'s `_cache` is already a single process-wide
+cache shared across every page and user (Streamlit Community Cloud runs
+one process for the whole multi-page app) — that part was already
+efficient. What wasn't: each page's own `@st.cache_data(ttl=...)` wrapper
+picked its own TTL number independently (30/60/120/300/600/3600 all
+appeared, sometimes for conceptually the same kind of data), and only 2 of
+7 analytics pages (`01_MCM_Bot.py`, `06_Time_Based_Realized_Vol.py`) had
+any refresh control at all — the other 5 just waited out whatever TTL
+their fetchers used (up to an hour for the Fear & Greed page's daily
+external feed). Also, `06`'s existing "Hard refresh" only cleared
+`st.cache_data` + `lib.deribit`'s cache, not `lib.surface`/`lib.history` —
+harmless today only because that page doesn't read through those two, but
+that was incidental, not by design.
+
+Fix, in three parts:
+1. `lib/constants.py`: added eight named TTL tiers (`TTL_FAST=10` through
+   `TTL_DAILY_EXTERNAL=3600`) so the same freshness cadence gets the same
+   name everywhere. Every existing `ttl=<number>` in `lib/deribit.py` and
+   the 5 previously-unbuttoned pages was swapped to the matching constant
+   — verified this was a pure rename with zero value changes (printed the
+   constants and diffed against the original hardcoded numbers).
+2. New `lib/cache.py`: `clear_all_caches()` clears all four cache layers
+   (`st.cache_data` + `deribit`/`surface`/`history`) in one call, and
+   `render_refresh_button()` renders a standard "🔄 Refresh data (clear
+   cache)" button wired to it. `01_MCM_Bot.py`'s "Clear data cache" and
+   `06`'s "Hard refresh" buttons now both call through this instead of
+   hand-rolling which caches to clear (`06` picks up the `surface`/
+   `history` clears it was missing, for free).
+3. Added `render_refresh_button()` to the 5 pages that had nothing:
+   `02_Block_Trades_-_Deribit.py`, `07_Regime_Identifier.py`,
+   `08_Spot_Vol_Correlation.py`, `10_Macro_Event_Impact.py`,
+   `11_Fear_Greed_Signal.py` — each in the sidebar alongside that page's
+   other controls.
+
+Did not change: `pages/02`'s fetch layer is still its own standalone
+`requests.get`/`_get_json_with_retry`, not routed through `lib/deribit.py`
+(pre-existing, flagged in Known backlog above) — its refresh button clears
+its `st.cache_data` wrappers (which is everything it uses) via
+`clear_all_caches()`, but the underlying HTTP calls aren't deduplicated
+against the rest of the app the way `lib/deribit.py`-backed pages are.
+
+Verified offline (no live Deribit/PyPI access in this sandbox): `py_compile`
+on every touched file; a real (non-stubbed) import of `lib/constants.py`
+and `lib/deribit.py` confirming the TTL rename introduced no typos and no
+value changes; a purpose-built `streamlit`+`plotly` stub (see Testing
+section) used to `runpy.run_path` all 7 modified pages end-to-end — all
+either completed or reached an expected `st.stop()`, with the new
+`cache_lib.render_refresh_button()`/`clear_all_caches()` call sites
+exercised on both the not-clicked and (button forced `True`) clicked path;
+and the existing `tests/run_all.py` suite (all 21 commands x BTC/SOL
+against `fake_deribit`) still passes unchanged against the edited
+`lib/deribit.py`. No live/visual check was possible — user should
+sanity-check the deployed pages, in particular that the new sidebar button
+placement doesn't crowd existing controls.
 
 ### 2026-08-22 — Replaced "Load selected…" popover with a per-tab "Run <asset>" button
 

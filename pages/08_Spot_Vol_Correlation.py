@@ -16,8 +16,9 @@ from plotly.subplots import make_subplots
 import time
 
 from lib.deribit import get_dvol, get_tradingview_ohlc, get_index_price
-from lib.constants import ASSET_CONFIG, ASSET_COLORS, PLOTLY_LAYOUT
+from lib.constants import ASSET_CONFIG, ASSET_COLORS, PLOTLY_LAYOUT, TTL_SLOW
 from lib.telegram import send_photo, is_configured
+from lib import cache as cache_lib
 from lib import fx_style
 
 st.set_page_config(page_title="Spot-Vol Correlation", page_icon="📈", layout="wide")
@@ -31,6 +32,9 @@ st.caption("DVOL vs Spot price • Rolling correlation • BTC & ETH only (Derib
 asset = st.sidebar.selectbox("Asset", ["BTC", "ETH"], index=0)
 lookback_days = st.sidebar.selectbox("Lookback", [30, 60, 90, 180, 365], index=2)
 corr_window = st.sidebar.slider("Correlation Window (days)", 7, 60, 21)
+st.sidebar.divider()
+with st.sidebar:
+    cache_lib.render_refresh_button()
 
 cfg = ASSET_CONFIG[asset]
 
@@ -42,7 +46,7 @@ if not cfg["has_dvol"]:
 # Data Fetch
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=TTL_SLOW)
 def fetch_data(asset_key: str, days: int):
     """Fetch DVOL and spot price data."""
     cfg = ASSET_CONFIG[asset_key]

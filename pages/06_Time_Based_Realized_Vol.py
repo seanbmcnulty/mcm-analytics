@@ -39,9 +39,10 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from lib.deribit import get_tradingview_ohlc, clear_cache
+from lib.deribit import get_tradingview_ohlc
 from lib.constants import ASSET_CONFIG, ASSET_COLORS, PLOTLY_LAYOUT
 from lib.telegram import send_message, send_photo, is_configured
+from lib import cache as cache_lib
 from lib import fx_style
 
 # ---------------------------------------------------------------------------
@@ -1527,11 +1528,7 @@ if not is_configured():
     st.caption("Telegram not configured — set credentials in secrets.toml or environment to enable sending.")
 
 if hard_refresh:
-    try:
-        st.cache_data.clear()
-    except Exception:
-        pass
-    clear_cache()
+    cache_lib.clear_all_caches()
     st.session_state.pop(_SNAP_KEY, None)
     st.session_state.pop(_UI_CACHE_KEY, None)
     st.rerun()

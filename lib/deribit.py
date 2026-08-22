@@ -17,6 +17,10 @@ import requests
 import pandas as pd
 import numpy as np
 
+from lib.constants import (
+    TTL_FAST, TTL_QUICK, TTL_SHORT, TTL_MEDIUM, TTL_LONG, TTL_SLOW,
+)
+
 BASE_URL = "https://www.deribit.com/api/v2/public"
 
 # Rate limiting
@@ -106,7 +110,7 @@ def _request(endpoint: str, params: dict | None = None, ttl: float = 60.0,
 
 def get_index_price(index_name: str) -> float | None:
     """Get current index price. index_name: btc_usd, eth_usd, sol_usdc, hype_usdc"""
-    result = _request("get_index_price", {"index_name": index_name}, ttl=10)
+    result = _request("get_index_price", {"index_name": index_name}, ttl=TTL_FAST)
     if result and "index_price" in result:
         return result["index_price"]
     return None
@@ -120,7 +124,7 @@ def get_option_chain(currency: str, kind: str = "option") -> list[dict] | None:
     Returns list of instrument summaries.
     """
     result = _request("get_book_summary_by_currency",
-                      {"currency": currency, "kind": kind}, ttl=120)
+                      {"currency": currency, "kind": kind}, ttl=TTL_LONG)
     return result if isinstance(result, list) else None
 
 
@@ -129,7 +133,7 @@ def get_instruments(currency: str, kind: str = "option",
     """Get list of active instruments."""
     result = _request("get_instruments",
                       {"currency": currency, "kind": kind, "expired": str(expired).lower()},
-                      ttl=300)
+                      ttl=TTL_SLOW)
     return result if isinstance(result, list) else None
 
 
@@ -145,7 +149,7 @@ def get_tradingview_ohlc(instrument_name: str, resolution: str | int,
         "resolution": str(resolution),
         "start_timestamp": start_ms,
         "end_timestamp": end_ms,
-    }, ttl=60)
+    }, ttl=TTL_MEDIUM)
 
     if not result or "ticks" not in result:
         return None
@@ -179,7 +183,7 @@ def get_dvol(currency: str, resolution: str | int = "1D",
         "resolution": str(resolution),
         "start_timestamp": start_ms,
         "end_timestamp": end_ms,
-    }, ttl=300)
+    }, ttl=TTL_SLOW)
 
     if not result or "data" not in result:
         return None
@@ -212,7 +216,7 @@ def get_trades(currency: str, kind: str = "option",
         "end_timestamp": end_ms,
         "count": count,
         "sorting": "desc",
-    }, ttl=60)
+    }, ttl=TTL_MEDIUM)
 
     if result and "trades" in result:
         return result["trades"]
@@ -235,7 +239,7 @@ def get_funding_history(instrument_name: str,
         "instrument_name": instrument_name,
         "start_timestamp": start_ms,
         "end_timestamp": end_ms,
-    }, ttl=300)
+    }, ttl=TTL_SLOW)
 
     if not result or not isinstance(result, list):
         return None
@@ -248,7 +252,7 @@ def get_funding_history(instrument_name: str,
 
 def get_ticker(instrument_name: str) -> dict | None:
     """Get ticker data for an instrument (mark price, funding, OI, etc.)."""
-    return _request("get_ticker", {"instrument_name": instrument_name}, ttl=15)
+    return _request("get_ticker", {"instrument_name": instrument_name}, ttl=TTL_QUICK)
 
 
 def get_expirations(currency: str, kind: str = "option") -> list[int] | None:
@@ -265,7 +269,7 @@ def get_expirations(currency: str, kind: str = "option") -> list[int] | None:
 def get_book_summary_by_instrument(instrument_name: str) -> dict | None:
     """Get book summary for a single instrument."""
     result = _request("get_book_summary_by_instrument",
-                      {"instrument_name": instrument_name}, ttl=30)
+                      {"instrument_name": instrument_name}, ttl=TTL_SHORT)
     if isinstance(result, list) and len(result) > 0:
         return result[0]
     return result if isinstance(result, dict) else None

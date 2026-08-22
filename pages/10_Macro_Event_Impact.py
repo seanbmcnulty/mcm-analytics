@@ -19,7 +19,8 @@ import plotly.express as px
 import streamlit as st
 
 from lib.deribit import get_tradingview_ohlc, get_dvol
-from lib.constants import ASSET_CONFIG, ASSET_COLORS, PLOTLY_LAYOUT
+from lib.constants import ASSET_CONFIG, ASSET_COLORS, PLOTLY_LAYOUT, TTL_EVENT
+from lib import cache as cache_lib
 from lib import fx_style
 
 # ---------------------------------------------------------------------------
@@ -121,7 +122,7 @@ def compute_surprise_zscore(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=TTL_EVENT, show_spinner=False)
 def fetch_price_around_event(
     index_name: str, event_ts_ms: int, window_hours: int = 24
 ) -> pd.DataFrame | None:
@@ -156,7 +157,7 @@ def fetch_price_around_event(
     return df
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=TTL_EVENT, show_spinner=False)
 def fetch_dvol_around_event(
     currency: str, event_ts_ms: int, window_hours: int = 24
 ) -> pd.DataFrame | None:
@@ -278,6 +279,9 @@ with st.sidebar:
         value=10,
         help="Limit API calls — each event fetches hourly candles from Deribit",
     )
+
+    st.divider()
+    cache_lib.render_refresh_button()
 
 # Apply filters
 filtered_df = calendar_df[calendar_df["event"].isin(selected_events)].copy()

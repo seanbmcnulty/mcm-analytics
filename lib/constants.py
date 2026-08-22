@@ -69,3 +69,21 @@ PLOTLY_LAYOUT = dict(
     font=dict(color="#fafafa"),
     margin=dict(l=40, r=20, t=40, b=30),
 )
+
+# ---------------------------------------------------------------------------
+# Standard cache TTLs (seconds), named by freshness tier rather than by data
+# type, so "how often can this realistically change" gets the same number
+# everywhere instead of every page or fetcher inventing its own. Pass to
+# @st.cache_data(ttl=...) or lib.deribit._request's ttl= kwarg. A page can
+# still deliberately deviate from the tier its underlying fetch uses (e.g. a
+# display widget that doesn't need the fetch's full freshness) - just say why
+# in a comment at the call site when it does.
+# ---------------------------------------------------------------------------
+TTL_FAST = 10             # index/spot price
+TTL_QUICK = 15            # single-instrument ticker (mark price, funding, OI)
+TTL_SHORT = 30            # order book / single-instrument book summary
+TTL_MEDIUM = 60           # recent trades, intraday OHLC candles
+TTL_LONG = 120            # full option chain, ATM IV term structure
+TTL_SLOW = 300            # daily OHLC, DVOL, funding history, instrument lists
+TTL_EVENT = 600           # historical event-window lookups (fixed-in-the-past data)
+TTL_DAILY_EXTERNAL = 3600  # once-a-day external data (e.g. alternative.me F&G)
