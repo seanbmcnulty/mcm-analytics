@@ -181,7 +181,10 @@ pages/02_Block_Trades.py        block trade flow — NOTE: calls Deribit directl
                                  cache/rate-limiter. Has its own st.cache_data + pacing,
                                  not reckless, but not coordinated with the rest of the
                                  app either. Worth unifying eventually, not urgent.
-pages/06,07,08,10_*.py          secondary analytics pages (RV, regime, correlation, macro)
+pages/06_Time_Based_Realized_Vol.py  RV across hedging frequencies x lookbacks (BTC/ETH perps),
+                                 7 estimators + decision matrix; renamed 2026-08-22 from
+                                 06_Realized_Vol.py, ported from exodus-analytics
+pages/07,08,10_*.py             secondary analytics pages (regime, correlation, macro)
 pages/11_Fear_Greed_Signal.py   contrarian delta-lean backtest vs alternative.me F&G Index
                                  (the one non-Deribit data source in this app — see above)
 pages/03,04,05,09,12,13,14      retired — moved to _to_delete/ on the device, not in git
@@ -248,6 +251,110 @@ Keep this updated: when a session makes a non-trivial change, decision, or
 finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
+
+### 2026-08-22 — Renamed + rewrote Realized Vol -> Time Based Realized Vol (ported from exodus-analytics)
+
+User asked for `pages/06_Realized_Vol.py` to be rebuilt on the model of
+exodus-analytics's `analytics_frontend/streamlit/pages/Time_Based_Realized_Vol.py`
+(found via the `exodus-analytics-backup-2026-08-06` backup nested inside the
+connected `mcm-analytics` folder), renamed to match, using perp instead of
+spot (this app has no spot leg anyway), scoped to BTC/ETH perps for now.
+
+**Renamed** `pages/06_Realized_Vol.py` -> `pages/06_Time_Based_Realized_Vol.py`
+(kept the `06` ordinal slot, same pattern as the `02_Block_Trades_-_Deribit.py`
+rename on 2026-08-21). Old file moved to `_to_delete/pages/` (not deleted —
+device bridge can't unlink mounted files, same constraint as always). Updated
+`Home.py`'s page directory entry to match.
+
+**What changed vs. the old page:** the old page was a simple multi-asset RV
+matrix (5 estimators x fixed day-count windows, BTC/ETH/SOL/HYPE, one
+timeframe at a time). The new page answers a different, more specific
+question per exodus's design — "if I hedge every X minutes/hours, what
+realized vol do I actually experience" — for one asset at a time: 10 hedging
+frequencies (1m-1d) x 6 lookbacks (1d-30d) x 7 estimators (close-to-close,
+Parkinson, Garman-Klass, Rogers-Satchell, Yang-Zhang, Bipower variation, a
+Realized-Kernel/pre-averaging proxy blend) averaged into a Composite RV used
+for long/short-gamma ranking, plus an EWMA next-window forecast, data
+completeness tracking, gap-fill + robust-outlier controls (winsorize/drop via
+median+MAD z-score), a cross-lookback heatmap, an interactive 3D decision
+matrix (lookback x frequency x metric), and a full Telegram report. All the
+math/quality-control functions are direct, exchange-agnostic ports from
+exodus (they operate on OHLC arrays, not on Binance specifics).
+
+**Adapted from exodus, not ported verbatim:**
+- Data source: exodus fetched Binance spot/perp klines directly; this page
+  fetches Deribit tradingview OHLC via `lib/deribit.get_tradingview_ohlc`
+  (BTC-PERPETUAL/ETH-PERPETUAL from `ASSET_CONFIG`), paginated in
+  1000-candle chunks (`fetch_deribit_klines_paginated`) since a 1m/30d
+  request is 43,200 candles and Deribit's tradingview endpoint has no
+  documented per-call cap.
+- No spot/perp toggle — Deribit's public API has no spot market to compare
+  against, so this app doesn't have that axis at all; the "in-progress live
+  bar" checkbox for 12h/1d frequencies is kept (still relevant on perp) but
+  the "market mode" selector is dropped.
+- Assets: BTC/ETH only for now (`TBRV_ASSETS`), not the ~28-asset Binance
+  list — could extend to SOL/HYPE once their Deribit tradingview history
+  depth at 1m/5m is checked.
+- Restyled to this app's conventions: `width="stretch"` (not
+  `use_container_width`), `fx_style.apply_theme`/`add_watermark` on every
+  chart, timestamps through `fx_style.to_local()` (SGT display), `lib/
+  telegram.py`'s `send_message`/`send_photo`/`is_configured()` gate (button
+  is disabled with a caption when not configured, rather than exodus's
+  always-on button), `ASSET_COLORS`/`PLOTLY_LAYOUT` from `lib/constants.py`.
+- Dropped exodus's cross-page Telegram batch sequence (`st.session_state
+  ["telegram_run_sequence"]`, `page_paths.py`, `st.switch_page` chaining) —
+  that's infrastructure from exodus's `Home.py` that this app doesn't have;
+  kept the single-page "Send to Telegram" button instead, which covers the
+  same reporting functionality for this page on its own.
+- Dropped a few functions exodus defined but never actually called from its
+  own main UI (`fig_price`, `fig_rolling_vol`, `fig_price_vol_dual`,
+  `fig_return_hist`, `fig_regime_bands`, `build_rolling_regime_bands`) —
+  verified by reading exodus's full ~3400-line source, not assumed.
+
+**Real bug found + fixed during offline verification (see CLAUDE.md's own
+"Testing" section for why offline verification matters here — no live
+network to Deribit from this sandbox either):** the pandas installed in this
+sandbox (3.0.x) resolves `pd.to_datetime(..., unit="ms")` to
+`datetime64[ms]`, not the historically-default `datetime64[ns]` — so
+`.astype("int64") // 1_000_000` (the natural way to get milliseconds back
+from a nanosecond-resolution datetime column) silently returned timestamps
+1,000,000x too small on this pandas version. Fixed by forcing
+`.to_numpy().astype("datetime64[ms]").astype("int64")` before extracting the
+epoch integer, which is correct regardless of which resolution pandas
+defaults to. This would have broken every fetch in production if that
+pandas version (or newer) ever got resolved by `pandas>=2.1.0` in
+`requirements.txt` — worth knowing about for any other page doing the same
+datetime64->int64 round-trip.
+
+**Verified offline** using the stub approach this file's own "Testing"
+section prescribes (no live Deribit network from this sandbox): built a
+richer `streamlit` + `plotly.graph_objects` stub (columns/tabs as reusable
+context managers, attribute-access `session_state`, permissive Figure/trace
+stand-ins since `plotly` itself isn't installable in this sandbox either),
+patched `lib.deribit.get_tradingview_ohlc` with a deterministic synthetic
+random-walk feed, and ran the real page script end-to-end via
+`importlib.util.exec_module` for: a cold load (all 10 frequencies x 6
+lookbacks, BTC), the "Send to Telegram" button path (confirmed it degrades
+gracefully — no credentials in this sandbox, so sends report `False` without
+raising), and the "Hard refresh" button path (confirmed it clears cache and
+calls `st.rerun()` as expected). Also directly exercised the resilience
+fallback: a successful fetch followed by a simulated Deribit outage on the
+next organic (non-forced) fetch correctly returns the last-good snapshot
+with `from_cache_fallback=True`; a *forced* refresh that then fails does
+NOT fall back (it deletes the snapshot before retrying) — this matches
+exodus's original semantics exactly (a forced refresh means "discard stale
+data," so no fallback is used), not a bug. Checked for duplicate widget
+keys (`grep`'d every `st.<widget>("label"...)` call) since this file's
+Testing section flags that as a real recurring bug class — none found, all
+labels unique. All 10 lookback x frequency combinations returned 100%
+candle completeness against the synthetic feed, RV decreased monotonically
+from 1m to 1d as expected for the synthetic random walk, and long/short-
+gamma ranks were assigned correctly.
+
+**Not verified:** real Deribit connectivity (same sandbox constraint as
+every other page), and the actual rendered Streamlit page in a browser —
+say so to the user, and suggest a visual sanity-check on the live deploy
+after this ships.
 
 ### 2026-08-22 — New page: Fear & Greed Signal (contrarian delta-lean backtest)
 
