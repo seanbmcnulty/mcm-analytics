@@ -39,10 +39,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from lib.deribit import get_tradingview_ohlc
+from lib.deribit import get_tradingview_ohlc, clear_cache
 from lib.constants import ASSET_CONFIG, ASSET_COLORS, PLOTLY_LAYOUT
 from lib.telegram import send_message, send_photo, is_configured
-from lib import cache as cache_lib
 from lib import fx_style
 
 # ---------------------------------------------------------------------------
@@ -74,16 +73,18 @@ st.caption(
 TBRV_ASSETS = ("BTC", "ETH")
 
 LOOKBACK_OPTIONS = ("1d", "3d", "7d", "14d", "21d", "30d")
-INTERVAL_OPTIONS = ("1m", "5m", "10m", "15m", "30m", "1h", "2h", "4h", "12h", "1d")
+# 4h (resolution "240") deliberately excluded: confirmed via live testing
+# that Deribit's tradingview endpoint returns no candles for BTC-PERPETUAL at
+# that resolution ("No candles returned for BTC-PERPETUAL (4h)" across every
+# lookback window) — not a transient outage. 2h and 12h already bracket that
+# gap, so this frequency is dropped rather than worked around.
+INTERVAL_OPTIONS = ("1m", "5m", "10m", "15m", "30m", "1h", "2h", "12h", "1d")
 
 # Deribit's get_tradingview_chart_data resolution parameter: minutes as a
-# string, or "1D" for daily. 240 (4h) isn't in Deribit's documented
-# enumeration but is accepted in practice (same as this app's existing
-# Realized Vol / Fear & Greed pages already assuming arbitrary-minute
-# resolutions work).
+# string, or "1D" for daily.
 INTERVAL_TO_RESOLUTION: Dict[str, str] = {
     "1m": "1", "5m": "5", "10m": "10", "15m": "15", "30m": "30",
-    "1h": "60", "2h": "120", "4h": "240", "12h": "720", "1d": "1D",
+    "1h": "60", "2h": "120", "12h": "720", "1d": "1D",
 }
 
 # Long hedge intervals whose last completed bar can be many hours stale (the
@@ -129,7 +130,7 @@ def interval_to_ms(interval: str) -> int:
     m = {
         "1m": 60_000, "5m": 300_000, "10m": 600_000, "15m": 900_000,
         "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
-        "4h": 14_400_000, "12h": 43_200_000, "1d": 86_400_000,
+        "12h": 43_200_000, "1d": 86_400_000,
     }
     if interval not in m:
         raise ValueError(f"Unknown interval: {interval}")
@@ -972,7 +973,7 @@ def fig_rolling_multi(analyses: List[Dict[str, Any]], asset: str, lookback: str)
     fig = go.Figure()
     marker_symbol_map = {
         "1m": "circle", "5m": "square", "10m": "diamond", "15m": "triangle-up",
-        "30m": "triangle-down", "1h": "cross", "2h": "x", "4h": "star",
+        "30m": "triangle-down", "1h": "cross", "2h": "x",
         "12h": "hexagon", "1d": "pentagon",
     }
     for item in analyses:
@@ -1528,7 +1529,11 @@ if not is_configured():
     st.caption("Telegram not configured — set credentials in secrets.toml or environment to enable sending.")
 
 if hard_refresh:
-    cache_lib.clear_all_caches()
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    clear_cache()
     st.session_state.pop(_SNAP_KEY, None)
     st.session_state.pop(_UI_CACHE_KEY, None)
     st.rerun()

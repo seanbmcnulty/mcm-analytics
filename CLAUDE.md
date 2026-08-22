@@ -278,6 +278,29 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-08-22 — Time Based Realized Vol: dropped the 4h frequency (Deribit returns no candles at that resolution)
+
+User tested the live page and saw every lookback window (1d through 30d)
+report `4h: No candles returned for BTC-PERPETUAL (4h)` — not a transient
+outage, every window hit it. `INTERVAL_TO_RESOLUTION` mapped `"4h" -> "240"`
+with a comment claiming 240 "isn't documented but works in practice" — that
+claim was never actually verified against live Deribit (this sandbox has no
+live network to it), and the user's real test disproved it. Removed 4h
+entirely rather than trying to work around it, since 2h and 12h already
+bracket that gap in the frequency ladder: dropped from `INTERVAL_OPTIONS`,
+`INTERVAL_TO_RESOLUTION`, `interval_to_ms`'s duration map, and the
+`fig_rolling_multi` marker-symbol map (`pages/06_Time_Based_Realized_Vol.py`).
+9 hedging frequencies remain: 1m, 5m, 10m, 15m, 30m, 1h, 2h, 12h, 1d.
+
+Re-verified offline (same mock-streamlit/mock-plotly/fake-Deribit harness as
+the entries below): smoke test now shows 67 fetch calls (was 68) across 9
+intervals, no exceptions, no `st.error`/`st.warning`; re-ran the cache/
+resilience checks (cold fetch, warm-TTL reuse, hard refresh, outage
+fallback, multi-interval batch) against the smaller interval set — all
+still pass. Not verified: real Deribit connectivity (same constraint as
+always) — ask the user to confirm the "excluded frequencies: 4h" warnings
+are gone on the next live load.
+
 ### 2026-08-22 — Cache consolidation + refresh button on every page
 
 User asked two related questions: can data be cached efficiently across all
