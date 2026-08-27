@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
+import plotly.colors as pcolors
 import plotly.graph_objects as go
 import requests
 from scipy.stats import norm
@@ -80,7 +81,7 @@ DEFAULT_MIN_SIZES = {
     'ETH': 125.0,
     'SOL_USDC': 125.0,
     'XRP_USDC': 1000.0,
-    'TRX_USDC': 100.0,
+    # TRX_USDC removed (2026-08-27): negligible volume, not worth a tab/slot.
     'AVAX_USDC': 10.0,
     'HYPE_USDC': 10.0,
 }
@@ -88,13 +89,13 @@ DEFAULT_MIN_SIZES = {
 ASSETS = list(DEFAULT_MIN_SIZES.keys())
 
 # Deribit groups every USDC-settled option under a single "USDC" currency
-# feed (SOL/XRP/TRX/AVAX/HYPE options are filtered out of it client-side by
+# feed (SOL/XRP/AVAX/HYPE options are filtered out of it client-side by
 # instrument prefix) - so there are really only 3 distinct trades feeds to
-# fetch, not 7. Fetching by currency once and reusing it across assets cuts
-# out 4 redundant identical API calls per page load.
+# fetch, not 6. Fetching by currency once and reusing it across assets cuts
+# out redundant identical API calls per page load.
 CURRENCY_MAP = {
     'BTC': 'BTC', 'ETH': 'ETH', 'SOL_USDC': 'USDC', 'XRP_USDC': 'USDC',
-    'TRX_USDC': 'USDC', 'AVAX_USDC': 'USDC', 'HYPE_USDC': 'USDC',
+    'AVAX_USDC': 'USDC', 'HYPE_USDC': 'USDC',
 }
 
 PLOTLY_LAYOUT = dict(
@@ -202,7 +203,7 @@ def _get_json_with_retry(url, params=None, timeout=10, max_retries=2, pace=0.15)
 def get_current_spot(asset: str) -> float:
     index_map = {
         'BTC': 'btc_usd', 'ETH': 'eth_usd', 'SOL_USDC': 'sol_usdc',
-        'XRP_USDC': 'xrp_usdc', 'TRX_USDC': 'trx_usdc',
+        'XRP_USDC': 'xrp_usdc',
         'AVAX_USDC': 'avax_usdc', 'HYPE_USDC': 'hype_usdc'
     }
     index_name = index_map.get(asset, f"{asset.lower()}_usd")
@@ -219,7 +220,7 @@ def get_current_spot(asset: str) -> float:
 def fetch_trades_by_currency(currency: str, start_dt_utc: datetime) -> pd.DataFrame:
     """Fetch+parse the raw trades feed for one Deribit currency (BTC/ETH/USDC).
 
-    Deribit exposes all USDC-settled option flow (SOL, XRP, TRX, AVAX, HYPE)
+    Deribit exposes all USDC-settled option flow (SOL, XRP, AVAX, HYPE)
     under a single "USDC" currency - the individual assets are filtered out
     of this shared feed by instrument prefix in fetch_public_trades() below.
     Fetching here once per currency (cached) instead of once per asset avoids
@@ -293,6 +294,13 @@ def fetch_trades_by_currency(currency: str, start_dt_utc: datetime) -> pd.DataFr
     if 'mark_price' not in df.columns and 'price' in df.columns:
         df['mark_price'] = df['price']
 
+    # Deribit normally returns a per-trade traded IV for options, but guard
+    # against a payload shape that ever omits it - several of the "Flow
+    # Analytics" charts below (IV surface, delta term structure) read this
+    # column directly and would KeyError without it.
+    if 'iv' not in df.columns:
+        df['iv'] = np.nan
+
     return df.dropna(subset=['strike', 'expiry']).reset_index(drop=True)
 
 def fetch_public_trades(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
@@ -302,7 +310,7 @@ def fetch_public_trades(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Filter by instrument prefix for USDC settled (SOL, XRP, AVAX, HYPE, TRX)
+    # Filter by instrument prefix for USDC settled (SOL, XRP, AVAX, HYPE)
     if "_USDC" in asset and "instrument_name" in df.columns:
         prefix = f"{asset}-"
         df = df[df['instrument_name'].str.startswith(prefix)].copy()
@@ -313,7 +321,7 @@ def fetch_public_trades(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
 def fetch_historical_spot(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
     perp_map = {
         'BTC': 'BTC-PERPETUAL', 'ETH': 'ETH-PERPETUAL', 'SOL_USDC': 'SOL_USDC-PERPETUAL',
-        'XRP_USDC': 'XRP_USDC-PERPETUAL', 'TRX_USDC': 'TRX_USDC-PERPETUAL',
+        'XRP_USDC': 'XRP_USDC-PERPETUAL',
         'AVAX_USDC': 'AVAX_USDC-PERPETUAL', 'HYPE_USDC': 'HYPE_USDC-PERPETUAL'
     }
     instrument = perp_map.get(asset, f"{asset}-PERPETUAL")
@@ -413,6 +421,49 @@ def compute_vectorized_greeks(df: pd.DataFrame, spot: float, asset: str) -> pd.D
         df['edge'] = (theo_asset_units * spot).abs()
     else:
         df['edge'] = theo_asset_units.abs()
+
+    # --- Fields for the "Flow Analytics" charts (ported from
+    # heatmap_live_v3.py) ---
+    df['minute'] = df['timestamp'].dt.floor('min')
+    df['direction_str'] = np.where(df['direction'] == 'buy', 'Buy', 'Sell')
+    df['expiry_str'] = df['expiry'].dt.strftime('%d%b%y')
+
+    # vega_usd / dollar_gamma are the exact same $ Greeks already computed
+    # above (dollar_vega, dollar_gamma_1pct) - both are amount * (per-contract
+    # dollar greek) - just aliased under the names heatmap_live_v3.py's chart
+    # functions expect, so there's no second computation to keep in sync.
+    df['vega_usd'] = df['dollar_vega']
+    df['dollar_gamma'] = df['dollar_gamma_1pct']
+
+    # Premium paid and "aggression" (how far through mark a taker paid),
+    # both signed in USD. BTC/ETH options are coin-margined - price and
+    # mark_price are quoted in the underlying (e.g. 0.05 BTC) - so need
+    # *spot to become USD, same asset split as the `edge` calc just above.
+    # USDC-settled assets are linear/USD-margined already, so must NOT be
+    # multiplied by spot again.
+    if asset in ['BTC', 'ETH']:
+        df['premium_usd'] = df['amount'] * df['price'] * spot
+        df['aggression_usd'] = (df['price'] - df['mark_price']) * df['amount'] * spot
+    else:
+        df['premium_usd'] = df['amount'] * df['price']
+        df['aggression_usd'] = (df['price'] - df['mark_price']) * df['amount']
+
+    abs_vega = df['vega_usd'].abs()
+    df['edge_vol'] = np.where(abs_vega > 0, df['aggression_usd'] / abs_vega, np.nan)
+
+    # Delta bucket: |delta| > 0.65 (deep ITM) and NaN deltas both fall
+    # through to 'Unknown'.
+    a = df['delta'].abs()
+    is_call_side = df['delta'] > 0
+    bucket_conds = [
+        (a >= 0.35) & (a <= 0.65),                    # ATM
+        is_call_side & (a >= 0.15) & (a < 0.35),      # 25D Call
+        is_call_side & (a > 0.0) & (a < 0.15),        # 10D Call
+        ~is_call_side & (a >= 0.15) & (a < 0.35),     # 25D Put
+        ~is_call_side & (a > 0.0) & (a < 0.15),       # 10D Put
+    ]
+    bucket_choices = ['ATM', '25D Call', '10D Call', '25D Put', '10D Put']
+    df['delta_bucket'] = np.select(bucket_conds, bucket_choices, default='Unknown')
 
     return df
 
@@ -770,6 +821,309 @@ def plot_cumulative_flow(data, asset):
     return fig
 
 # ---------------------------------------------------------------------------
+# Flow Analytics (ported from heatmap_live_v3.py's HeatMap class - the
+# uploaded script was a BTC/ETH-only live Dash dashboard; these are its
+# chart-building methods #5-11, reworked to run on this page's already
+# per-asset (not just BTC/ETH) df_asset frame and column names, and to use
+# this page's own color constants/fx_style finishing instead of a Dash
+# theme dict. build_structures/build_flow_table_rows/build_stats_children
+# from that script are a data TABLE, not a chart, and are not ported here.
+# ---------------------------------------------------------------------------
+def _empty_flow_fig(title):
+    fig = go.Figure()
+    fig.update_layout(title=title, paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR,
+                       font=dict(color=TEXT_COLOR), height=400, margin=dict(l=40, r=40, t=40, b=40))
+    fx_style.add_watermark(fig)
+    return fx_style.apply_theme(fig)
+
+def plot_iv_surface_by_tenor(data, asset, marker_size=1.0):
+    """Traded IV vs Strike, colour-coded by tenor, with the volume-weighted
+    average IV per strike drawn as a dotted curve per expiry."""
+    if data.empty or 'iv' not in data.columns:
+        return _empty_flow_fig(f'{asset} Traded IV Surface: No IV Data')
+
+    filtered = data[(data['strike'] > 0) & data['iv'].notna() & (data['iv'] > 0)].dropna(subset=['expiry']).copy()
+    if filtered.empty:
+        return _empty_flow_fig(f'{asset} Traded IV Surface: No IV Data')
+
+    filtered['_w'] = filtered['abs_amount']
+    filtered['_ivw'] = filtered['iv'] * filtered['_w']
+
+    fig = go.Figure()
+    expiries = filtered[['expiry', 'expiry_str']].drop_duplicates().sort_values('expiry')
+    n_expiries = len(expiries)
+    if n_expiries > 1:
+        color_scale = pcolors.sample_colorscale('Turbo', [i / (n_expiries - 1) for i in range(n_expiries)])
+    else:
+        color_scale = [pcolors.sample_colorscale('Turbo', [0.5])[0]]
+
+    for i, (_, row) in enumerate(expiries.iterrows()):
+        exp_date, exp_str = row['expiry'], row['expiry_str']
+        exp_data = filtered[filtered['expiry'] == exp_date]
+        color = color_scale[i]
+
+        sums = exp_data.groupby('strike')[['_ivw', '_w']].sum()
+        line_data = (sums['_ivw'] / sums['_w']).rename('vwap_iv').reset_index().sort_values('strike')
+        if len(line_data) > 1:
+            fig.add_trace(go.Scatter(
+                x=line_data['strike'], y=line_data['vwap_iv'], mode='lines',
+                line=dict(color=color, width=2, dash='dot'), opacity=0.6, hoverinfo='skip',
+                showlegend=False, legendgroup=exp_str, name=f'{exp_str} Curve'
+            ))
+
+        buys = exp_data[exp_data['direction_str'] == 'Buy']
+        if not buys.empty:
+            b_sizes = (buys['abs_amount'] * marker_size * 8).clip(upper=MARKER_SIZE_CAP)
+            fig.add_trace(go.Scatter(
+                x=buys['strike'], y=buys['iv'], mode='markers',
+                marker=dict(size=b_sizes, color=color, symbol='triangle-up', opacity=0.8, line=dict(width=1, color='white')),
+                text=[f"Buy {r.option_type}<br>Expiry: {exp_str}<br>Strike: {r.strike:,.0f}<br>"
+                      f"Vol: {abs(r.amount):.1f}<br>IV: {r.iv:.1f}%" for r in buys.itertuples()],
+                hoverinfo='text', name=f'{exp_str} (Buy)', legendgroup=exp_str
+            ))
+
+        sells = exp_data[exp_data['direction_str'] == 'Sell']
+        if not sells.empty:
+            s_sizes = (sells['abs_amount'] * marker_size * 8).clip(upper=MARKER_SIZE_CAP)
+            fig.add_trace(go.Scatter(
+                x=sells['strike'], y=sells['iv'], mode='markers',
+                marker=dict(size=s_sizes, color=color, symbol='triangle-down', opacity=0.8, line=dict(width=1, color='white')),
+                text=[f"Sell {r.option_type}<br>Expiry: {exp_str}<br>Strike: {r.strike:,.0f}<br>"
+                      f"Vol: {abs(r.amount):.1f}<br>IV: {r.iv:.1f}%" for r in sells.itertuples()],
+                hoverinfo='text', name=f'{exp_str} (Sell)', legendgroup=exp_str,
+                showlegend=buys.empty
+            ))
+
+    fig.update_layout(
+        title=f'{asset} Traded IV Surface (Coloured by Tenor)',
+        xaxis_title='Strike (Log Scale)', yaxis_title='Implied Volatility (%)',
+        xaxis=dict(type='log'), yaxis=dict(autorange=True),
+        paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
+        legend=dict(x=1.02, y=1, bordercolor='rgba(0,0,0,0.2)', borderwidth=1),
+        height=400, margin=dict(l=40, r=120, t=40, b=40)
+    )
+    fx_style.add_watermark(fig)
+    return fx_style.apply_theme(fig)
+
+def plot_term_structure_flow(data, asset):
+    """Total traded volume (calls vs. puts) stacked by expiry."""
+    if data.empty:
+        return _empty_flow_fig(f'{asset} Term Structure Flow: No Data')
+
+    filtered = data.dropna(subset=['expiry']).copy()
+    if filtered.empty:
+        return _empty_flow_fig(f'{asset} Term Structure Flow: No Data')
+
+    agg = filtered.groupby(['expiry', 'expiry_str', 'option_type'])['abs_amount'].sum().reset_index().sort_values('expiry')
+
+    fig = go.Figure()
+    for opt_type, color, name in [('C', 'blue', 'Calls'), ('P', 'purple', 'Puts')]:
+        subset = agg[agg['option_type'] == opt_type]
+        if not subset.empty:
+            fig.add_trace(go.Bar(x=subset['expiry_str'], y=subset['abs_amount'], name=name, marker_color=color))
+
+    fig.update_layout(
+        title=f'{asset} Term Structure Flow (Total Traded Volume)',
+        xaxis_title='Expiry', yaxis_title='Absolute Volume', barmode='stack',
+        xaxis=dict(categoryorder='array', categoryarray=agg['expiry_str'].unique()),
+        paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        height=400, margin=dict(l=40, r=40, t=40, b=40)
+    )
+    fx_style.add_watermark(fig)
+    return fx_style.apply_theme(fig)
+
+def plot_put_call_ratio_and_cumulative(data, asset):
+    """Cumulative call/put volume with the running put/call ratio on a
+    secondary axis."""
+    if data.empty:
+        return _empty_flow_fig(f'{asset} Flow & Put/Call Ratio: No Data')
+
+    df = data.copy()
+    df['call_vol'] = np.where(df['option_type'] == 'C', df['abs_amount'], 0)
+    df['put_vol'] = np.where(df['option_type'] == 'P', df['abs_amount'], 0)
+
+    grouped = df.groupby('minute')[['abs_amount', 'call_vol', 'put_vol']].sum().reset_index()
+    grouped['cum_calls'] = grouped['call_vol'].cumsum()
+    grouped['cum_puts'] = grouped['put_vol'].cumsum()
+    grouped['pc_ratio'] = np.where(grouped['cum_calls'] > 0, grouped['cum_puts'] / grouped['cum_calls'], 0)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=grouped['minute'], y=grouped['cum_calls'], mode='lines', line=dict(color='blue'), name='Cumul. Calls'))
+    fig.add_trace(go.Scatter(x=grouped['minute'], y=grouped['cum_puts'], mode='lines', line=dict(color='purple'), name='Cumul. Puts'))
+    fig.add_trace(go.Scatter(x=grouped['minute'], y=grouped['pc_ratio'], mode='lines', line=dict(color='#CC9900', dash='dot'), name='Put/Call Ratio', yaxis='y2'))
+
+    fig.update_layout(
+        title=f'{asset} Flow & Put/Call Ratio',
+        xaxis_title='Time (SGT)', yaxis_title='Cumulative Volume',
+        yaxis2=dict(title='Put/Call Ratio', overlaying='y', side='right', range=[0, max(3, grouped['pc_ratio'].max() * 1.2)]),
+        paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        height=400, margin=dict(l=40, r=40, t=40, b=40)
+    )
+    fx_style.add_watermark(fig)
+    return fx_style.apply_theme(fig)
+
+def plot_delta_term_structure(data, asset):
+    """Volume-weighted traded IV by delta bucket (ATM/25D/10D calls & puts),
+    across expiries."""
+    if data.empty or 'delta_bucket' not in data.columns:
+        return _empty_flow_fig(f'{asset} Traded Term Structure by Delta: No Data')
+
+    filtered = data.dropna(subset=['iv', 'expiry', 'delta_bucket']).copy()
+    filtered = filtered[(filtered['delta_bucket'] != 'Unknown') & (filtered['iv'] > 0)]
+    if filtered.empty:
+        return _empty_flow_fig(f'{asset} Traded Term Structure by Delta: No Data')
+
+    filtered['_w'] = filtered['abs_amount']
+    filtered['_ivw'] = filtered['iv'] * filtered['_w']
+    agg = filtered.groupby(['expiry', 'expiry_str', 'delta_bucket'])[['_ivw', '_w']].sum().reset_index()
+    agg['vwap_iv'] = agg['_ivw'] / agg['_w']
+    agg = agg.sort_values('expiry')
+
+    styles = {
+        '10D Call': {'color': '#33CCFF', 'dash': 'dot'},
+        '25D Call': {'color': '#3366FF', 'dash': 'dash'},
+        'ATM': {'color': '#CC9900', 'dash': 'solid'},
+        '25D Put': {'color': '#CC66FF', 'dash': 'dash'},
+        '10D Put': {'color': '#9933FF', 'dash': 'dot'},
+    }
+    expiries = agg['expiry_str'].unique()
+
+    fig = go.Figure()
+    for bucket, style in styles.items():
+        bucket_data = agg[agg['delta_bucket'] == bucket]
+        if not bucket_data.empty:
+            fig.add_trace(go.Scatter(
+                x=bucket_data['expiry_str'], y=bucket_data['vwap_iv'], mode='lines+markers',
+                line=dict(color=style['color'], width=2, dash=style['dash']),
+                marker=dict(size=8, color=style['color']), name=bucket
+            ))
+
+    fig.update_layout(
+        title=f'{asset} Traded Term Structure by Delta',
+        xaxis_title='Expiry Date', yaxis_title='VWAP Implied Volatility (%)',
+        xaxis=dict(categoryorder='array', categoryarray=expiries), yaxis=dict(autorange=True),
+        paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
+        legend=dict(x=1.02, y=1, bordercolor='rgba(0,0,0,0.2)', borderwidth=1),
+        height=400, margin=dict(l=40, r=120, t=40, b=40)
+    )
+    fx_style.add_watermark(fig)
+    return fx_style.apply_theme(fig)
+
+def plot_net_vega_by_expiry(data, asset):
+    """Net (signed, buy +/sell -) vega flow, stacked calls vs. puts, by
+    expiry."""
+    if data.empty or 'vega_usd' not in data.columns:
+        return _empty_flow_fig(f'{asset} Net Vega Flow by Expiry: No Data')
+
+    f = data.dropna(subset=['expiry'])
+    f = f[f['vega_usd'].notna()]
+    if f.empty:
+        return _empty_flow_fig(f'{asset} Net Vega Flow by Expiry: No Data')
+
+    agg = f.groupby(['expiry', 'expiry_str', 'option_type'], as_index=False).agg(
+        vega=('vega_usd', 'sum'), contracts=('abs_amount', 'sum'))
+    order = agg[['expiry', 'expiry_str']].drop_duplicates().sort_values('expiry')['expiry_str'].tolist()
+
+    fig = go.Figure()
+    for opt, color, name in [('C', 'blue', 'Calls'), ('P', 'purple', 'Puts')]:
+        sub = agg[agg['option_type'] == opt]
+        if sub.empty:
+            continue
+        fig.add_trace(go.Bar(
+            x=sub['expiry_str'], y=sub['vega'], name=name, marker_color=color,
+            customdata=sub['contracts'],
+            hovertemplate='%{x}<br>Net vega: $%{y:,.0f}<br>Contracts: %{customdata:,.0f}<extra>' + name + '</extra>'
+        ))
+    fig.add_hline(y=0, line_color='rgba(0,0,0,0.3)')
+    fig.update_layout(
+        title=f'{asset} Net Vega Flow by Expiry (buy +, sell -)', barmode='relative',
+        xaxis=dict(title='Expiry', categoryorder='array', categoryarray=order),
+        yaxis=dict(title='Net Vega (USD)', tickprefix='$', tickformat='~s'),
+        paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        height=400, margin=dict(l=40, r=40, t=40, b=40)
+    )
+    fx_style.add_watermark(fig)
+    return fx_style.apply_theme(fig)
+
+def plot_net_positioning_by_strike(data, asset, current_spot=0.0):
+    """Net vega by strike for the session, with a marker at the strike
+    nearest current spot."""
+    if data.empty or 'vega_usd' not in data.columns:
+        return _empty_flow_fig(f'{asset} Net Vega by Strike: No Data')
+
+    f = data[data['strike'] > 0]
+    f = f[f['vega_usd'].notna()]
+    if f.empty:
+        return _empty_flow_fig(f'{asset} Net Vega by Strike: No Data')
+
+    agg = f.groupby(['strike', 'option_type'], as_index=False).agg(
+        vega=('vega_usd', 'sum'), net_contracts=('amount', 'sum'), gross=('abs_amount', 'sum'))
+    cat = sorted(agg['strike'].unique())
+
+    fig = go.Figure()
+    for opt, color, name in [('C', 'blue', 'Calls'), ('P', 'purple', 'Puts')]:
+        sub = agg[agg['option_type'] == opt]
+        if sub.empty:
+            continue
+        fig.add_trace(go.Bar(
+            x=sub['strike'], y=sub['vega'], name=name, marker_color=color,
+            customdata=np.stack([sub['net_contracts'], sub['gross']], axis=-1),
+            hovertemplate=('Strike %{x}<br>Net vega: $%{y:,.0f}<br>Net contracts: %{customdata[0]:,.1f}'
+                           '<br>Gross contracts: %{customdata[1]:,.1f}<extra>' + name + '</extra>')
+        ))
+    fig.add_hline(y=0, line_color='rgba(0,0,0,0.3)')
+    if current_spot and current_spot > 0 and cat:
+        nearest = min(cat, key=lambda k: abs(k - current_spot))
+        fig.add_vline(x=nearest, line_dash='dot', line_color='rgba(0,0,0,0.6)',
+                      annotation_text='spot', annotation_font=dict(color=TEXT_COLOR, size=10))
+    fig.update_layout(
+        title=f'{asset} Net Vega by Strike (session, buy +, sell -)', barmode='relative',
+        xaxis=dict(title='Strike', type='category', categoryorder='array', categoryarray=cat),
+        yaxis=dict(title='Net Vega (USD)', tickprefix='$', tickformat='~s'),
+        paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        height=400, margin=dict(l=40, r=40, t=40, b=40)
+    )
+    fx_style.add_watermark(fig)
+    return fx_style.apply_theme(fig)
+
+def plot_cumulative_aggression(data, asset):
+    """Cumulative premium paid through mark (>0 = takers paying up), total
+    plus the 4 busiest expiries."""
+    if data.empty or 'aggression_usd' not in data.columns:
+        return _empty_flow_fig(f'{asset} Aggression: No Data')
+
+    f = data[data['aggression_usd'].notna()]
+    if f.empty:
+        return _empty_flow_fig(f'{asset} Aggression: No Data')
+
+    total = f.groupby('minute')['aggression_usd'].sum().cumsum()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=total.index, y=total.values, mode='lines', line=dict(color=TEXT_COLOR, width=2), name='Total'))
+
+    top = f.groupby('expiry_str')['abs_amount'].sum().nlargest(4).index.tolist()
+    if top:
+        colors = pcolors.sample_colorscale('Turbo', [i / max(len(top) - 1, 1) for i in range(len(top))])
+        for e, color in zip(top, colors):
+            s = f[f['expiry_str'] == e].groupby('minute')['aggression_usd'].sum().cumsum()
+            fig.add_trace(go.Scatter(x=s.index, y=s.values, mode='lines', line=dict(color=color, width=1.5), name=e))
+
+    fig.add_hline(y=0, line_color='rgba(0,0,0,0.3)')
+    fig.update_layout(
+        title=f'{asset} Aggression - Cumulative Premium Through Mark (>0 = takers paying up)',
+        xaxis_title='Time (SGT)', yaxis=dict(title='Cum. $ through mark', tickprefix='$', tickformat='~s'),
+        paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        height=400, margin=dict(l=40, r=40, t=40, b=40)
+    )
+    fx_style.add_watermark(fig)
+    return fx_style.apply_theme(fig)
+
+# ---------------------------------------------------------------------------
 # Telegram Sending (same rendering path as pages/01_MCM_Bot.py's
 # send_result_to_telegram, adapted for this page's plain chart set - no
 # tables here, so it's just "render each figure to PNG, sanitize its title
@@ -948,6 +1302,8 @@ for idx, asset in enumerate(ASSETS):
 # here, but the actual sending happens after the tab loop below, once
 # asset_figs_dict is fully populated with every asset's charts.
 # ---------------------------------------------------------------------------
+CHARTS_PER_ASSET = 12  # 5 original + 7 Flow Analytics - keep in sync with asset_figs_dict below
+
 _tg_configured = telegram.is_configured()
 st.caption("Send charts to Telegram (as images):" if _tg_configured
            else f"Telegram not configured: {telegram.config_status()}")
@@ -959,18 +1315,18 @@ for _a, _col in zip(ASSETS, _tg_cols[:len(ASSETS)]):
         send_asset_clicked[_a] = st.button(
             _clean, key=f"tg_send_{_a}", width="stretch",
             disabled=not _tg_configured,
-            help=f"Send {_clean}'s 5 charts to Telegram.")
+            help=f"Send {_clean}'s {CHARTS_PER_ASSET} charts to Telegram.")
 _BTC_ETH = [a for a in ASSETS if a in ("BTC", "ETH")]
 with _tg_cols[len(ASSETS)]:
     send_btc_eth_clicked = st.button(
         "BTC+ETH", key="tg_send_btc_eth", width="stretch",
         disabled=not _tg_configured or not _BTC_ETH,
-        help="Send BTC and ETH's charts to Telegram.")
+        help=f"Send BTC and ETH's charts to Telegram ({CHARTS_PER_ASSET * 2} charts).")
 with _tg_cols[len(ASSETS) + 1]:
     send_all_clicked = st.button(
         "📤 All", key="tg_send_all", width="stretch",
         disabled=not _tg_configured,
-        help="Send every asset's charts to Telegram (35 charts total).")
+        help=f"Send every asset's charts to Telegram ({CHARTS_PER_ASSET * len(ASSETS)} charts total).")
 
 # Tabs
 tab_names = [f"📈 {a.replace('_USDC', '')}" for a in ASSETS] + ["📊 ALL (2x2 Grid)", "📋 Block Trade Statistics"]
@@ -981,7 +1337,6 @@ def get_asset_multipliers(asset):
     if asset == 'ETH': return 0.5/15, 1.0/15
     if 'SOL' in asset: return 0.5/150, 1.0/150
     if 'XRP' in asset: return 0.5/1500, 1.0/1500
-    if 'TRX' in asset: return 0.5/1500, 1.0/1500
     if 'AVAX' in asset: return 0.5/150, 1.0/150
     if 'HYPE' in asset: return 0.5/150, 1.0/150
     return 0.5/150, 1.0/150
@@ -1010,8 +1365,20 @@ for idx, asset in enumerate(ASSETS):
         fig_net_heatmap = plot_net_heatmap(df_asset, clean_name)
         fig_gross_volume = plot_gross_volume_heatmap(df_asset, clean_name)
         fig_cumulative = plot_cumulative_flow(df_asset, clean_name)
+
+        # Flow Analytics (ported from heatmap_live_v3.py) - 7 additional charts.
+        fig_iv_surface = plot_iv_surface_by_tenor(df_asset, clean_name, m_size)
+        fig_term_flow = plot_term_structure_flow(df_asset, clean_name)
+        fig_pc_ratio = plot_put_call_ratio_and_cumulative(df_asset, clean_name)
+        fig_delta_term = plot_delta_term_structure(df_asset, clean_name)
+        fig_vega_expiry = plot_net_vega_by_expiry(df_asset, clean_name)
+        fig_vega_strike = plot_net_positioning_by_strike(df_asset, clean_name, spot_px)
+        fig_aggression = plot_cumulative_aggression(df_asset, clean_name)
+
         asset_figs_dict[asset] = [
             fig_scatter, fig_strike_expiry, fig_net_heatmap, fig_gross_volume, fig_cumulative,
+            fig_iv_surface, fig_term_flow, fig_pc_ratio, fig_delta_term,
+            fig_vega_expiry, fig_vega_strike, fig_aggression,
         ]
 
         # 1. Scatter with Spot & DVOL
@@ -1031,6 +1398,29 @@ for idx, asset in enumerate(ASSETS):
         # above are equal-sized boxes instead of one being paired with this
         # chart at half width and the other sitting full-width alone)
         st.plotly_chart(fig_cumulative, width="stretch", key=f"tab_cumulative_{asset}")
+
+        # 5. Flow Analytics - IV surface and delta term structure both carry
+        # a wide right-side legend, so they get their own full-width rows;
+        # the rest pair up in equal-width columns.
+        st.divider()
+        st.subheader(f"{clean_name} Flow Analytics")
+        st.plotly_chart(fig_iv_surface, width="stretch", key=f"tab_iv_surface_{asset}")
+
+        col3, col4 = st.columns(2)
+        with col3:
+            st.plotly_chart(fig_term_flow, width="stretch", key=f"tab_term_flow_{asset}")
+        with col4:
+            st.plotly_chart(fig_pc_ratio, width="stretch", key=f"tab_pc_ratio_{asset}")
+
+        st.plotly_chart(fig_delta_term, width="stretch", key=f"tab_delta_term_{asset}")
+
+        col5, col6 = st.columns(2)
+        with col5:
+            st.plotly_chart(fig_vega_expiry, width="stretch", key=f"tab_vega_expiry_{asset}")
+        with col6:
+            st.plotly_chart(fig_vega_strike, width="stretch", key=f"tab_vega_strike_{asset}")
+
+        st.plotly_chart(fig_aggression, width="stretch", key=f"tab_aggression_{asset}")
 
 # Handle the toolbar's Telegram buttons now that every asset's figures have
 # been built (asset_figs_dict is fully populated by the tab loop above).

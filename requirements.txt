@@ -8,14 +8,21 @@ numpy>=1.26.0
 pandas>=2.1.0
 matplotlib>=3.7.0
 scipy>=1.11.0
-plotly>=5.18.0
+# plotly is capped below 6.1 on purpose, to match the kaleido pin below.
+# Plotly 6.1.1+ requires kaleido>=1.0 for fig.to_image()/write_image() (the
+# legacy 0.x "bundled Chromium" engine is dropped) — an unbounded plotly pin
+# here let Streamlit Cloud's next fresh install grab a >=6.1.1 build while
+# kaleido stayed pinned at 0.2.x, which produced this exact runtime error
+# every time an image was rendered:
+#   "Image export requires the Kaleido package, v1.0.0 or greater..."
+# i.e. every Telegram chart send failing with "failed to render". Keep
+# these two pins moving together — either stay on plotly<6.1 + kaleido<0.3
+# (bundled Chromium, no extra setup) or upgrade to plotly>=6.1.1 +
+# kaleido>=1.0 AND provision a Chrome/Chromium binary (kaleido 1.x needs
+# one on PATH, or plotly.io.get_chrome() run once at startup / a
+# packages.txt apt entry) — never mix the two.
+plotly>=5.18.0,<6.1.0
 arch>=6.2.0
 toml>=0.10.2
-# Pinned below 0.3 on purpose: kaleido 1.x dropped its bundled Chromium
-# (needs a separate browser install step), which silently breaks
-# fig.to_image()/write_image() on a headless host like Streamlit Cloud —
-# the exact symptom of Telegram sends degrading from chart images to raw
-# text. Keep this pin unless a Chrome/Chromium binary is provisioned
-# alongside the app.
 kaleido>=0.2.1,<0.3.0
 streamlit-autorefresh>=1.0.1
