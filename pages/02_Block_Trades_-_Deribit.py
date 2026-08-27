@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import time
+import html
 import concurrent.futures
 from datetime import datetime, timedelta, timezone
 
@@ -27,6 +28,7 @@ import streamlit as st
 
 from lib import cache as cache_lib
 from lib import fx_style
+from lib import telegram
 from lib.constants import TTL_SHORT, TTL_MEDIUM
 
 # ---------------------------------------------------------------------------
@@ -150,6 +152,17 @@ with st.sidebar:
         time.sleep(60)
         st.rerun()
     cache_lib.render_refresh_button()
+
+    st.divider()
+    st.subheader("Telegram")
+    if telegram.is_configured():
+        send_all_clicked = st.button("📤 Send ALL charts to Telegram", key="tg_send_all",
+                                      help="Sends every chart on every asset tab "
+                                           "(35 charts) - handled further down the "
+                                           "page once they're all built.")
+    else:
+        send_all_clicked = False
+        st.caption(f"Telegram not configured: {telegram.config_status()}")
 
 # ---------------------------------------------------------------------------
 # API Fetching Helpers
@@ -640,6 +653,30 @@ def plot_strike_vs_expiry(data, asset, size_multiplier=1.0):
     fig = fx_style.apply_theme(fig)
     return fig
 
+def _square_heatmap_axes(pivot):
+    """xaxis/yaxis kwargs that make every cell in a strike x expiry heatmap
+    a uniform square, regardless of the actual numeric gaps between strikes
+    or calendar gaps between expiries.
+
+    By default the strike axis is numeric/continuous, so Plotly spaces
+    columns by actual price distance (a 5000-wide strike gap renders visibly
+    narrower than a 20000-wide one), and the expiry axis - built from
+    '%Y-%m-%d' strings - gets auto-detected as a date axis and spaces rows
+    by actual calendar distance (a weekly expiry next to a quarterly one
+    would render with very different row heights). Forcing both to
+    `type='category'` makes every column/row exactly one unit wide/tall
+    regardless of the real value gap, and `scaleanchor`+`scaleratio=1` then
+    forces those units to be equal in pixels too, so cells end up square
+    instead of just uniformly-spaced rectangles.
+    """
+    return (
+        dict(title='Strike', type='category',
+             categoryorder='array', categoryarray=list(pivot.columns)),
+        dict(title='Expiry', type='category',
+             categoryorder='array', categoryarray=list(pivot.index.strftime('%Y-%m-%d')),
+             scaleanchor='x', scaleratio=1),
+    )
+
 def plot_net_heatmap(data, asset):
     fig = go.Figure()
     if data.empty:
@@ -659,9 +696,10 @@ def plot_net_heatmap(data, asset):
         colorbar=dict(title='Net Contracts', bgcolor=BACKGROUND_COLOR, bordercolor=TEXT_COLOR, tickfont=dict(color=TEXT_COLOR)),
         hovertemplate='Strike: %{x}<br>Expiry: %{y}<br>Net Flow: %{z}<extra></extra>'
     ))
+    xaxis, yaxis = _square_heatmap_axes(pivot)
     fig.update_layout(
         title=f'{asset} Option Strike vs Expiry Net Flow Heatmap',
-        xaxis_title='Strike', yaxis_title='Expiry',
+        xaxis=xaxis, yaxis=yaxis,
         paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
         height=400,
         margin=dict(l=40, r=40, t=40, b=40)
@@ -689,9 +727,10 @@ def plot_gross_volume_heatmap(data, asset):
         colorbar=dict(title='Gross Contracts', bgcolor=BACKGROUND_COLOR, bordercolor=TEXT_COLOR, tickfont=dict(color=TEXT_COLOR)),
         hovertemplate='Strike: %{x}<br>Expiry: %{y}<br>Gross Volume: %{z}<extra></extra>'
     ))
+    xaxis, yaxis = _square_heatmap_axes(pivot)
     fig.update_layout(
         title=f'{asset} Gross Volume Heatmap',
-        xaxis_title='Strike', yaxis_title='Expiry',
+        xaxis=xaxis, yaxis=yaxis,
         paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
         height=400,
         margin=dict(l=40, r=40, t=40, b=40)
@@ -732,6 +771,54 @@ def plot_cumulative_flow(data, asset):
     fx_style.add_watermark(fig)
     fig = fx_style.apply_theme(fig)
     return fig
+
+# ---------------------------------------------------------------------------
+# Telegram Sending (same rendering path as pages/01_MCM_Bot.py's
+# send_result_to_telegram, adapted for this page's plain chart set - no
+# tables here, so it's just "render each figure to PNG, sanitize its title
+# into a caption, send")
+# ---------------------------------------------------------------------------
+def _caption_from_title(title_text, fallback: str) -> str:
+    """Telegram-safe caption from a figure's title. Our titles here are
+    plain f-strings with no Plotly <span>/<br> markup, but html.escape()
+    is cheap insurance against parse_mode=HTML choking on a literal '<' or
+    '&' (e.g. a future title containing a raw comparison operator) - see
+    pages/01_MCM_Bot.py's _caption_from_title for the incident this pattern
+    was built to avoid."""
+    if not title_text:
+        return fallback
+    text = html.escape(str(title_text).replace("<br>", "\n").strip())
+    return (text[:1024] if len(text) > 1024 else text) or fallback
+
+def _send_chart_to_telegram(fig, caption_base: str):
+    """Render one chart (light theme, matching 01_MCM_Bot.py's Telegram
+    rendering) and send it. Returns (ok, failure_reason_or_None)."""
+    if fig is None:
+        return False, f"{caption_base}: no chart to send"
+    title_obj = getattr(getattr(fig, "layout", None), "title", None)
+    title_text = getattr(title_obj, "text", None) if title_obj else None
+    caption = _caption_from_title(title_text, caption_base)
+
+    png = fx_style.fig_to_png(fx_style.apply_theme(fig, "light"), width=1200, height=800)
+    if png is None:
+        return False, f"{caption_base}: failed to render image"
+    if telegram.send_photo(png, caption):
+        return True, None
+    return False, f"{caption_base}: failed to send to Telegram"
+
+def _send_asset_charts_to_telegram(clean_name: str, figs: list) -> tuple[int, int, list[str]]:
+    """Send every chart for one asset. Returns (sent, failed, reasons)."""
+    sent = failed = 0
+    reasons = []
+    for fig in figs:
+        ok, reason = _send_chart_to_telegram(fig, f"{clean_name} block trades")
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+            if reason:
+                reasons.append(reason)
+    return sent, failed, reasons
 
 # ---------------------------------------------------------------------------
 # Data Pipeline & Tab Rendering
@@ -823,55 +910,92 @@ def get_asset_multipliers(asset):
 # ---------------------------------------------------------------------------
 # Render Individual Asset Tabs
 # ---------------------------------------------------------------------------
+asset_figs_dict = {}  # asset -> list of figs, built once here and reused by
+                       # both st.plotly_chart (on-screen) and the Telegram
+                       # send buttons below, instead of re-computing them.
+
 for idx, asset in enumerate(ASSETS):
     clean_name = asset.replace('_USDC', '')
     with tabs[idx]:
         st.markdown(f'<div class="asset-header">{clean_name} Option Block Flow Analysis</div>', unsafe_allow_html=True)
-        
+
         df_asset = asset_data_dict[asset]
         hist_spot = hist_spot_dict[asset]
         dvol_s = dvol_dict[asset]
         spot_px = spot_dict[asset]
-        
+
         m_size, s_mult = get_asset_multipliers(asset)
-        
+
+        fig_scatter = plot_scatter_with_spot_and_dvol(df_asset, hist_spot, dvol_s, spot_px, clean_name, m_size)
+        fig_strike_expiry = plot_strike_vs_expiry(df_asset, clean_name, s_mult)
+        fig_net_heatmap = plot_net_heatmap(df_asset, clean_name)
+        fig_gross_volume = plot_gross_volume_heatmap(df_asset, clean_name)
+        fig_cumulative = plot_cumulative_flow(df_asset, clean_name)
+        asset_figs_dict[asset] = [
+            fig_scatter, fig_strike_expiry, fig_net_heatmap, fig_gross_volume, fig_cumulative,
+        ]
+
         # 1. Scatter with Spot & DVOL
-        st.plotly_chart(
-            plot_scatter_with_spot_and_dvol(df_asset, hist_spot, dvol_s, spot_px, clean_name, m_size),
-            width="stretch",
-            key=f"tab_scatter_{asset}"
-        )
-        
+        st.plotly_chart(fig_scatter, width="stretch", key=f"tab_scatter_{asset}")
+
         # 2. Strike vs Expiry
-        st.plotly_chart(
-            plot_strike_vs_expiry(df_asset, clean_name, s_mult),
-            width="stretch",
-            key=f"tab_strike_expiry_{asset}"
-        )
-        
+        st.plotly_chart(fig_strike_expiry, width="stretch", key=f"tab_strike_expiry_{asset}")
+
         # 3. Heatmaps Side-by-Side (equal-width columns, so both boxes match)
         col1, col2 = st.columns(2)
         with col1:
-            st.plotly_chart(
-                plot_net_heatmap(df_asset, clean_name),
-                width="stretch",
-                key=f"tab_net_heatmap_{asset}"
-            )
+            st.plotly_chart(fig_net_heatmap, width="stretch", key=f"tab_net_heatmap_{asset}")
         with col2:
-            st.plotly_chart(
-                plot_gross_volume_heatmap(df_asset, clean_name),
-                width="stretch",
-                key=f"tab_gross_volume_{asset}"
-            )
+            st.plotly_chart(fig_gross_volume, width="stretch", key=f"tab_gross_volume_{asset}")
 
         # 4. Cumulative Flow (moved out of the heatmap row so both heatmaps
         # above are equal-sized boxes instead of one being paired with this
         # chart at half width and the other sitting full-width alone)
-        st.plotly_chart(
-            plot_cumulative_flow(df_asset, clean_name),
-            width="stretch",
-            key=f"tab_cumulative_{asset}"
-        )
+        st.plotly_chart(fig_cumulative, width="stretch", key=f"tab_cumulative_{asset}")
+
+        # 5. Send this asset's charts to Telegram
+        send_disabled = not telegram.is_configured()
+        if st.button(f"📤 Send {clean_name} charts to Telegram", key=f"tg_send_{asset}",
+                     disabled=send_disabled,
+                     help=None if not send_disabled else "Telegram isn't configured (see secrets.toml)."):
+            with st.spinner(f"Sending {clean_name} charts to Telegram..."):
+                sent, failed, reasons = _send_asset_charts_to_telegram(clean_name, asset_figs_dict[asset])
+            if sent:
+                st.success(f"Sent {sent} chart(s) to Telegram."
+                           + (f" ({failed} failed — see below.)" if failed else ""))
+            else:
+                st.error("Failed to send charts to Telegram.")
+            for r in reasons:
+                st.caption(r)
+
+# Handle the sidebar's "Send ALL" button now that every asset's figures have
+# been built (asset_figs_dict is fully populated by the tab loop above).
+if send_all_clicked:
+    total_sent = total_failed = 0
+    all_reasons: list[str] = []
+    all_figs = [(asset.replace('_USDC', ''), fig)
+                for asset in ASSETS for fig in asset_figs_dict[asset]]
+    progress = st.progress(0.0)
+    with st.spinner("Sending all charts to Telegram..."):
+        for i, (clean_name, fig) in enumerate(all_figs, start=1):
+            ok, reason = _send_chart_to_telegram(fig, f"{clean_name} block trades")
+            if ok:
+                total_sent += 1
+            else:
+                total_failed += 1
+                if reason:
+                    all_reasons.append(reason)
+            progress.progress(i / len(all_figs))
+    progress.empty()
+    if total_sent:
+        st.success(f"Sent {total_sent} chart(s) to Telegram."
+                   + (f" ({total_failed} failed — see detail below.)" if total_failed else ""))
+    else:
+        st.error("Failed to send charts to Telegram.")
+    if all_reasons:
+        with st.expander(f"⚠️ {len(all_reasons)} chart(s) had trouble — click for detail."):
+            for r in all_reasons:
+                st.markdown(f"- {r}")
 
 # ---------------------------------------------------------------------------
 # Render ALL (2x2 Grid) Tab
