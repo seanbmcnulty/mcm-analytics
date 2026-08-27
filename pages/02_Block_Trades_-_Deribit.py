@@ -156,13 +156,10 @@ with st.sidebar:
     st.divider()
     st.subheader("Telegram")
     if telegram.is_configured():
-        send_all_clicked = st.button("📤 Send ALL charts to Telegram", key="tg_send_all",
-                                      help="Sends every chart on every asset tab "
-                                           "(35 charts) - handled further down the "
-                                           "page once they're all built.")
+        st.success("Telegram ready")
     else:
-        send_all_clicked = False
-        st.caption(f"Telegram not configured: {telegram.config_status()}")
+        st.warning("Telegram not configured")
+        st.caption(telegram.config_status())
 
 # ---------------------------------------------------------------------------
 # API Fetching Helpers
@@ -790,35 +787,86 @@ def _caption_from_title(title_text, fallback: str) -> str:
     text = html.escape(str(title_text).replace("<br>", "\n").strip())
     return (text[:1024] if len(text) > 1024 else text) or fallback
 
+def _render_png_with_reason(fig):
+    """Render one themed figure to PNG bytes via kaleido - same call as
+    fx_style.fig_to_png, but also returns the underlying exception text on
+    failure. fx_style.fig_to_png only prints that text to stdout (visible
+    in Streamlit Cloud's Manage app -> Logs), so a render failure here
+    would otherwise show only a generic "failed to render" with no way to
+    tell why (missing Chromium, a timeout, an unsupported layout property)
+    without leaving the app. Surfacing it directly in the failure reason
+    saves that round trip."""
+    try:
+        return fig.to_image(format="png", width=1200, height=800), None
+    except Exception as e:
+        return None, str(e)
+
 def _send_chart_to_telegram(fig, caption_base: str):
     """Render one chart (light theme, matching 01_MCM_Bot.py's Telegram
-    rendering) and send it. Returns (ok, failure_reason_or_None)."""
+    rendering) and send it. Retries the render once, same as
+    01_MCM_Bot.py's send_result_to_telegram, in case of a transient
+    kaleido hiccup. Returns (ok, failure_reason_or_None); the reason
+    marks whether the failure was at render (kaleido) or send (Telegram)
+    stage, since those point at different root causes."""
     if fig is None:
         return False, f"{caption_base}: no chart to send"
     title_obj = getattr(getattr(fig, "layout", None), "title", None)
     title_text = getattr(title_obj, "text", None) if title_obj else None
     caption = _caption_from_title(title_text, caption_base)
 
-    png = fx_style.fig_to_png(fx_style.apply_theme(fig, "light"), width=1200, height=800)
+    themed = fx_style.apply_theme(fig, "light")
+    png, err = _render_png_with_reason(themed)
     if png is None:
-        return False, f"{caption_base}: failed to render image"
+        png, err = _render_png_with_reason(themed)
+    if png is None:
+        detail = f" ({err})" if err else ""
+        return False, f"{caption_base}: failed to **render**{detail}"
     if telegram.send_photo(png, caption):
         return True, None
-    return False, f"{caption_base}: failed to send to Telegram"
+    return False, f"{caption_base}: failed to **send**"
 
-def _send_asset_charts_to_telegram(clean_name: str, figs: list) -> tuple[int, int, list[str]]:
-    """Send every chart for one asset. Returns (sent, failed, reasons)."""
-    sent = failed = 0
-    reasons = []
-    for fig in figs:
-        ok, reason = _send_chart_to_telegram(fig, f"{clean_name} block trades")
-        if ok:
-            sent += 1
-        else:
-            failed += 1
-            if reason:
-                reasons.append(reason)
-    return sent, failed, reasons
+def _send_many_to_telegram(fig_label_pairs: list, label: str) -> None:
+    """Send a batch of (clean_asset_name, fig) pairs to Telegram with a
+    progress bar and a success/failure summary - shared by the toolbar's
+    per-asset, BTC+ETH, and All buttons so there's one code path instead
+    of three copies (mirrors 01_MCM_Bot.py's _send_to_telegram)."""
+    if not fig_label_pairs:
+        st.warning(f"Nothing to send for {label}.")
+        return
+    total_sent = total_failed = 0
+    all_reasons: list = []
+    progress = st.progress(0.0) if len(fig_label_pairs) > 1 else None
+    with st.spinner(f"Sending {label} to Telegram..."):
+        for i, (clean_name, fig) in enumerate(fig_label_pairs, start=1):
+            ok, reason = _send_chart_to_telegram(fig, f"{clean_name} block trades")
+            if ok:
+                total_sent += 1
+            else:
+                total_failed += 1
+                if reason:
+                    all_reasons.append(reason)
+            if progress:
+                progress.progress(i / len(fig_label_pairs))
+    if progress:
+        progress.empty()
+    if total_sent:
+        st.success(f"Sent {total_sent} chart(s) to Telegram."
+                   + (f" ({total_failed} failed — see detail below.)" if total_failed else ""))
+    else:
+        st.error("Failed to send charts to Telegram.")
+    if all_reasons:
+        n_render = sum(1 for r in all_reasons if "render" in r)
+        n_send = sum(1 for r in all_reasons if "send" in r)
+        with st.expander(f"⚠️ {len(all_reasons)} chart(s) had trouble — "
+                         f"{n_render} failed to render, {n_send} failed to send. Click for detail."):
+            st.caption(
+                "**Render** failures happen before Telegram is ever contacted "
+                "(the chart image itself couldn't be built — usually kaleido; "
+                "the text in parentheses is the underlying error). **Send** "
+                "failures mean the image rendered fine but Telegram rejected "
+                "or didn't receive it.")
+            for r in all_reasons:
+                st.markdown(f"- {r}")
 
 # ---------------------------------------------------------------------------
 # Data Pipeline & Tab Rendering
@@ -893,6 +941,37 @@ for idx, asset in enumerate(ASSETS):
     vol = asset_data_dict[asset]['abs_amount'].sum() if cnt > 0 else 0
     m_cols[idx].metric(f"{clean} Blocks", f"{cnt}", f"{vol:,.0f} ctrs")
 
+# ---------------------------------------------------------------------------
+# Send to Telegram — one button per asset, a BTC+ETH combo, plus "All",
+# matching pages/01_MCM_Bot.py's toolbar (send just one asset, a pair, or
+# everything) instead of a single all-or-nothing send. Clicks are captured
+# here, but the actual sending happens after the tab loop below, once
+# asset_figs_dict is fully populated with every asset's charts.
+# ---------------------------------------------------------------------------
+_tg_configured = telegram.is_configured()
+st.caption("Send charts to Telegram (as images):" if _tg_configured
+           else f"Telegram not configured: {telegram.config_status()}")
+_tg_cols = st.columns(len(ASSETS) + 2)
+send_asset_clicked = {}
+for _a, _col in zip(ASSETS, _tg_cols[:len(ASSETS)]):
+    _clean = _a.replace('_USDC', '')
+    with _col:
+        send_asset_clicked[_a] = st.button(
+            _clean, key=f"tg_send_{_a}", width="stretch",
+            disabled=not _tg_configured,
+            help=f"Send {_clean}'s 5 charts to Telegram.")
+_BTC_ETH = [a for a in ASSETS if a in ("BTC", "ETH")]
+with _tg_cols[len(ASSETS)]:
+    send_btc_eth_clicked = st.button(
+        "BTC+ETH", key="tg_send_btc_eth", width="stretch",
+        disabled=not _tg_configured or not _BTC_ETH,
+        help="Send BTC and ETH's charts to Telegram.")
+with _tg_cols[len(ASSETS) + 1]:
+    send_all_clicked = st.button(
+        "📤 All", key="tg_send_all", width="stretch",
+        disabled=not _tg_configured,
+        help="Send every asset's charts to Telegram (35 charts total).")
+
 # Tabs
 tab_names = [f"📈 {a.replace('_USDC', '')}" for a in ASSETS] + ["📊 ALL (2x2 Grid)", "📋 Block Trade Statistics"]
 tabs = st.tabs(tab_names)
@@ -953,49 +1032,20 @@ for idx, asset in enumerate(ASSETS):
         # chart at half width and the other sitting full-width alone)
         st.plotly_chart(fig_cumulative, width="stretch", key=f"tab_cumulative_{asset}")
 
-        # 5. Send this asset's charts to Telegram
-        send_disabled = not telegram.is_configured()
-        if st.button(f"📤 Send {clean_name} charts to Telegram", key=f"tg_send_{asset}",
-                     disabled=send_disabled,
-                     help=None if not send_disabled else "Telegram isn't configured (see secrets.toml)."):
-            with st.spinner(f"Sending {clean_name} charts to Telegram..."):
-                sent, failed, reasons = _send_asset_charts_to_telegram(clean_name, asset_figs_dict[asset])
-            if sent:
-                st.success(f"Sent {sent} chart(s) to Telegram."
-                           + (f" ({failed} failed — see below.)" if failed else ""))
-            else:
-                st.error("Failed to send charts to Telegram.")
-            for r in reasons:
-                st.caption(r)
-
-# Handle the sidebar's "Send ALL" button now that every asset's figures have
+# Handle the toolbar's Telegram buttons now that every asset's figures have
 # been built (asset_figs_dict is fully populated by the tab loop above).
+def _figs_for(assets: list) -> list:
+    return [(a.replace('_USDC', ''), fig) for a in assets for fig in asset_figs_dict[a]]
+
+for _a in ASSETS:
+    if send_asset_clicked.get(_a):
+        _send_many_to_telegram(_figs_for([_a]), _a.replace('_USDC', ''))
+
+if send_btc_eth_clicked and _BTC_ETH:
+    _send_many_to_telegram(_figs_for(_BTC_ETH), "BTC+ETH")
+
 if send_all_clicked:
-    total_sent = total_failed = 0
-    all_reasons: list[str] = []
-    all_figs = [(asset.replace('_USDC', ''), fig)
-                for asset in ASSETS for fig in asset_figs_dict[asset]]
-    progress = st.progress(0.0)
-    with st.spinner("Sending all charts to Telegram..."):
-        for i, (clean_name, fig) in enumerate(all_figs, start=1):
-            ok, reason = _send_chart_to_telegram(fig, f"{clean_name} block trades")
-            if ok:
-                total_sent += 1
-            else:
-                total_failed += 1
-                if reason:
-                    all_reasons.append(reason)
-            progress.progress(i / len(all_figs))
-    progress.empty()
-    if total_sent:
-        st.success(f"Sent {total_sent} chart(s) to Telegram."
-                   + (f" ({total_failed} failed — see detail below.)" if total_failed else ""))
-    else:
-        st.error("Failed to send charts to Telegram.")
-    if all_reasons:
-        with st.expander(f"⚠️ {len(all_reasons)} chart(s) had trouble — click for detail."):
-            for r in all_reasons:
-                st.markdown(f"- {r}")
+    _send_many_to_telegram(_figs_for(ASSETS), "all assets")
 
 # ---------------------------------------------------------------------------
 # Render ALL (2x2 Grid) Tab
