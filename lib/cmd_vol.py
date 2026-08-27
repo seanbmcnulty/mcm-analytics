@@ -217,6 +217,77 @@ def cmd_skew_term_structure(asset: str, **kwargs):
 
 
 # ===========================================================================
+# 2b. Butterfly term structure
+# ===========================================================================
+
+def cmd_butterfly_term_structure(asset: str, **kwargs):
+    """10d butterfly (avg of 10Δ call/put IV minus ATM IV) across listed expiries."""
+    now = _now()
+    vols = surface.option_vols_by_dte(asset)
+    call = {float(k): float(v) for k, v in vols.get("call10", {}).items() if _finite(v)}
+    put = {float(k): float(v) for k, v in vols.get("put10", {}).items() if _finite(v)}
+    atm = {float(k): float(v) for k, v in vols.get("atm", {}).items() if _finite(v)}
+    if len(call) < 2 or len(put) < 2 or len(atm) < 2:
+        return None, None, "No butterfly data available."
+
+    dtes = surface.listed_expiries(asset) or sorted(int(d) for d in call)
+    x_cat = [(now.date() + timedelta(days=int(d))).strftime("%d-%b") for d in dtes]
+
+    fc, estimated, src = history.surface_history(asset, "deltaCall10", days=35)
+    fp, _, _ = history.surface_history(asset, "deltaPut10", days=35)
+    fa, _, _ = history.surface_history(asset, "delta50", days=35)
+
+    fig = go.Figure()
+    entries: list[tuple[str, str, dict[float, float], dict[float, float], dict[float, float]]] = [
+        ("Current", "Current", call, put, atm)]
+    if (fc is not None and fp is not None and fa is not None
+            and not fc.empty and not fp.empty and not fa.empty):
+        for label, style_key, ts, rc in _lookback_points(fc, now, [
+            ("24h Ago", timedelta(hours=24)),
+            ("1 Week Ago", timedelta(days=7)),
+            ("1 Month Ago", timedelta(days=30)),
+        ]):
+            # Pair the put and ATM frames to the SAME actual moment as the
+            # resolved call row, not a fresh (and possibly differently-aged)
+            # lookup.
+            rp, _ = history.surface_row_near(fp, ts)
+            ra, _ = history.surface_row_near(fa, ts)
+            if rp is not None and ra is not None:
+                entries.append((label, style_key, _row_to_map(rc),
+                                _row_to_map(rp), _row_to_map(ra)))
+
+    for label, style_key, cmap, pmap, amap in entries:
+        style = TERM_STRUCTURE_SERIES_STYLE.get(style_key, TERM_STRUCTURE_SERIES_STYLE["Current"])
+        y = []
+        for d in dtes:
+            c = surface.interp_at_dte(cmap, float(d))
+            p = surface.interp_at_dte(pmap, float(d))
+            a = surface.interp_at_dte(amap, float(d))
+            y.append(((_dec(c) + _dec(p)) / 2.0 - _dec(a)) * 100.0
+                     if (_finite(c) and _finite(p) and _finite(a)) else float("nan"))
+        is_current = label == "Current"
+        name = label if (is_current or not estimated) else f"{label} (est.)"
+        fig.add_trace(go.Scatter(
+            x=x_cat, y=y, name=name,
+            mode="lines+markers+text" if is_current else "lines+markers",
+            text=surface.tidy_labels(x_cat) if is_current else [""] * len(x_cat),
+            textposition="top center", textfont=dict(size=12),
+            line=dict(color=style["color"], width=style["width"],
+                      dash=style["dash"], shape="spline"),
+            marker=dict(symbol=style["marker_symbol"], size=8 if is_current else 7),
+        ))
+
+    fig.update_layout(
+        title=f"{asset} Butterfly Term Structure (10Δ Wings - ATM)",
+        xaxis_title="Expiry (Deribit)", yaxis_title="10 Delta Butterfly (pts)",
+        height=450, template=TEMPLATE, xaxis=dict(type="category"),
+        yaxis=dict(zeroline=True, zerolinewidth=1, zerolinecolor="rgba(0,0,0,0.3)"),
+    )
+    finalize(fig, legend_rows=1)
+    return fig, None, None
+
+
+# ===========================================================================
 # 3. Vol surface (smile) figure — shared by vol_run and vol_smile
 # ===========================================================================
 

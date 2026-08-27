@@ -403,6 +403,7 @@ with st.sidebar:
 | **Vol run** | Implied volatility by expiry (ATM σ, 3h/open change, RV, IV−RV, 25Δ wings, forward IV). Green/red = up/down. |
 | **Vol term structure** | ATM vol across expiries; current vs 24h / 1w / 1m ago. |
 | **Skew term structure** | 25Δ call minus put skew by expiry (call–put vol spread). |
+| **Butterfly term structure** | 10Δ butterfly by expiry: average of 10Δ call/put vol minus ATM vol. |
 | **Basis run** | Perp and dated futures basis vs index. Basis % (1Y APR) = annualized; green/red = contango/backwardation. |
 | **Forward vols** | Combined ATM, 25d call, 25d put vols and their forward vols by expiry date. |
 | **Forward vol steepness** | ATM-only $100k vega daily carry waterfall by adjacent tenor pair (excludes <=3DTE; weighted to 30D vega). |

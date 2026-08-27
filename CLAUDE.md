@@ -149,6 +149,13 @@ filesystems.
   `push_to_github.bat` (handles stale lockfiles, remote setup, rebase,
   push) themselves after you've committed files to their disk.
 - Don't create empty/redundant `.md` files or READMEs unless asked.
+- **Never run `git` commands (even read-only ones like `git status`/`git
+  diff`) via `device_bash` against this repo.** The mounted-folder bridge
+  blocks unlink/delete on `.git/` paths, so git's normal lockfile cleanup
+  fails and leaves a `.git/index.lock` behind that then blocks the user's
+  own `push_to_github.bat`. Inspect changes with `device_list_dir`/reading
+  files instead; if a git command must run and leaves a lock, don't retry
+  — tell the user to delete `.git/index.lock` by hand.
 
 ## Testing — do this before shipping any change
 
@@ -1046,3 +1053,22 @@ not a code bug — confirmed via `WebFetch` on the raw GitHub content).
 - **Set up this file** and a Cowork Project ("MCM Analytics") so future
   sessions don't start from zero — see the top of this file for what it
   covers.
+- **Added `/butterfly_term_structure`** (10Δ butterfly: average of 10Δ
+  call/put IV minus ATM IV, by listed expiry) to `lib/cmd_vol.py`,
+  registered in `lib/commands.py` right after `/skew_term_structure` so
+  the dashboard places it there automatically for every asset (dashboard
+  order is driven purely by `COMMANDS` list order — see `MCM_ORDER` in
+  `pages/01_MCM_Bot.py`). Modeled directly on `cmd_skew_term_structure`,
+  same lookback-snapshot pairing pattern, just 3-way (call10/put10/atm)
+  instead of 2-way. Verified via `tests/run_all.py` across all 4 assets.
+  While testing, rebuilt the offline `plotly`/`scipy` stubs from scratch
+  (not committed — they're /tmp and session-$HOME only) since neither is
+  installed in this sandbox or on the device bridge's shell; fixed two
+  stub gaps along the way (`go.Figure(single_trace)` without a list
+  wrapper, and `scipy.stats.norm.cdf/pdf` needing to accept numpy arrays,
+  not just scalars, for `cmd_market.cmd_block_trades_summary`) — worth
+  reusing bits of this if a future session rebuilds the stubs again.
+  **Also**: accidentally ran `git status`/`git diff` via `device_bash`
+  while sanity-checking the diff, which left a `.git/index.lock` behind
+  (see the new warning above) — flagged to the user to delete it by hand
+  before they run `push_to_github.bat`.
