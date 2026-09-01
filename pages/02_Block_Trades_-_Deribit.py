@@ -702,8 +702,8 @@ def plot_strike_vs_expiry(data, asset, size_multiplier=1.0):
     return fig
 
 def _square_heatmap_axes(pivot):
-    """xaxis/yaxis kwargs that make every cell in a strike x expiry heatmap
-    a uniform square, regardless of the actual numeric gaps between strikes
+    """xaxis/yaxis kwargs that give every cell in a strike x expiry heatmap
+    uniform spacing, regardless of the actual numeric gaps between strikes
     or calendar gaps between expiries.
 
     By default the strike axis is numeric/continuous, so Plotly spaces
@@ -713,16 +713,24 @@ def _square_heatmap_axes(pivot):
     by actual calendar distance (a weekly expiry next to a quarterly one
     would render with very different row heights). Forcing both to
     `type='category'` makes every column/row exactly one unit wide/tall
-    regardless of the real value gap, and `scaleanchor`+`scaleratio=1` then
-    forces those units to be equal in pixels too, so cells end up square
-    instead of just uniformly-spaced rectangles.
+    regardless of the real value gap.
+
+    This used to also pin `scaleanchor='x'`/`scaleratio=1` on the y-axis to
+    make cells literally square in pixels - but strikes routinely outnumber
+    expiries several-fold (e.g. ~50 strike columns vs ~11 expiry rows), and
+    forcing a 1:1 pixel ratio between them squeezed the expiry axis into a
+    small fraction of the chart height. That left a blank gap above the
+    squeezed rows and, worse, Plotly then auto-hid every other expiry label
+    to keep them from overlapping in the cramped space - so several expiries
+    looked missing even though they were in the data. Dropping the
+    scaleanchor lets each axis use its own full extent instead, at the cost
+    of cells no longer being pixel-perfect squares.
     """
     return (
         dict(title='Strike', type='category',
              categoryorder='array', categoryarray=list(pivot.columns)),
         dict(title='Expiry', type='category',
-             categoryorder='array', categoryarray=list(pivot.index.strftime('%Y-%m-%d')),
-             scaleanchor='x', scaleratio=1),
+             categoryorder='array', categoryarray=list(pivot.index.strftime('%Y-%m-%d'))),
     )
 
 def plot_net_heatmap(data, asset):
@@ -1077,7 +1085,15 @@ def plot_net_positioning_by_strike(data, asset, current_spot=0.0):
     fig.add_hline(y=0, line_color='rgba(0,0,0,0.3)')
     if current_spot and current_spot > 0 and cat:
         nearest = min(cat, key=lambda k: abs(k - current_spot))
-        fig.add_vline(x=nearest, line_dash='dot', line_color='rgba(0,0,0,0.6)',
+        # Plotly's add_vline mishandles a category axis whose categories are
+        # themselves numbers (plotly.py#3013): given a raw strike value like
+        # 71000, it's read as a literal x-position rather than a category
+        # lookup, which blows the axis range out to ~71000 while the bars
+        # actually sit at category *index* positions 0..len(cat)-1 -
+        # squashing every bar into an invisible sliver near the origin.
+        # Passing the category's index instead keeps the vline on the same
+        # index-based scale the bars are drawn on.
+        fig.add_vline(x=cat.index(nearest), line_dash='dot', line_color='rgba(0,0,0,0.6)',
                       annotation_text='spot', annotation_font=dict(color=TEXT_COLOR, size=10))
     fig.update_layout(
         title=f'{asset} Net Vega by Strike (session, buy +, sell -)', barmode='relative',
