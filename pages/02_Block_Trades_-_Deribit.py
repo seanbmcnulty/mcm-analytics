@@ -435,6 +435,16 @@ def compute_vectorized_greeks(df: pd.DataFrame, spot: float, asset: str) -> pd.D
     df['vega_usd'] = df['dollar_vega']
     df['dollar_gamma'] = df['dollar_gamma_1pct']
 
+    # Vega weighted to a standard 30-day tenor: vega scales roughly with
+    # sqrt(T), so raw vega alone makes a far-dated expiry look like the
+    # dominant risk just because it has more optionality, when a 1-point IV
+    # move that far out is a much bigger real-world event than the same
+    # 1-point move in the front week. Scaling by sqrt(30d / T) puts every
+    # expiry's vega on an equal "how much does a 30-day-equivalent vol move
+    # cost me here" footing, so it can be compared/aggregated fairly across
+    # tenors. 365.25 matches the day-count already used for `tte` above.
+    df['vega_usd_30d'] = df['vega_usd'] * np.sqrt((30 / 365.25) / df['tte'])
+
     # Premium paid and "aggression" (how far through mark a taker paid),
     # both signed in USD. BTC/ETH options are coin-margined - price and
     # mark_price are quoted in the underlying (e.g. 0.05 BTC) - so need
@@ -1106,6 +1116,91 @@ def plot_net_positioning_by_strike(data, asset, current_spot=0.0):
     fx_style.add_watermark(fig)
     return fx_style.apply_theme(fig)
 
+def plot_net_vega_by_expiry_weighted(data, asset):
+    """Same as plot_net_vega_by_expiry, but vega is weighted to a 30-day
+    tenor (vega * sqrt(30d / days-to-expiry), see vega_usd_30d in
+    compute_vectorized_greeks) so expiries can be compared on an equal
+    footing instead of raw vega making far-dated expiries look dominant
+    just because vega grows with sqrt(T)."""
+    if data.empty or 'vega_usd_30d' not in data.columns:
+        return _empty_flow_fig(f'{asset} Weighted Vega Flow by Expiry: No Data')
+
+    f = data.dropna(subset=['expiry'])
+    f = f[f['vega_usd_30d'].notna()]
+    if f.empty:
+        return _empty_flow_fig(f'{asset} Weighted Vega Flow by Expiry: No Data')
+
+    agg = f.groupby(['expiry', 'expiry_str', 'option_type'], as_index=False).agg(
+        vega=('vega_usd_30d', 'sum'), contracts=('abs_amount', 'sum'))
+    order = agg[['expiry', 'expiry_str']].drop_duplicates().sort_values('expiry')['expiry_str'].tolist()
+
+    fig = go.Figure()
+    for opt, color, name in [('C', 'blue', 'Calls'), ('P', 'purple', 'Puts')]:
+        sub = agg[agg['option_type'] == opt]
+        if sub.empty:
+            continue
+        fig.add_trace(go.Bar(
+            x=sub['expiry_str'], y=sub['vega'], name=name, marker_color=color,
+            customdata=sub['contracts'],
+            hovertemplate='%{x}<br>30d-weighted vega: $%{y:,.0f}<br>Contracts: %{customdata:,.0f}<extra>' + name + '</extra>'
+        ))
+    fig.add_hline(y=0, line_color='rgba(0,0,0,0.3)')
+    fig.update_layout(
+        title=f'{asset} Weighted Vega Flow by Expiry (30d-equiv, buy +, sell -)', barmode='relative',
+        xaxis=dict(title='Expiry', categoryorder='array', categoryarray=order),
+        yaxis=dict(title='30d-Weighted Vega (USD)', tickprefix='$', tickformat='~s'),
+        paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        height=400, margin=dict(l=40, r=40, t=40, b=40)
+    )
+    fx_style.add_watermark(fig)
+    return fx_style.apply_theme(fig)
+
+def plot_net_positioning_by_strike_weighted(data, asset, current_spot=0.0):
+    """Same as plot_net_positioning_by_strike, but vega is weighted to a
+    30-day tenor - see plot_net_vega_by_expiry_weighted's docstring."""
+    if data.empty or 'vega_usd_30d' not in data.columns:
+        return _empty_flow_fig(f'{asset} Weighted Vega by Strike: No Data')
+
+    f = data[data['strike'] > 0]
+    f = f[f['vega_usd_30d'].notna()]
+    if f.empty:
+        return _empty_flow_fig(f'{asset} Weighted Vega by Strike: No Data')
+
+    agg = f.groupby(['strike', 'option_type'], as_index=False).agg(
+        vega=('vega_usd_30d', 'sum'), net_contracts=('amount', 'sum'), gross=('abs_amount', 'sum'))
+    cat = sorted(agg['strike'].unique())
+
+    fig = go.Figure()
+    for opt, color, name in [('C', 'blue', 'Calls'), ('P', 'purple', 'Puts')]:
+        sub = agg[agg['option_type'] == opt]
+        if sub.empty:
+            continue
+        fig.add_trace(go.Bar(
+            x=sub['strike'], y=sub['vega'], name=name, marker_color=color,
+            customdata=np.stack([sub['net_contracts'], sub['gross']], axis=-1),
+            hovertemplate=('Strike %{x}<br>30d-weighted vega: $%{y:,.0f}<br>Net contracts: %{customdata[0]:,.1f}'
+                           '<br>Gross contracts: %{customdata[1]:,.1f}<extra>' + name + '</extra>')
+        ))
+    fig.add_hline(y=0, line_color='rgba(0,0,0,0.3)')
+    if current_spot and current_spot > 0 and cat:
+        nearest = min(cat, key=lambda k: abs(k - current_spot))
+        # Same numeric-category add_vline pitfall as
+        # plot_net_positioning_by_strike (plotly.py#3013) - pass the
+        # category index, not the raw strike value.
+        fig.add_vline(x=cat.index(nearest), line_dash='dot', line_color='rgba(0,0,0,0.6)',
+                      annotation_text='spot', annotation_font=dict(color=TEXT_COLOR, size=10))
+    fig.update_layout(
+        title=f'{asset} Weighted Vega by Strike (30d-equiv, session, buy +, sell -)', barmode='relative',
+        xaxis=dict(title='Strike', type='category', categoryorder='array', categoryarray=cat),
+        yaxis=dict(title='30d-Weighted Vega (USD)', tickprefix='$', tickformat='~s'),
+        paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        height=400, margin=dict(l=40, r=40, t=40, b=40)
+    )
+    fx_style.add_watermark(fig)
+    return fx_style.apply_theme(fig)
+
 def plot_cumulative_aggression(data, asset):
     """Cumulative premium paid through mark (>0 = takers paying up), total
     plus the 4 busiest expiries."""
@@ -1318,7 +1413,7 @@ for idx, asset in enumerate(ASSETS):
 # here, but the actual sending happens after the tab loop below, once
 # asset_figs_dict is fully populated with every asset's charts.
 # ---------------------------------------------------------------------------
-CHARTS_PER_ASSET = 12  # 5 original + 7 Flow Analytics - keep in sync with asset_figs_dict below
+CHARTS_PER_ASSET = 14  # 5 original + 9 Flow Analytics - keep in sync with asset_figs_dict below
 
 _tg_configured = telegram.is_configured()
 st.caption("Send charts to Telegram (as images):" if _tg_configured
@@ -1389,12 +1484,15 @@ for idx, asset in enumerate(ASSETS):
         fig_delta_term = plot_delta_term_structure(df_asset, clean_name)
         fig_vega_expiry = plot_net_vega_by_expiry(df_asset, clean_name)
         fig_vega_strike = plot_net_positioning_by_strike(df_asset, clean_name, spot_px)
+        fig_vega_expiry_weighted = plot_net_vega_by_expiry_weighted(df_asset, clean_name)
+        fig_vega_strike_weighted = plot_net_positioning_by_strike_weighted(df_asset, clean_name, spot_px)
         fig_aggression = plot_cumulative_aggression(df_asset, clean_name)
 
         asset_figs_dict[asset] = [
             fig_scatter, fig_strike_expiry, fig_net_heatmap, fig_gross_volume, fig_cumulative,
             fig_iv_surface, fig_term_flow, fig_pc_ratio, fig_delta_term,
-            fig_vega_expiry, fig_vega_strike, fig_aggression,
+            fig_vega_expiry, fig_vega_strike, fig_vega_expiry_weighted, fig_vega_strike_weighted,
+            fig_aggression,
         ]
 
         # 1. Scatter with Spot & DVOL
@@ -1435,6 +1533,12 @@ for idx, asset in enumerate(ASSETS):
             st.plotly_chart(fig_vega_expiry, width="stretch", key=f"tab_vega_expiry_{asset}")
         with col6:
             st.plotly_chart(fig_vega_strike, width="stretch", key=f"tab_vega_strike_{asset}")
+
+        col7, col8 = st.columns(2)
+        with col7:
+            st.plotly_chart(fig_vega_expiry_weighted, width="stretch", key=f"tab_vega_expiry_weighted_{asset}")
+        with col8:
+            st.plotly_chart(fig_vega_strike_weighted, width="stretch", key=f"tab_vega_strike_weighted_{asset}")
 
         st.plotly_chart(fig_aggression, width="stretch", key=f"tab_aggression_{asset}")
 
