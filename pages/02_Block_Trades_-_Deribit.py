@@ -163,6 +163,24 @@ with st.sidebar:
         st.caption(telegram.config_status())
 
 # ---------------------------------------------------------------------------
+# Auto pipeline (triggered from the Home page's "Refresh BTC/ETH & send to
+# Telegram" button, chained from pages/01_MCM_Bot.py step 1): clear caches
+# so this run re-fetches fresh block-trade data, then auto-send BTC+ETH to
+# Telegram once the tabs below are built (see the toolbar section further
+# down, and the send-dispatch block after the tab loop).
+# ---------------------------------------------------------------------------
+_auto_pipeline_active = (st.session_state.get("auto_pipeline") == "block_trades"
+                         and telegram.is_configured())
+if _auto_pipeline_active:
+    st.info("🔄📤 Auto pipeline — step 2/2: refreshing Block Trades data for "
+            "BTC/ETH and sending to Telegram…")
+    cache_lib.clear_all_caches()
+elif st.session_state.get("auto_pipeline") == "block_trades":
+    # Shouldn't happen — the Home page button is disabled when Telegram
+    # isn't configured — but clear the flag rather than getting stuck.
+    st.session_state["auto_pipeline"] = None
+
+# ---------------------------------------------------------------------------
 # API Fetching Helpers
 # ---------------------------------------------------------------------------
 def _get_json_with_retry(url, params=None, timeout=10, max_retries=2, pace=0.15):
@@ -1432,7 +1450,7 @@ with _tg_cols[len(ASSETS)]:
     send_btc_eth_clicked = st.button(
         "BTC+ETH", key="tg_send_btc_eth", width="stretch",
         disabled=not _tg_configured or not _BTC_ETH,
-        help=f"Send BTC and ETH's charts to Telegram ({CHARTS_PER_ASSET * 2} charts).")
+        help=f"Send BTC and ETH's charts to Telegram ({CHARTS_PER_ASSET * 2} charts).") or _auto_pipeline_active
 with _tg_cols[len(ASSETS) + 1]:
     send_all_clicked = st.button(
         "📤 All", key="tg_send_all", width="stretch",
@@ -1556,6 +1574,11 @@ if send_btc_eth_clicked and _BTC_ETH:
 
 if send_all_clicked:
     _send_many_to_telegram(_figs_for(ASSETS), "all assets")
+
+if _auto_pipeline_active:
+    st.session_state["auto_pipeline"] = None
+    st.success("✅ Auto pipeline complete — MCM Bot and Block Trades reports "
+               "for BTC/ETH have been sent to Telegram.")
 
 # ---------------------------------------------------------------------------
 # Render ALL (2x2 Grid) Tab

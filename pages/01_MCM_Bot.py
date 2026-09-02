@@ -433,6 +433,33 @@ st.caption("Crypto derivatives analytics · Deribit public API · "
            f"{fx_style.DISPLAY_TZ_LABEL} time")
 
 # ---------------------------------------------------------------------------
+# Auto pipeline (triggered from the Home page's "Refresh BTC/ETH & send to
+# Telegram" button): refresh BTC+ETH here and send to Telegram, then hand
+# off to the Block Trades page for its own BTC+ETH step. Single-shot: the
+# flag is advanced to "block_trades" (or cleared) before this block can
+# ever run twice.
+# ---------------------------------------------------------------------------
+if st.session_state.get("auto_pipeline") == "mcm_bot":
+    if telegram.is_configured():
+        _auto_assets = [a for a in ASSETS if a in ("BTC", "ETH")]
+        st.info(f"🔄📤 Auto pipeline — step 1/2: refreshing MCM Bot data for "
+                f"{', '.join(_auto_assets)} and sending to Telegram…")
+        with st.spinner(f"Refreshing MCM Bot commands for {', '.join(_auto_assets)}…"):
+            cache_lib.clear_all_caches()
+            _fresh = run_reports(_auto_assets, list(cmdreg.COMMAND_NAMES),
+                                 st.session_state.get("mcm_dte_days", 30))
+            st.session_state.mcm_all_results = {
+                **(st.session_state.mcm_all_results or {}), **_fresh}
+            st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
+        _send_to_telegram(_auto_assets, "BTC+ETH")
+        st.session_state["auto_pipeline"] = "block_trades"
+        st.switch_page("pages/02_Block_Trades_-_Deribit.py")
+    else:
+        # Shouldn't happen — the Home page button is disabled when Telegram
+        # isn't configured — but clear the flag rather than getting stuck.
+        st.session_state["auto_pipeline"] = None
+
+# ---------------------------------------------------------------------------
 # Toolbar — expiry + load/refresh/send, one compact row instead of three
 # stacked sections. Everything here used to take ~40 lines of subheaders and
 # always-visible captions before a single chart appeared; the explanatory
