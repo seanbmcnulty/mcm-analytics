@@ -172,7 +172,7 @@ with st.sidebar:
 _auto_pipeline_active = (st.session_state.get("auto_pipeline") == "block_trades"
                          and telegram.is_configured())
 if _auto_pipeline_active:
-    st.info("🔄📤 Auto pipeline — step 2/2: refreshing Block Trades data for "
+    st.info("🔄📤 Auto pipeline — step 2/3: refreshing Block Trades data for "
             "BTC/ETH and sending to Telegram…")
     cache_lib.clear_all_caches()
 elif st.session_state.get("auto_pipeline") == "block_trades":
@@ -1576,9 +1576,8 @@ if send_all_clicked:
     _send_many_to_telegram(_figs_for(ASSETS), "all assets")
 
 if _auto_pipeline_active:
-    st.session_state["auto_pipeline"] = None
-    st.success("✅ Auto pipeline complete — MCM Bot and Block Trades reports "
-               "for BTC/ETH have been sent to Telegram.")
+    st.session_state["auto_pipeline"] = "tbrv_btc"
+    st.switch_page("pages/06_Time_Based_Realized_Vol.py")
 
 # ---------------------------------------------------------------------------
 # Render ALL (2x2 Grid) Tab

@@ -442,7 +442,7 @@ st.caption("Crypto derivatives analytics · Deribit public API · "
 if st.session_state.get("auto_pipeline") == "mcm_bot":
     if telegram.is_configured():
         _auto_assets = [a for a in ASSETS if a in ("BTC", "ETH")]
-        st.info(f"🔄📤 Auto pipeline — step 1/2: refreshing MCM Bot data for "
+        st.info(f"🔄📤 Auto pipeline — step 1/3: refreshing MCM Bot data for "
                 f"{', '.join(_auto_assets)} and sending to Telegram…")
         with st.spinner(f"Refreshing MCM Bot commands for {', '.join(_auto_assets)}…"):
             cache_lib.clear_all_caches()

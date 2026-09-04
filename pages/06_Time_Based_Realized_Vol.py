@@ -1466,6 +1466,35 @@ with st.expander("Estimator glossary (assumptions and caveats)", expanded=False)
     st.dataframe(estimator_glossary, width="stretch", hide_index=True)
 
 # ---------------------------------------------------------------------------
+# Auto pipeline (triggered from the Home page's "Refresh BTC/ETH & send to
+# Telegram" button, chained from pages/02_Block_Trades_-_Deribit.py step 2):
+# this page only ever shows one asset at a time (sidebar selectbox), so the
+# BTC and ETH legs run as two separate passes over this same page rather
+# than in one run — see the pipeline-continuation block near the bottom,
+# which reruns for "tbrv_eth" after "tbrv_btc" finishes, then clears the
+# flag. `_auto_tbrv_asset`, when set, overrides the asset the rest of this
+# script uses regardless of what the sidebar widget shows.
+# ---------------------------------------------------------------------------
+_auto_pipeline_step = st.session_state.get("auto_pipeline")
+_auto_tbrv_asset = None
+if _auto_pipeline_step in ("tbrv_btc", "tbrv_eth"):
+    if is_configured():
+        _auto_tbrv_asset = "BTC" if _auto_pipeline_step == "tbrv_btc" else "ETH"
+        st.info(f"🔄📤 Auto pipeline — step 3/3: refreshing Time Based Realized "
+                f"Vol data for {_auto_tbrv_asset} and sending to Telegram…")
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        clear_cache()
+        st.session_state.pop(_SNAP_KEY, None)
+        st.session_state.pop(_UI_CACHE_KEY, None)
+    else:
+        # Shouldn't happen — the Home page button is disabled when Telegram
+        # isn't configured — but clear the flag rather than getting stuck.
+        st.session_state["auto_pipeline"] = None
+
+# ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 
@@ -1475,6 +1504,9 @@ with st.sidebar:
     asset_idx = TBRV_ASSETS.index(prev_asset) if prev_asset in TBRV_ASSETS else 0
     asset = st.selectbox("Asset", TBRV_ASSETS, index=asset_idx)
     st.session_state["_tbrv_asset_pref"] = asset
+    if _auto_tbrv_asset:
+        asset = _auto_tbrv_asset
+        st.session_state["_tbrv_asset_pref"] = asset
     st.caption("Overall summaries include all lookbacks.")
 
     compare_intervals = st.multiselect(
@@ -1511,6 +1543,8 @@ with st.sidebar:
     )
     st.markdown("---")
     refresh = st.button("Refresh data", width="stretch")
+    if _auto_tbrv_asset:
+        refresh = True
 
 if not compare_intervals:
     st.warning("Select at least one hedging frequency.")
@@ -1525,6 +1559,8 @@ with col_b:
     send_tg = st.button(
         "📤 Send to Telegram", width="stretch", type="primary", disabled=not is_configured(),
     )
+if _auto_tbrv_asset:
+    send_tg = True
 if not is_configured():
     st.caption("Telegram not configured — set credentials in secrets.toml or environment to enable sending.")
 
@@ -1830,6 +1866,16 @@ if send_tg:
         st.success("Report sent to Telegram")
     else:
         st.error("One or more lookback reports failed to send")
+
+if _auto_tbrv_asset:
+    if _auto_pipeline_step == "tbrv_btc":
+        st.session_state["auto_pipeline"] = "tbrv_eth"
+        st.rerun()
+    else:
+        st.session_state["auto_pipeline"] = None
+        st.success("✅ Auto pipeline complete — MCM Bot, Block Trades, and "
+                   "Time Based Realized Vol reports for BTC/ETH have all "
+                   "been sent to Telegram.")
 
 # ---------------------------------------------------------------------------
 # Footer

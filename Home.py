@@ -120,13 +120,14 @@ st.session_state.setdefault("auto_pipeline", None)
 _tg_ready = is_configured()
 _pipeline_running = st.session_state.get("auto_pipeline") is not None
 if st.button(
-    "🔄📤 Refresh BTC/ETH & send to Telegram (MCM Bot, then Block Trades)",
+    "🔄📤 Refresh BTC/ETH & send to Telegram (MCM Bot → Block Trades → Time Based RV)",
     width="stretch",
     type="primary",
     disabled=not _tg_ready or _pipeline_running,
     help="Clears cached data and re-runs every MCM Bot command for BTC and "
          "ETH, sends those reports to Telegram, then does the same for the "
-         "Block Trades — Deribit page's BTC and ETH charts. Takes a few "
+         "Block Trades — Deribit page's BTC and ETH charts, then the Time "
+         "Based Realized Vol page's BTC and ETH reports. Takes several "
          "minutes — you'll land on each page as its step runs.",
 ):
     st.session_state["auto_pipeline"] = "mcm_bot"
