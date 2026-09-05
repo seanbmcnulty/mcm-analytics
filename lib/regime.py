@@ -449,6 +449,94 @@ def calculate_days_in_regime_series(df: pd.DataFrame, regime_col: str = "regime"
     return out
 
 
+def get_historical_regime_spell_lengths(df: pd.DataFrame, regime_col: str = "regime") -> dict[str, list[int]]:
+    """Completed historical spell lengths (in days), grouped by regime label.
+
+    A "spell" is a maximal run of consecutive days in the same regime. The
+    spell still in progress at the end of the series is deliberately
+    excluded -- its final length is unknown (censored), and including it as
+    if it were a completed spell would understate how long spells of that
+    type can actually run."""
+    if df is None or len(df) == 0 or regime_col not in df.columns:
+        return {}
+    regimes = df[regime_col].tolist()
+    if not regimes:
+        return {}
+    spells: dict[str, list[int]] = {}
+    run_regime, run_len = regimes[0], 1
+    for r in regimes[1:]:
+        if r == run_regime:
+            run_len += 1
+        else:
+            spells.setdefault(run_regime, []).append(run_len)
+            run_regime, run_len = r, 1
+    # run_regime/run_len is the in-progress spell at the end -- not appended.
+    return spells
+
+
+MIN_SPELLS_FOR_DURATION_FORECAST = 3
+
+
+def forecast_regime_duration(df: pd.DataFrame, current_regime: str, days_in_regime: int,
+                              regime_col: str = "regime") -> dict:
+    """Empirical forecast for how much longer the *current* regime spell is
+    likely to run, from this asset's own completed historical spells of the
+    same regime label.
+
+    Survivor-conditioned: only past spells that reached at least
+    ``days_in_regime`` are used to estimate what happens next -- a spell
+    that historically ended on day 10 says nothing about a spell that has
+    already run 40 days. This is the same idea as a Kaplan-Meier-style
+    conditional residual life, done directly on the small empirical sample
+    rather than fitting a parametric survival curve (there usually isn't
+    enough history per asset/regime to justify one).
+
+    Returns a dict; ``n_spells`` is always present. Below
+    ``MIN_SPELLS_FOR_DURATION_FORECAST`` completed spells of this regime
+    type, only ``{"n_spells": n}`` is returned -- too little history to say
+    anything. Otherwise also includes: ``n_survivors`` (historical spells
+    that lasted at least as long as the current one), ``median_total_duration``
+    (unconditional, for context), ``median_remaining``/``mean_remaining``/
+    ``p25_remaining``/``p75_remaining`` (days), and ``prob_ends_within_7d``.
+    When every historical spell of this type ended before reaching the
+    current length (``n_survivors == 0``), the current spell is already
+    unusually long for this asset/regime -- remaining-duration stats are
+    reported as 0 and ``prob_ends_within_7d`` as 1.0 to signal "expect this
+    to end imminently," rather than extrapolating past the observed range."""
+    spells = get_historical_regime_spell_lengths(df, regime_col=regime_col)
+    lengths = spells.get(current_regime, [])
+    n_spells = len(lengths)
+    if n_spells < MIN_SPELLS_FOR_DURATION_FORECAST:
+        return {"n_spells": n_spells}
+
+    lengths_arr = np.array(lengths, dtype=float)
+    days_in_regime = max(0, int(days_in_regime))
+    survivors = lengths_arr[lengths_arr >= days_in_regime]
+    n_survivors = int(len(survivors))
+    if n_survivors == 0:
+        median_remaining = mean_remaining = p25_remaining = p75_remaining = 0.0
+        prob_ends_within_7d = 1.0
+    else:
+        remaining = survivors - days_in_regime
+        median_remaining = float(np.median(remaining))
+        mean_remaining = float(np.mean(remaining))
+        p25_remaining = float(np.percentile(remaining, 25))
+        p75_remaining = float(np.percentile(remaining, 75))
+        prob_ends_within_7d = float(np.mean(remaining <= 7))
+
+    return {
+        "n_spells": n_spells,
+        "n_survivors": n_survivors,
+        "median_total_duration": float(np.median(lengths_arr)),
+        "median_remaining": median_remaining,
+        "mean_remaining": mean_remaining,
+        "p25_remaining": p25_remaining,
+        "p75_remaining": p75_remaining,
+        "prob_ends_within_7d": prob_ends_within_7d,
+        "current_days": days_in_regime,
+    }
+
+
 # ============================================================================
 # SHOCK & SQUEEZE DETECTION
 # ============================================================================
@@ -1321,6 +1409,7 @@ def compute_snapshot(asset: str, df: pd.DataFrame, rv_window_days: int = 30) -> 
     )
 
     backtest_breakout, backtest_rtl = _backtest_raw_scores_and_outcomes(df, asset, learned_weights=learned_weights)
+    duration_forecast = forecast_regime_duration(df, current_regime, days_in_regime)
 
     rv_pct = np.nan
     if len(df) >= 60:
@@ -1347,4 +1436,5 @@ def compute_snapshot(asset: str, df: pd.DataFrame, rv_window_days: int = 30) -> 
         "backtest_breakout": backtest_breakout,
         "backtest_rtl": backtest_rtl,
         "rv_percentile": rv_pct,
+        "duration_forecast": duration_forecast,
     }

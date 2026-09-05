@@ -62,6 +62,24 @@ def _show(fig: go.Figure | None, key: str) -> None:
     st.plotly_chart(fx_style.apply_theme(fig), width="stretch", key=key)
 
 
+def _format_duration_forecast(fc: dict | None) -> str:
+    """One-line text rendering of regime.forecast_regime_duration()'s output,
+    shared by the on-page caption and the Telegram summary so the wording
+    stays consistent between the two."""
+    if not fc:
+        return ""
+    if fc.get("n_spells", 0) < regime.MIN_SPELLS_FOR_DURATION_FORECAST:
+        return f"⏳ Regime duration forecast: not enough completed {fc.get('n_spells', 0)}-spell history yet for this regime type."
+    if fc.get("n_survivors", 0) == 0:
+        return (f"⏳ Regime duration forecast: already longer than every one of the {fc['n_spells']} historical "
+                f"spells of this type — treat as overdue to shift (median historical duration was "
+                f"{fc['median_total_duration']:.0f}d).")
+    return (f"⏳ Regime duration forecast: median {fc['median_remaining']:.0f} more day(s) "
+            f"(range {fc['p25_remaining']:.0f}-{fc['p75_remaining']:.0f}d), "
+            f"{fc['prob_ends_within_7d'] * 100:.0f}% chance it ends within 7 days "
+            f"— based on {fc['n_survivors']} of {fc['n_spells']} historical spells that ran at least this long.")
+
+
 # ============================================================================
 # CHART BUILDERS
 # ============================================================================
@@ -435,7 +453,8 @@ def create_forward_outcome_chart(asset: str, breakout_recs, rtl_recs) -> go.Figu
     return fig
 
 
-def create_regime_duration_distribution_chart(df: pd.DataFrame, asset: str = "BTC") -> go.Figure | None:
+def create_regime_duration_distribution_chart(df: pd.DataFrame, asset: str = "BTC",
+                                               current_regime: str | None = None, days_in_regime: int | None = None) -> go.Figure | None:
     d = df if "regime" in df.columns else regime.add_regime_classification(df, asset=asset)
     periods, start, prev_reg = [], None, None
     for date, row in d.iterrows():
@@ -454,6 +473,9 @@ def create_regime_duration_distribution_chart(df: pd.DataFrame, asset: str = "BT
         vals = pdf[pdf["regime"] == r]["duration"]
         if len(vals) > 0:
             fig.add_trace(go.Histogram(x=vals, name=r, marker_color=REGIME_COLORS.get(r), opacity=0.7, nbinsx=min(25, max(5, len(vals)))))
+    if current_regime is not None and days_in_regime is not None:
+        fig.add_vline(x=days_in_regime, line_dash="dash", line_color=REGIME_COLORS.get(current_regime, "white"), line_width=2,
+                      annotation_text=f"Now: {days_in_regime}d", annotation_position="top")
     fig.update_layout(**PLOTLY_LAYOUT, title=f"Regime Duration Distribution ({asset})", xaxis_title="Duration (days)", yaxis_title="Count", barmode="overlay", height=350)
     return fig
 
@@ -631,12 +653,15 @@ def send_asset_report_to_telegram(asset: str, snap: dict, rv_window_days: int) -
     df = snap["df"]
     rv_col = snap["rv_col"]
     current_regime = snap["current_regime"]
+    days_in_regime = snap["days_in_regime"]
     prob_label = "Return to Low prob" if current_regime in ("Moderate", "High") else "Breakout prob"
+    duration_line = _format_duration_forecast(snap.get("duration_forecast"))
     send_message(
         f"📊 <b>Regime Identifier – {asset}</b>\n\n"
-        f"Regime: <b>{current_regime}</b> ({snap['days_in_regime']} days)\n"
+        f"Regime: <b>{current_regime}</b> ({days_in_regime} days)\n"
         f"{rv_window_days}d RV: {snap['current_rv']:.2f}%\n"
         f"{prob_label}: {snap['breakout_prob']:.0f}%"
+        + (f"\n{duration_line}" if duration_line else "")
     )
     shock_fig, _ = create_shock_analysis(df, asset=asset)
     squeeze_fig, _ = create_volume_squeeze_chart(df, asset=asset)
@@ -661,7 +686,7 @@ def send_asset_report_to_telegram(asset: str, snap: dict, rv_window_days: int) -
         (create_microstructure_indicators_chart(df), f"{asset} - Microstructure Indicators"),
         (create_calibration_summary_chart(asset, snap["backtest_breakout"], snap["backtest_rtl"]), f"{asset} - Calibration Summary"),
         (create_forward_outcome_chart(asset, snap["backtest_breakout"], snap["backtest_rtl"]), f"{asset} - Forward Outcome"),
-        (create_regime_duration_distribution_chart(df, asset), f"{asset} - Regime Duration Distribution"),
+        (create_regime_duration_distribution_chart(df, asset, current_regime, days_in_regime), f"{asset} - Regime Duration Distribution"),
         (create_volatility_percentile_time_series(df, rv_col, rv_window_days), f"{asset} - Volatility Percentile"),
         (create_rolling_correlation_chart(df, 30, rv_col, rv_window_days), f"{asset} - Rolling Correlation"),
         (create_drawdowns_by_regime_chart(df, asset), f"{asset} - Drawdowns by Regime"),
@@ -725,6 +750,15 @@ def render_sidebar_playbook(asset: str, snap: dict) -> None:
     st.sidebar.metric("7-Day RV", f"{df['rv_7d'].iloc[-1]:.2f}%")
     st.sidebar.metric("30-Day RV", f"{df['rv_30d'].iloc[-1]:.2f}%")
     st.sidebar.metric("90-Day RV", f"{df['rv_90d'].iloc[-1]:.2f}%")
+
+    fc = snap.get("duration_forecast") or {}
+    if fc.get("n_spells", 0) >= regime.MIN_SPELLS_FOR_DURATION_FORECAST:
+        st.sidebar.metric(
+            f"Est. {snap['current_regime']} regime remaining",
+            f"{fc.get('median_remaining', 0):.0f}d" if fc.get("n_survivors", 0) > 0 else "overdue to shift",
+            help=f"Median remaining duration from {fc.get('n_survivors', 0)} of {fc.get('n_spells', 0)} "
+                 f"historical {snap['current_regime']}-vol spells that lasted at least {snap['days_in_regime']}d.",
+        )
 
     shock_info = snap["shock_info"]
     if shock_info[0]:
@@ -832,6 +866,11 @@ def render_asset_dashboard(asset: str, days_back: int, rv_window_days: int, quic
         most_likely = max(fwd_probs, key=fwd_probs.get)
         st.caption(f"🔮 **3d regime:** {probs_str}. Most likely: **{most_likely}**.")
 
+    duration_forecast = snap["duration_forecast"]
+    duration_line = _format_duration_forecast(duration_forecast)
+    if duration_line:
+        st.caption(duration_line)
+
     st.markdown("### Options positioning")
     for label, msg in regime.get_options_positioning(current_regime, days_in_regime, breakout_prob, shock_info, term_structure_slope, asset=asset):
         st.caption(f"**{label}:** {msg}")
@@ -840,6 +879,8 @@ def render_asset_dashboard(asset: str, days_back: int, rv_window_days: int, quic
     if not np.isnan(rv_pct):
         bullets.append(f"Current RV at **{rv_pct:.0f}th percentile** of last year.")
     bullets.append(f"{prob_label}: **{breakout_prob:.0f}%**.")
+    if duration_line:
+        bullets.append(duration_line.replace("⏳ ", ""))
     if shock_info[0]:
         bullets.append(f"Last shock **{(df.index[-1] - shock_info[0]).days}** days ago ({shock_info[1]:.1f}% move).")
     with st.expander("📌 State of the market (summary)", expanded=True):
@@ -934,7 +975,7 @@ def render_asset_dashboard(asset: str, days_back: int, rv_window_days: int, quic
     with st.expander("📊 Regime & Volatility Analytics (duration, percentile, correlation, drawdowns, seasonality, expected move, skew, autocorr)", expanded=True):
         r1c1, r1c2 = st.columns(2)
         with r1c1:
-            _show(create_regime_duration_distribution_chart(df, asset), f"{asset}_regime_duration")
+            _show(create_regime_duration_distribution_chart(df, asset, current_regime, days_in_regime), f"{asset}_regime_duration")
         with r1c2:
             _show(create_volatility_percentile_time_series(df, rv_col, rv_window_days), f"{asset}_vol_percentile")
         r2c1, r2c2 = st.columns(2)

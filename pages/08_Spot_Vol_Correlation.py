@@ -115,20 +115,22 @@ def _spot_series(asset: str, days: int) -> pd.Series:
     df = history.perp_ohlc(asset, days=days, resolution="60")
     if df is None or df.empty:
         return pd.Series(dtype=float)
-    return df["close"].dropna()
+    return _normalize_dt_index(df["close"].dropna())
 
 
 @st.cache_data(ttl=300, max_entries=16, show_spinner=False)
 def _cvol_series(asset: str, days: int):
     """30d ATM IV (%), (estimated, source)."""
     s, est, src = history.iv_series_at_dte(asset, 30, "delta50", days=days)
-    return (s if s is not None else pd.Series(dtype=float)), est, src
+    s = _normalize_dt_index(s) if s is not None else pd.Series(dtype=float)
+    return s, est, src
 
 
 @st.cache_data(ttl=300, max_entries=16, show_spinner=False)
 def _leg_series(asset: str, days: int, delta_key: str):
     s, est, src = history.iv_series_at_dte(asset, 30, delta_key, days=days)
-    return (s if s is not None else pd.Series(dtype=float)), est, src
+    s = _normalize_dt_index(s) if s is not None else pd.Series(dtype=float)
+    return s, est, src
 
 
 def _svol_series(asset: str, days: int):
@@ -168,6 +170,28 @@ def _bf_series(asset: str, days: int):
     return bf, (est_c or est_p or est_a), src_a
 
 
+def _normalize_dt_index(s: pd.Series) -> pd.Series:
+    """Coerce a tz-aware DatetimeIndex to a fixed (microsecond) resolution.
+
+    pandas 2.x/3.x's ``merge_asof``/``Index.union`` require the two sides'
+    datetime64 dtype to match *exactly*, not just compare equal — and this
+    app's various timestamp constructions don't all land on the same
+    resolution: Deribit epoch-ms timestamps (``lib/history.py:perp_ohlc``,
+    ``dvol_history``) parse to ``datetime64[ms, UTC]``, while recorded
+    snapshot timestamps parsed from ISO8601 strings with microsecond
+    precision (``lib/history.py:_parse_snapshot_csv``) parse to
+    ``datetime64[us, UTC]``. Mixing the two raises "incompatible merge keys
+    ... must be the same type" — reproduced live on this page (CVOL, being
+    snapshot-backed, is often `us`; spot, being Deribit-OHLC-backed, is
+    always `ms`). Normalizing both sides here, right before every merge,
+    fixes it regardless of which side drifts in the future."""
+    if s.empty or not isinstance(s.index, pd.DatetimeIndex) or s.index.tz is None:
+        return s
+    s = s.copy()
+    s.index = s.index.as_unit("us")
+    return s
+
+
 def _align_to_spot(vol_series: pd.Series, spot: pd.Series) -> pd.DataFrame:
     """Nearest-timestamp join of a (possibly sparser) vol series onto the spot
     index, tolerant of the two feeds' different native resolutions (spot is
@@ -176,8 +200,8 @@ def _align_to_spot(vol_series: pd.Series, spot: pd.Series) -> pd.DataFrame:
     scatter colorscale."""
     if vol_series.empty or spot.empty:
         return pd.DataFrame(columns=["spot", "vol", "days_ago"])
-    v = vol_series.sort_index()
-    s = spot.sort_index()
+    v = _normalize_dt_index(vol_series.sort_index())
+    s = _normalize_dt_index(spot.sort_index())
     merged = pd.merge_asof(
         pd.DataFrame({"vol": v}), pd.DataFrame({"spot": s}),
         left_index=True, right_index=True, direction="nearest", tolerance=pd.Timedelta("12h"),
@@ -283,7 +307,9 @@ def _candlestick_dvol(asset: str, start_ms: int, end_ms: int, resolution: str, s
     fig.add_trace(go.Candlestick(x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="DVOL",
                                   increasing_line_color="#4CAF50", decreasing_line_color="#F44336"), secondary_y=False)
     if skew_series is not None and not skew_series.empty:
-        aligned = skew_series.reindex(df.index, method="nearest", tolerance=pd.Timedelta("6h")).dropna()
+        skew_series = _normalize_dt_index(skew_series)
+        target_index = df.index.as_unit("us") if isinstance(df.index, pd.DatetimeIndex) else df.index
+        aligned = skew_series.reindex(target_index, method="nearest", tolerance=pd.Timedelta("6h")).dropna()
         if not aligned.empty:
             fig.add_trace(go.Scatter(x=aligned.index, y=aligned.values, mode="lines", name="25Δ Skew", line=dict(color="#9c27b0", width=1.5, dash="dot")), secondary_y=True)
     fig.update_yaxes(title_text="DVOL", secondary_y=False)
@@ -296,7 +322,7 @@ def _chart_rolling_correlation(spot: pd.Series, cvol: pd.Series, asset: str, win
     """Rolling correlation of spot vs. CVOL (30d ATM IV) — named for the metric
     actually used (history.iv_series_at_dte), to avoid confusion with the real
     DVOL index used only in the candlestick panel (see module docstring)."""
-    merged = pd.merge_asof(pd.DataFrame({"spot": spot.sort_index()}), pd.DataFrame({"cvol": cvol.sort_index()}),
+    merged = pd.merge_asof(pd.DataFrame({"spot": _normalize_dt_index(spot.sort_index())}), pd.DataFrame({"cvol": _normalize_dt_index(cvol.sort_index())}),
                             left_index=True, right_index=True, direction="nearest", tolerance=pd.Timedelta("12h")).dropna()
     if len(merged) < window:
         return _insufficient_data_fig(f"Spot-CVOL Rolling Correlation — {asset}", f"Need a full {window}-point window; have {len(merged)}.")
@@ -313,7 +339,7 @@ def _chart_rolling_correlation(spot: pd.Series, cvol: pd.Series, asset: str, win
 
 
 def _chart_rolling_covariance(spot: pd.Series, cvol: pd.Series, asset: str, window: int = ROLLING_WINDOW) -> go.Figure:
-    merged = pd.merge_asof(pd.DataFrame({"spot": spot.sort_index()}), pd.DataFrame({"cvol": cvol.sort_index()}),
+    merged = pd.merge_asof(pd.DataFrame({"spot": _normalize_dt_index(spot.sort_index())}), pd.DataFrame({"cvol": _normalize_dt_index(cvol.sort_index())}),
                             left_index=True, right_index=True, direction="nearest", tolerance=pd.Timedelta("12h")).dropna()
     if len(merged) < window:
         return _insufficient_data_fig(f"Spot-CVOL Rolling Covariance — {asset}", f"Need a full {window}-point window; have {len(merged)}.")

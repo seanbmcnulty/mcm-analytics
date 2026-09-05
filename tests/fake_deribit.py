@@ -84,7 +84,7 @@ def get_expirations(currency, kind="option"):
 
 
 def get_tradingview_ohlc(instrument_name, resolution, start_ms, end_ms):
-    step_ms = {"1D": 86400000, "60": 3600000, "15": 900000}.get(str(resolution), 86400000)
+    step_ms = {"1D": 86400000, "60": 3600000, "15": 900000, "1": 60000}.get(str(resolution), 86400000)
     n = max(3, min(2000, int((end_ms - start_ms) / step_ms)))
     ts = [start_ms + i * step_ms for i in range(n)]
     base = PERP.get(instrument_name)
