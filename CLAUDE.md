@@ -212,7 +212,12 @@ pages/02_Block_Trades.py        block trade flow — NOTE: calls Deribit directl
 pages/06_Time_Based_Realized_Vol.py  RV across hedging frequencies x lookbacks (BTC/ETH perps),
                                  7 estimators + decision matrix; renamed 2026-08-22 from
                                  06_Realized_Vol.py, ported from exodus-analytics
-pages/07,08,10_*.py             secondary analytics pages (regime, correlation, macro)
+pages/07_Regime_Identifier.py   vol-regime classification + calibrated breakout/return-to-low
+                                 probability model, BTC/ETH only; full port from exodus-analytics
+                                 (2026-09-04, see Session log) — see lib/regime.py for the model
+pages/08_Spot_Vol_Correlation.py  spot vs. CVOL/skew/RR/BF + vol-prediction ensemble, BTC/ETH
+                                 only (DVOL-dependent); full port from exodus-analytics (2026-09-04)
+pages/10_*.py                   secondary analytics page (macro)
 pages/11_Fear_Greed_Signal.py   contrarian delta-lean backtest vs alternative.me F&G Index
                                  (the one non-Deribit data source in this app — see above)
 pages/03,04,05,09,12,13,14      retired — moved to _to_delete/ on the device, not in git
@@ -233,6 +238,9 @@ lib/vol_math.py                 Black-Scholes, implied vol, delta math
 lib/fng.py                      alternative.me Crypto Fear & Greed Index client (pure
                                  functions, no streamlit import — same shape as deribit.py)
 lib/instruments.py, telegram.py instrument parsing; Telegram send integration
+lib/regime.py                   vol-regime data/math/model library for pages/07 — GARCH,
+                                 breakout/return-to-low probability, in-session calibration
+                                 (see 2026-09-04 Session log entry)
 
 scripts/record_snapshot.py      standalone CLI recorder, run by the GH Action
 .github/workflows/record_snapshots.yml   hourly snapshot recorder (see above)
@@ -284,6 +292,121 @@ Keep this updated: when a session makes a non-trivial change, decision, or
 finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
+
+### 2026-09-04 — Regime Identifier + Spot Vol Correlation: full rebuild from exodus-analytics (were simplified stubs)
+
+User asked for `pages/07_Regime_Identifier.py` and `pages/08_Spot_Vol_Correlation.py`
+to be "set up properly," replicating how `pages/06_Time_Based_Realized_Vol.py`
+was ported from exodus-analytics (see the 2026-08-22 entry below) — both pages
+were previously simplified, non-faithful stubs, not real ports. Confirmed three
+scope decisions with the user before building: (1) full replication of
+everything exodus renders, not a cut-down version; (2) both pages scoped to
+**BTC/ETH only** (matches Spot Vol Correlation's DVOL dependency, applied
+consistently to Regime Identifier too — SOL/HYPE dropped from both); (3)
+calibration/backtest fitting recomputed **in-session** via `st.cache_data`
+(TTL_DAILY_EXTERNAL), not persisted to a JSON file, since Streamlit Community
+Cloud's filesystem is ephemeral (same constraint documented above under
+"Deployment model").
+
+Read exodus's `Regime_Identifier.py` (4510 lines) and `Spot_Vol_Correlation.py`
+(2841 lines) in full before writing anything — same "verify, don't assume"
+approach as the page-06 port. Confirmed via direct inspection of exodus's
+`_render_asset_tab`/report-send functions that 4 of its 5 vol-prediction chart
+functions (`_chart_vol_prediction_winsorized`, `_lagged_vol`, `_ensemble`,
+`_oos`) are never actually called from its own UI — dropped as dead code,
+keeping only `_chart_vol_prediction_vs_rr` (linear/quadratic/cubic/exponential,
+time-weighted, 4 lookback windows).
+
+**New file `lib/regime.py`** (1350 lines) — the data/math/model library for
+Regime Identifier: asset-specific RV-threshold regime classification (BTC
+40/60, ETH 50/75), GARCH(1,1) conditional vol + persistence (`arch` package,
+degrades gracefully via `ARCH_AVAILABLE` if not installed), the 16-factor
+Low-vol "breakout probability" / 7-factor Moderate-High "return-to-low
+probability" composite models, in-session logistic-regression calibration
+fitted by backtesting historical regime transitions, Markov transition-matrix
+3-day-forward regime probabilities blended 50/50 with the calibrated score,
+volatility-shock detection with exponential half-life decay, volume-squeeze
+detection, and `compute_snapshot()`/`get_processed_df()` as new centralizing
+entry points (not present in exodus, added to keep the page thin). The
+calibration-persistence replacement is the key architectural deviation from
+exodus — documented in the module's `_fit_calibration_cached` docstring:
+`_df` (leading underscore) is excluded from Streamlit's cache-key hash, and an
+explicit `as_of` timestamp string is the real cache-busting key, refit at most
+once per hour rather than on every rerun.
+
+**Rewrote `pages/07_Regime_Identifier.py`** (1131 lines) — full port of every
+exodus chart (~25 `create_*` functions: regime gauges, price/regime timeline,
+GARCH indicators, term structure, compression/early-warning/microstructure
+indicators, calibration reliability + forward-outcome charts, regime
+duration/seasonality/drawdowns-by-regime, etc.), the strategic playbook +
+options-positioning sidebar, and full Telegram reporting — restyled to this
+app's dark `PLOTLY_LAYOUT` theme (exodus used `plotly_white`).
+
+**Rewrote `pages/08_Spot_Vol_Correlation.py`** (769 lines) — exodus fetched a
+30d constant-maturity vol surface from Amberdata; replaced entirely with this
+app's existing Deribit-only reconstruction (`lib/history.py`/`lib/surface.py`):
+CVOL (30d ATM IV) = `history.iv_series_at_dte(asset, 30, "delta50")`, 25Δ skew
+= 25Δcall−25Δput, 10Δ risk reversal = 10Δcall−10Δput, 10Δ butterfly =
+(10Δcall+10Δput)/2−ATM, all at 30 DTE; DVol Snapshot candles use the real
+Deribit DVOL index (`lib.deribit.get_dvol`) — kept distinct from the
+reconstructed CVOL used everywhere else (renamed the rolling correlation/
+covariance chart titles from exodus's "Spot-DVol" to "Spot-CVOL" to match what
+data they actually use, avoiding a misleading label). The "current 30d
+surface" U-shape overlay on the vol-prediction chart comes from the live
+option chain (`surface.option_vols_by_dte` + `surface.interp_at_dte`) via a
+Black-Scholes delta-search strike inversion (`scipy.stats.norm.ppf`), not
+Amberdata. Generalized exodus's four near-identical scatter functions
+(`_scatter_cvol_spot`/`_svol_spot`/`_rr_spot`/`_bf_spot`) into one
+`_scatter_vs_spot`. Both asset tabs render in `st.tabs()` side by side (not
+lazy-loaded one at a time like page 07) since Spot Vol Correlation's whole
+point is comparing BTC and ETH.
+
+**Two real bugs found and fixed during offline verification** (not introduced
+by this session's new code — both were latent in the freshly-written page 07
+before it had ever been run):
+1. `create_regime_gauge`/`create_days_in_regime_gauge` called
+   `fig.update_layout(**PLOTLY_LAYOUT, margin=dict(...))` — `PLOTLY_LAYOUT`
+   already defines `margin` (see `lib/constants.py`), so this is a duplicate-
+   keyword-argument `TypeError` on every load. Split into two calls
+   (`update_layout(**PLOTLY_LAYOUT, ...)` then a second `update_layout(margin=...)`).
+   Worth grepping for `**PLOTLY_LAYOUT.*margin=` on any future page touching
+   these gauge-style charts.
+2. `create_calibration_summary_chart`: `has_breakout = breakout_recs and
+   len(breakout_recs) >= 10` — when `breakout_recs` is an empty list, Python's
+   `and` short-circuits and returns the empty list itself (not `False`), so
+   `int(has_breakout)` a few lines later raised `TypeError: ... not 'list'`
+   whenever calibration had insufficient backtest samples for one regime
+   direction (a real, reachable case, not just a test artifact). Fixed by
+   wrapping both `has_breakout`/`has_rtl` in `bool(...)`.
+
+**Built a new offline test harness** (`/tmp/stubs/` — sandbox-local, not
+committed, rebuild next time per the Testing section) since this sandbox has
+neither `plotly` nor `streamlit` installed: a permissive `plotly.graph_objects`/
+`plotly.subplots` stub (records trace calls, doesn't validate figure
+semantics) and a richer `streamlit` stub than prior sessions needed — tracks
+widget-key uniqueness across a run (`reset()` between runs), supports
+`session_state` attribute access, returns list-of-context-managers from
+`columns()`/`tabs()`, and a `sidebar` object usable both as `with st.sidebar:`
+and via direct `st.sidebar.metric(...)`-style calls. Ran both pages end-to-end
+via `runpy` with `lib.deribit` monkeypatched to `tests/fake_deribit`'s
+synthetic feed (same fixture the existing suite uses): a cold load of both
+pages: no exceptions, no `st.error()`, no duplicate widget keys. Went further
+than a single cold load — directly exercised `render_asset_dashboard`
+(page 07) for both BTC/ETH × quick_view True/False, `render_asset_tab`
+(page 08) for both assets × Ratio/Spread × three date ranges (14/90/365
+days), `get_summary_stats`, and every Telegram report-send function for both
+pages (safe since Telegram is unconfigured in this sandbox — `send_message`/
+`send_photo` return `False` before any network call) — this is what actually
+exercises every `create_*`/chart-builder function, not just whichever ones the
+default cold-load path happens to reach. All passed. Re-ran the full existing
+suite (`tests/test_math.py`, `tests/run_all.py` all 4 assets) unchanged — still
+passes, confirming `lib/regime.py`'s new code didn't disturb anything else.
+
+**Not verified:** real Deribit connectivity and the actual rendered Streamlit
+page in a browser (same sandbox constraint as every other page here, see
+Testing section) — ask the user to sanity-check both pages live after
+deploying, in particular the dark-theme gauge/indicator charts and the DVol
+candlestick-with-skew-overlay panel, which can't be visually verified offline.
 
 ### 2026-08-22 — Time Based Realized Vol: dropped the 4h frequency (Deribit returns no candles at that resolution)
 
