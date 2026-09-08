@@ -276,11 +276,10 @@ add_workflow.bat                user-run: move staged .github/workflows file int
 
 ## Known backlog (not urgent, flagged during review)
 
-- `pages/02_Block_Trades_-_Deribit.py`'s direct Deribit calls could still be
-  routed through `lib/deribit.py` for a single shared rate budget — it got
-  a refresh button and named TTLs on 2026-08-22 (see Session log), but its
-  fetch layer itself is still the page-local `requests.get`/
-  `_get_json_with_retry`, not `lib/deribit.py`'s shared cache.
+- `pages/02_Block_Trades_-_Deribit.py` Deribit fetches were routed through
+  `lib/deribit.py` on 2026-09-08 (shared rate budget + TTL cache). Spot-check
+  live that trades pagination / perp overlay / DVOL still look right after
+  the cutover; revert that page's fetch helpers if anything regresses.
 - A few `frame.iterrows()` loops in `lib/cmd_vol.py` (smile snapshot
   high/low band) are a minor pandas anti-pattern — low-risk to vectorize,
   but not currently a real bottleneck since history frames are now
@@ -292,6 +291,90 @@ Keep this updated: when a session makes a non-trivial change, decision, or
 finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
+
+### 2026-09-08 — Desk-speed core preset, pipeline timeout, Telegram/caption tests, Block Trades via lib.deribit
+
+Nine small UX/reliability items (pending Macro dirty files left alone):
+
+1. **Run core BTC+ETH** toolbar button on MCM Bot — curated subset
+   (vol_run, vol_term_structure, skew_term_structure, basis_run,
+   block_trades_summary) merges into mcm_all_results.
+2. **Auto-pipeline 15-min timeout** — Home sets auto_pipeline_started_at
+   (UTC); lib/cache.expire_stale_auto_pipeline() clears a stuck flag on
+   Home / MCM Bot / Block Trades / TBRV so the Home button re-enables.
+3. **Regression tests** — caption helper extracted to
+   lib/telegram_caption.py; tests/test_telegram_caption.py +
+   tests/test_requirements_pins.py wired at the top of tests/run_all.py.
+4. Home page_info command count now uses len(COMMAND_NAMES).
+5. "What each report shows" moved from sidebar to a main-area expander.
+6. Load all / Refresh all / Run asset progress shows "BTC 5/22";
+   progressive merge_into session_state updates; hard errors listed.
+7. Telegram send: removed identical double fig_to_png /
+   dataframe_to_table_image retries; batch progress "Sending i/n".
+8. Full-row grid heuristic: keep FULL_ROW_COMMANDS, also widen when a
+   loaded df has more than 6 columns.
+9. Block Trades Deribit fetches routed through lib/deribit (shared rate
+   budget + cache); clear_all_caches still clears it.
+### 2026-09-06 — Macro Event Impact: added back the spider/Bloomberg-reaction/timeline charts, per-event picker
+
+Follow-up to the 2026-09-05 rebuild. User asked for the charts flagged as
+scope-cut in that rebuild ("missing a lot of charts and spider graphs and
+things") and the ability to select fewer past events (previously only a
+coarse "last 10/20/40/all" depth control).
+
+**Added three chart builders to `pages/10_Macro_Event_Impact.py`** — direct
+ports of exodus's versions, minus the Wikipedia-sourced hover-context field
+(no substitute source; everything price/vol-derived is unabridged):
+`chart_event_timeline_candles` (daily candlesticks, each selected event's
+reaction window shaded green/red by direction, dropped the upcoming-event
+marker since the bundled calendar has no future dates), `chart_bloomberg_
+reaction` (every selected event's path overlaid from T0 to a chosen span,
+plus mean ± 1 stdev bands), `chart_event_spider` (same idea over a longer
+symmetric pre/post window, one line per event date). New `lib/macro.py:
+fetch_daily_ohlc_range()` backs the timeline chart (arbitrary date-range
+daily OHLC, separate from the existing per-event fetchers since it isn't
+keyed to one release).
+
+**Per-event selection, replacing the old "History depth" dropdown**: a
+multiselect lists every past event matching the type filter (`"YYYY-MM-DD —
+Event"`, most recent first, 53 in the bundled calendar), defaulting to the
+most recent 15 but prunable/expandable to any subset — down to a single
+event if wanted. Required restructuring the caching layer: `build_impact_
+table_cached`/`fetch_ohlc_by_event_cached` now key on a `tuple[str, ...]` of
+`"date|event"` keys (hashable, required for `st.cache_data`) resolved back
+to rows via a new `_scored_calendar()`/`_events_by_keys()` pair, rather than
+the old `(event_types, n_events)` pair — this also fixes a latent
+correctness issue in the original design: z-scores are now always computed
+once against the *full* calendar (`_scored_calendar()`, cached), so pruning
+which events are *displayed* can never change the z-score reference sample
+for the ones that remain (narrowing "last N" used to silently do exactly
+that). Both the spider and Bloomberg-reaction OHLC fetch use the same
+`(window_before_h, window_after_h)` the impact table's own fetch uses,
+so `lib.macro.fetch_event_ohlc`'s own cache collapses them into one real
+fetch per event, not three.
+
+Telegram send functions (`send_asset_report_to_telegram`/`send_all_reports_
+to_telegram`) updated to the new signature and now send all 11 charts
+(was 8) — timeline, Bloomberg reaction, and spider added to the batch.
+
+**Verified offline**: `py_compile` on both files; smoke-tested the new
+`fetch_daily_ohlc_range` directly against `tests/fake_deribit` (60 daily
+rows back for a 60-day request, tz-aware UTC index); re-ran the full page
+harness (cold load, no exceptions/
+`st.error()`/duplicate keys) plus a deeper exercise directly calling
+`render_asset_tab` for both assets across 4 event-count selections (15
+most recent, 3 hand-picked, a single event, and all 53), 2 spider/Bloomberg
+parameter combinations, and the empty-selection edge case (degrades to "no
+events" without crashing) — all clean. Telegram send functions exercised
+end-to-end (degrade to `sent=0` since neither Telegram nor kaleido are
+available in this sandbox, same known limitation as every other page).
+Re-ran `tests/test_math.py`/`tests/run_all.py` (all 4 assets) — unaffected,
+still pass.
+
+**Not verified**: real Deribit connectivity and the actual rendered page in
+a browser (same sandbox constraint as always) — the shaded-box annotations
+on the timeline chart and the multiselect's usability with 53 candidate
+events are both worth a live sanity check.
 
 ### 2026-09-05 — Spot Vol Correlation crash fix, Regime Identifier duration forecast, Macro Event Impact full rebuild from exodus-analytics
 

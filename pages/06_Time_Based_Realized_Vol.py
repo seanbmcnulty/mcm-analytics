@@ -40,6 +40,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from lib.deribit import get_tradingview_ohlc, clear_cache
+from lib import cache as cache_lib
 from lib.constants import ASSET_CONFIG, ASSET_COLORS, PLOTLY_LAYOUT
 from lib.telegram import send_message, send_photo, is_configured
 from lib import fx_style
@@ -1475,6 +1476,9 @@ with st.expander("Estimator glossary (assumptions and caveats)", expanded=False)
 # flag. `_auto_tbrv_asset`, when set, overrides the asset the rest of this
 # script uses regardless of what the sidebar widget shows.
 # ---------------------------------------------------------------------------
+if cache_lib.expire_stale_auto_pipeline():
+    st.caption("Auto pipeline timed out after 15 minutes and was cleared.")
+
 _auto_pipeline_step = st.session_state.get("auto_pipeline")
 _auto_tbrv_asset = None
 if _auto_pipeline_step in ("tbrv_btc", "tbrv_eth"):
@@ -1493,6 +1497,7 @@ if _auto_pipeline_step in ("tbrv_btc", "tbrv_eth"):
         # Shouldn't happen — the Home page button is disabled when Telegram
         # isn't configured — but clear the flag rather than getting stuck.
         st.session_state["auto_pipeline"] = None
+        st.session_state["auto_pipeline_started_at"] = None
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -1873,6 +1878,7 @@ if _auto_tbrv_asset:
         st.rerun()
     else:
         st.session_state["auto_pipeline"] = None
+        st.session_state["auto_pipeline_started_at"] = None
         st.success("✅ Auto pipeline complete — MCM Bot, Block Trades, and "
                    "Time Based Realized Vol reports for BTC/ETH have all "
                    "been sent to Telegram.")

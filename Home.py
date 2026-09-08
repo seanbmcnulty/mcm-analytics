@@ -11,9 +11,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import streamlit as st
 import time
+from datetime import datetime, timezone
+
 from lib.deribit import get_index_price, get_option_chain, get_ticker
 from lib.constants import ASSET_CONFIG, ASSETS, ASSET_COLORS
 from lib.telegram import is_configured
+from lib import cache as cache_lib
+from lib import commands as cmdreg
 
 st.set_page_config(
     page_title="MCM Analytics",
@@ -116,6 +120,11 @@ st.divider()
 st.subheader("Quick Actions")
 
 st.session_state.setdefault("auto_pipeline", None)
+st.session_state.setdefault("auto_pipeline_started_at", None)
+
+if cache_lib.expire_stale_auto_pipeline():
+    st.caption("Auto pipeline timed out after 15 minutes and was cleared — "
+               "you can start it again.")
 
 _tg_ready = is_configured()
 _pipeline_running = st.session_state.get("auto_pipeline") is not None
@@ -131,10 +140,14 @@ if st.button(
          "minutes — you'll land on each page as its step runs.",
 ):
     st.session_state["auto_pipeline"] = "mcm_bot"
+    st.session_state["auto_pipeline_started_at"] = datetime.now(timezone.utc)
     st.switch_page("pages/01_MCM_Bot.py")
 
 if not _tg_ready:
     st.caption("Configure Telegram (see secrets.toml.example) to enable this.")
+elif _pipeline_running:
+    st.caption("Auto pipeline running — Home button disabled until it finishes "
+               "or times out (15 min).")
 
 # ---------------------------------------------------------------------------
 # Navigation
@@ -144,7 +157,7 @@ st.divider()
 st.subheader("Pages")
 
 page_info = [
-    ("01 MCM Bot", "Full markets bot: 21 commands — vol/skew term structure, forward vols, carry, basis, flow, RV"),
+    ("01 MCM Bot", f"Full markets bot: {len(cmdreg.COMMAND_NAMES)} commands — vol/skew term structure, forward vols, carry, basis, flow, RV"),
     ("02 Block Trades", "Deribit block trade analysis with Greeks and Telegram reporting"),
     ("06 Time Based Realized Vol", "RV across hedging frequencies + lookbacks (BTC/ETH perps), 7 estimators, decision matrix"),
     ("07 Regime Identifier", "Vol regime classification (GARCH + implied vol)"),

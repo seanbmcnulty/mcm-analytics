@@ -14,23 +14,24 @@ pages 06/07/08 — see CLAUDE.md.
 Scoped to **BTC and ETH only** (``lib.macro.MACRO_ASSETS``) — same DVOL
 dependency, same reason, as pages 07/08.
 
-Dropped as out-of-scope chart builders (NOT verified-dead in exodus — these
-ARE wired into its own UI, unlike the page-08 dead-code elimination, so this
-is a deliberate scope-reduction judgment call under time pressure, flagged
-to the user rather than silently made): ``_event_spider_chart`` (path
-comparison overlay), ``_bloomberg_reaction_chart`` (multi-event average
-response band), ``_event_timeline_candles`` (daily candlestick timeline with
-event boxes + Wikipedia-sourced event context). All three need either the
-Wikipedia-context enrichment exodus used (not reproduced here) or are a
-"nice to have" restating information the scatter/bar/asymmetry charts below
-already surface more directly. Ask if these are wanted — they can be added
-without needing any new adaptation decisions, just more chart code.
+2026-09-06: added back the three chart builders originally scope-cut on
+first pass — ``chart_event_spider`` (path comparison overlay across
+selected events), ``chart_bloomberg_reaction`` (mean response ± 1 stdev
+band), ``chart_event_timeline_candles`` (daily candlestick timeline with
+event windows highlighted) — plus a per-event multiselect so specific past
+releases can be included/excluded rather than only "last N". The one piece
+of exodus's versions NOT reproduced is the Wikipedia-sourced hover-context
+snippet on each event (no substitute source in this app); everything that
+depends only on price/vol data is a direct, unabridged port.
 
 Kept, and mapped onto this app's data:
 - Surprise Z-Score vs Actual Move scatter, Actual vs Implied Move bar,
   asymmetry (max up/down) bars, move-size distribution histogram, Move Ratio
   over time, Decision-vs-Expectations scatter, Path-Dependency-diagnostics
-  scatter — all direct ports of exodus's chart functions, unchanged math.
+  scatter, event spider, Bloomberg-style reaction band, price timeline with
+  event windows — all direct ports of exodus's chart functions, unchanged
+  math (customdata trimmed of the dropped `consensus_basis`/web-context
+  fields, everything else identical).
 - exodus's "ATM 1W/1M vol change pre->post" chart is replaced by
   ``lib.macro``'s DVOL-crush-by-horizon bar chart (1h/4h/24h/48h/72h) — the
   same *idea* (how much vol was crushed after the release), simpler because
@@ -69,7 +70,12 @@ st.set_page_config(page_title="Macro Event Impact", page_icon="📅", layout="wi
 
 CSV_PATH = Path(__file__).parent.parent / "data" / "macro_events_calendar.csv"
 CHART_HEIGHT = 420
-LOOKBACK_OPTIONS = {"Last 10 events": 10, "Last 20 events": 20, "Last 40 events": 40, "All history": 10_000}
+DEFAULT_RECENT_EVENTS = 15  # default multiselect selection: most recent N matching events
+
+SPIDER_HOURS_BEFORE_OPTIONS = [6, 12, 24, 48]
+SPIDER_HOURS_AFTER_OPTIONS = [24, 48, 72, 168]
+BLOOMBERG_SPAN_MINUTES = {"30m": 30, "1h": 60, "4h": 240, "12h": 720, "24h": 1440, "72h": 4320}
+UTC = timezone.utc
 
 
 def _show(fig: go.Figure | None, key: str) -> None:
@@ -246,6 +252,182 @@ def chart_path_dependency(df: pd.DataFrame, timeframe: str) -> go.Figure:
     return fig
 
 
+def chart_event_spider(events: pd.DataFrame, ohlc_by_event: dict, pre_hours: int, post_hours: int, bin_minutes: int = 5) -> go.Figure:
+    """One price path per selected event, all aligned to T=0 at release —
+    direct port of exodus's ``_event_spider_chart`` (drops the Wikipedia
+    web-context hover field; everything else identical)."""
+    if events.empty:
+        return _empty_fig("Event Spider: Price Path Around T=0", "No events selected", height=560)
+    fig = go.Figure()
+    added = 0
+    for _, row in events.sort_values("date").iterrows():
+        t0 = pd.Timestamp(row["release_time_utc"])
+        ohlc = ohlc_by_event.get(t0)
+        if ohlc is None or ohlc.empty:
+            continue
+        idx = ohlc.index
+        t0_cmp = macro._align_ts(idx, t0)
+        pre_arr = np.asarray(idx <= t0_cmp)
+        if not pre_arr.any():
+            continue
+        price_t0 = float(ohlc.iloc[pre_arr].iloc[-1]["close"])
+        if price_t0 <= 0:
+            continue
+        rel_min = ((idx - t0_cmp) / np.timedelta64(1, "m")).astype(float)
+        window_mask = np.asarray((rel_min >= -pre_hours * 60) & (rel_min <= post_hours * 60))
+        if not window_mask.any():
+            continue
+        seg_rel = rel_min[window_mask]
+        seg_pct = (ohlc.iloc[window_mask]["close"].astype(float) / price_t0 - 1.0) * 100.0
+        tmp = pd.DataFrame({"rel_min": seg_rel, "pct": seg_pct.values})
+        tmp["bin"] = (tmp["rel_min"] / bin_minutes).round().astype(int) * bin_minutes
+        tmp = tmp.groupby("bin", as_index=False)["pct"].last()
+        x_hours = tmp["bin"] / 60.0
+        surprise = row.get("surprise")
+        fig.add_trace(go.Scatter(
+            x=x_hours, y=tmp["pct"], mode="lines", name=str(row["date"]),
+            customdata=np.column_stack([
+                np.repeat(str(row.get("event", "")), len(tmp)),
+                np.repeat(surprise if pd.notna(surprise) else np.nan, len(tmp)),
+                np.repeat(row.get("actual_num", np.nan), len(tmp)),
+                np.repeat(row.get("consensus_num", np.nan), len(tmp)),
+            ]),
+            hovertemplate=("Date %{fullData.name}<br>Event %{customdata[0]}<br>"
+                           "T%{x:.2f}h | Move %{y:.2f}%<br>"
+                           "Actual %{customdata[2]:.3f} | Consensus %{customdata[3]:.3f}<br>"
+                           "Surprise %{customdata[1]:.3f}<extra></extra>"),
+        ))
+        added += 1
+    if added == 0:
+        return _empty_fig("Event Spider: Price Path Around T=0", "No path data for selected events", height=560)
+    fig.add_vline(x=0, line_dash="dash", line_color="gray")
+    fig.update_layout(**PLOTLY_LAYOUT, height=560, title="Event Spider: Price Path Around T=0",
+                       xaxis_title="Hours from event (T=0)", yaxis_title="Price Change vs T0 (%)",
+                       legend_title="Event date")
+    return fig
+
+
+def chart_bloomberg_reaction(events: pd.DataFrame, ohlc_by_event: dict, span_minutes: int, span_label: str,
+                              event_label: str, asset_label: str) -> go.Figure:
+    """Individual event paths from T0 to T+span plus the mean response and
+    ±1 stdev bands — direct port of exodus's ``_bloomberg_reaction_chart``."""
+    if events.empty:
+        return _empty_fig(f"{event_label} Reaction Graph (Span {span_label})", "No events selected", height=560)
+    fig = go.Figure()
+    step_min = 1 if span_minutes <= 120 else 5
+    grid = np.arange(0, span_minutes + step_min, step_min)
+    path_matrix = []
+    palette = ["#00bcd4", "#4caf50", "#ff9800", "#e91e63", "#3f51b5", "#9c27b0",
+               "#f44336", "#8bc34a", "#607d8b", "#795548", "#2196f3", "#cddc39"]
+    for i, (_, row) in enumerate(events.sort_values("date").iterrows()):
+        t0 = pd.Timestamp(row["release_time_utc"])
+        ohlc = ohlc_by_event.get(t0)
+        if ohlc is None or ohlc.empty:
+            continue
+        idx = ohlc.index
+        t0_cmp = macro._align_ts(idx, t0)
+        pre_arr = np.asarray(idx <= t0_cmp)
+        if not pre_arr.any():
+            continue
+        price_t0 = float(ohlc.iloc[pre_arr].iloc[-1]["close"])
+        if price_t0 <= 0:
+            continue
+        rel_min = ((idx - t0_cmp) / np.timedelta64(1, "m")).astype(float)
+        mask = np.asarray((rel_min >= 0) & (rel_min <= span_minutes))
+        if not mask.any():
+            continue
+        seg_rel = rel_min[mask]
+        seg_pct = (ohlc.iloc[mask]["close"].astype(float) / price_t0 - 1.0) * 100.0
+        xp, fp = np.asarray(seg_rel, dtype=float), np.asarray(seg_pct.values, dtype=float)
+        order = np.argsort(xp)
+        xp, fp = xp[order], fp[order]
+        if len(xp) < 2:
+            continue
+        if xp[0] > 0:
+            xp, fp = np.insert(xp, 0, 0.0), np.insert(fp, 0, 0.0)
+        interp = np.interp(grid, xp, fp)
+        path_matrix.append(interp)
+        fig.add_trace(go.Scatter(x=grid, y=interp, mode="lines", name=str(row["date"]),
+                                  line=dict(width=2, color=palette[i % len(palette)]),
+                                  hovertemplate="Date %{fullData.name}<br>Minutes %{x:.0f}<br>Move %{y:.2f}%<extra></extra>"))
+    if not path_matrix:
+        return _empty_fig(f"{event_label} Reaction Graph (Span {span_label})", "No path data for selected events", height=560)
+    paths = np.vstack(path_matrix)
+    mean_path, std_path = np.nanmean(paths, axis=0), np.nanstd(paths, axis=0)
+    fig.add_trace(go.Scatter(x=grid, y=mean_path, mode="lines", name="Average Response",
+                              line=dict(color="#ffffff", width=3, dash="dash"),
+                              hovertemplate="Average<br>Minutes %{x:.0f}<br>Move %{y:.2f}%<extra></extra>"))
+    fig.add_trace(go.Scatter(x=grid, y=mean_path + std_path, mode="lines", name="Upper Bound (+1σ)",
+                              line=dict(color="#2ecc71", width=2, dash="dot"),
+                              hovertemplate="Upper Bound<br>Minutes %{x:.0f}<br>Move %{y:.2f}%<extra></extra>"))
+    fig.add_trace(go.Scatter(x=grid, y=mean_path - std_path, mode="lines", name="Lower Bound (−1σ)",
+                              line=dict(color="#e74c3c", width=2, dash="dot"),
+                              hovertemplate="Lower Bound<br>Minutes %{x:.0f}<br>Move %{y:.2f}%<extra></extra>"))
+    fig.add_hline(y=0, line_dash="dot", line_color="gray")
+    fig.update_layout(**PLOTLY_LAYOUT, height=560, title=f"{event_label} Reaction Graph (Span {span_label})",
+                       xaxis_title="Minutes from Release", yaxis_title=f"{asset_label} % Change", legend_title="Series")
+    return fig
+
+
+def chart_event_timeline_candles(daily_ohlc: pd.DataFrame | None, events: pd.DataFrame, asset_label: str, event_label: str,
+                                  box_pre_hours: int = 12, box_post_hours: int = 36) -> go.Figure:
+    """Daily candlesticks with each event's reaction window shaded (green =
+    price up over the window, red = down) — direct port of exodus's
+    ``_event_timeline_candles``, minus the upcoming-event marker (no forward
+    calendar here — see module docstring) and the Wikipedia context line in
+    each label (kept: move %, actual, consensus, beat/miss — all real data)."""
+    if daily_ohlc is None or daily_ohlc.empty:
+        return _empty_fig(f"{asset_label} Price Timeline — {event_label} Events Highlighted",
+                           "No price data available for timeline", height=560)
+    fig = go.Figure()
+    idx = daily_ohlc.index
+    fig.add_trace(go.Candlestick(
+        x=idx, open=daily_ohlc["open"], high=daily_ohlc["high"], low=daily_ohlc["low"], close=daily_ohlc["close"],
+        name=f"{asset_label} (1D)", increasing_line_color="#26a69a", decreasing_line_color="#9b9b9b", showlegend=False,
+    ))
+    chart_start, chart_end = idx.min(), idx.max()
+    for _, row in events.sort_values("release_time_utc").iterrows():
+        t0 = pd.Timestamp(row["release_time_utc"])
+        if t0 < chart_start or t0 > chart_end:
+            continue
+        x0, x1 = t0 - pd.Timedelta(hours=box_pre_hours), t0 + pd.Timedelta(hours=box_post_hours)
+        win = daily_ohlc.loc[(idx >= x0) & (idx <= x1)]
+        if win.empty:
+            pos = idx.searchsorted(t0, side="left")
+            pos = min(max(pos, 0), len(daily_ohlc) - 1)
+            win = daily_ohlc.iloc[pos:pos + 1]
+        if win.empty:
+            continue
+        y_low, y_high = float(win["low"].min()), float(win["high"].max())
+        up = float(win["close"].iloc[-1]) >= float(win["open"].iloc[0])
+        fill = "rgba(38,166,154,0.35)" if up else "rgba(214,120,130,0.45)"
+        line_color = "rgba(38,166,154,0.95)" if up else "rgba(214,120,130,0.95)"
+        label_color = "#1b7a6e" if up else "#b23a48"
+        move_pct = (float(win["close"].iloc[-1]) / float(win["open"].iloc[0]) - 1.0) * 100.0
+        fig.add_shape(type="rect", x0=x0, x1=x1, y0=y_low, y1=y_high,
+                      fillcolor=fill, line=dict(color=line_color, width=1.5), layer="below")
+        bullets = [f"• Move {move_pct:+.1f}%"]
+        actual_v, consensus_v = row.get("actual_num"), row.get("consensus_num")
+        if pd.notna(actual_v):
+            bullets.append(f"• Actual {actual_v:g}")
+        if pd.notna(consensus_v):
+            bullets.append(f"• Cons. {consensus_v:g}")
+        if pd.notna(actual_v) and pd.notna(consensus_v):
+            surprise_v = actual_v - consensus_v
+            bullets.append(f"• Beat (+{surprise_v:g})" if surprise_v > 0 else f"• Miss ({surprise_v:g})" if surprise_v < 0 else "• In line")
+        label_text = f"<b>{row.get('date', '')}</b><br>" + "<br>".join(bullets)
+        fig.add_annotation(x=t0, y=y_high, text=label_text, showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.5,
+                            arrowcolor=label_color, ax=0, ay=-55, font=dict(size=9, color="#ffffff"), align="left",
+                            bgcolor=label_color, bordercolor=label_color, borderwidth=1, borderpad=4, opacity=0.95)
+        fig.add_trace(go.Scatter(x=[t0], y=[y_high], mode="markers", marker=dict(size=1, color="rgba(0,0,0,0)"),
+                                  showlegend=False,
+                                  hovertemplate=(f"{event_label}<br>Date {row.get('date', '')}<br>"
+                                                 f"Window move {move_pct:+.2f}%<br>High {y_high:,.0f} | Low {y_low:,.0f}<extra></extra>")))
+    fig.update_layout(**PLOTLY_LAYOUT, height=560, title=f"{asset_label} Price Timeline — {event_label} Events Highlighted",
+                       xaxis_title="Date", yaxis_title=f"{asset_label} Price", xaxis_rangeslider_visible=False, showlegend=False)
+    return fig
+
+
 # ============================================================================
 # DATA ORCHESTRATION
 # ============================================================================
@@ -255,35 +437,85 @@ def _load_calendar() -> pd.DataFrame | None:
     return macro.load_macro_calendar(CSV_PATH)
 
 
-def _selected_events(cal: pd.DataFrame, event_types: list[str], n_events: int) -> pd.DataFrame:
-    now_utc = pd.Timestamp.now(tz=timezone.utc)
-    past = cal[(cal["event"].isin(event_types)) & (cal["release_time_utc"] <= now_utc)]
-    return past.sort_values("date", ascending=False).head(n_events).sort_values("date")
+def _event_key(date_str: str, event: str) -> str:
+    return f"{date_str}|{event}"
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def build_impact_table_cached(asset: str, event_types: list[str], n_events: int, timeframe: str,
-                               window_minutes: int, window_before_h: int, window_after_h: int) -> pd.DataFrame:
+def _event_label(date_str: str, event: str) -> str:
+    return f"{date_str} — {event}"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _scored_calendar() -> pd.DataFrame:
+    """Full calendar + surprise z-scores, computed once and reused by every
+    selection/caching layer below (so a change in which events are *picked*
+    never changes the z-score reference sample)."""
     cal = _load_calendar()
     if cal is None or cal.empty:
         return pd.DataFrame()
     scored = macro.compute_surprise_zscores(cal)
-    events = _selected_events(scored, event_types, n_events)
+    scored["_date_str"] = scored["date"].apply(lambda d: d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d))
+    scored["_key"] = scored.apply(lambda r: _event_key(r["_date_str"], r["event"]), axis=1)
+    return scored
+
+
+def _candidate_events(event_types: list[str]) -> pd.DataFrame:
+    """All past events matching the chosen types, most recent first — the
+    pool the per-event multiselect is built from."""
+    scored = _scored_calendar()
+    if scored.empty:
+        return scored
+    now_utc = pd.Timestamp.now(tz=UTC)
+    past = scored[(scored["event"].isin(event_types)) & (scored["release_time_utc"] <= now_utc)]
+    return past.sort_values("date", ascending=False)
+
+
+def _events_by_keys(event_keys: tuple[str, ...]) -> pd.DataFrame:
+    scored = _scored_calendar()
+    if scored.empty:
+        return scored
+    return scored[scored["_key"].isin(event_keys)].sort_values("date")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def build_impact_table_cached(asset: str, event_keys: tuple[str, ...], timeframe: str,
+                               window_minutes: int, window_before_h: int, window_after_h: int) -> pd.DataFrame:
+    events = _events_by_keys(event_keys)
     if events.empty:
         return pd.DataFrame()
     return macro.build_impact_table(events, asset, timeframe, window_minutes, window_before_h, window_after_h)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_ohlc_by_event_cached(asset: str, event_keys: tuple[str, ...], window_before_h: int, window_after_h: int) -> dict:
+    """Per-event OHLC for the spider/Bloomberg-reaction charts, keyed by
+    release_time_utc. Reuses macro.fetch_event_ohlc's own cache — calling
+    this with the same (window_before_h, window_after_h) already used by
+    build_impact_table_cached means no duplicate fetches."""
+    events = _events_by_keys(event_keys)
+    out = {}
+    for _, row in events.iterrows():
+        t0 = pd.Timestamp(row["release_time_utc"])
+        t0_ms = int(t0.timestamp() * 1000)
+        ohlc = macro.fetch_event_ohlc(asset, t0_ms, window_before_h, window_after_h)
+        if ohlc is not None and not ohlc.empty:
+            out[t0] = ohlc
+    return out
 
 
 # ============================================================================
 # RENDER
 # ============================================================================
 
-def render_asset_tab(asset: str, event_types: list[str], n_events: int, timeframe: str) -> pd.DataFrame:
+def render_asset_tab(asset: str, event_keys: tuple[str, ...], event_label: str, timeframe: str,
+                      spider_pre_h: int, spider_post_h: int, bloomberg_span: str) -> pd.DataFrame:
     window_minutes = macro.TIMEFRAME_MINUTES[timeframe]
-    window_before_h, window_after_h = 4, max(24, window_minutes // 60 + 4)
+    bloomberg_minutes = BLOOMBERG_SPAN_MINUTES[bloomberg_span]
+    window_before_h = max(4, spider_pre_h)
+    window_after_h = max(24, window_minutes // 60 + 4, spider_post_h, bloomberg_minutes // 60 + 1)
 
     with st.spinner(f"Fetching {asset} event reactions from Deribit…"):
-        impact = build_impact_table_cached(asset, event_types, n_events, timeframe, window_minutes, window_before_h, window_after_h)
+        impact = build_impact_table_cached(asset, event_keys, timeframe, window_minutes, window_before_h, window_after_h)
 
     if impact.empty:
         st.info("No matching events with fetchable Deribit history for this asset/selection.")
@@ -304,6 +536,32 @@ def render_asset_tab(asset: str, event_types: list[str], n_events: int, timefram
     c5.metric("Expectation alignment", f"{kpis.get('aligned_pct', np.nan):.1f}%")
     c6.metric("Up-first paths", f"{kpis.get('up_first_pct', np.nan):.1f}%")
     c7.metric("Typical first touch", kpis.get("first_touch", "—"))
+
+    st.markdown("---")
+
+    events = _events_by_keys(event_keys)
+    ohlc_by_event = fetch_ohlc_by_event_cached(asset, event_keys, window_before_h, window_after_h)
+
+    st.subheader(f"{asset} price timeline — events highlighted")
+    st.caption("Daily candlesticks. Each shaded box marks one release's reaction window "
+               "(green = price up over the window, red = down).")
+    sel_ts = [pd.Timestamp(t) for t in events["release_time_utc"]] if not events.empty else []
+    if sel_ts:
+        timeline_start = min(sel_ts) - pd.Timedelta(days=7)
+        timeline_end = max(pd.Timestamp.now(tz=UTC), max(sel_ts)) + pd.Timedelta(days=3)
+        daily_ohlc = macro.fetch_daily_ohlc_range(asset, int(timeline_start.timestamp() * 1000), int(timeline_end.timestamp() * 1000))
+        _show(chart_event_timeline_candles(daily_ohlc, events, asset, event_label), key=f"{asset}_timeline")
+
+    st.subheader(f"{event_label} Bloomberg-style reaction")
+    st.caption("Each colored line is one past event's path from release to the selected span. "
+               "White dashed is the average response; green/red dotted are ±1 stdev bounds.")
+    _show(chart_bloomberg_reaction(events, ohlc_by_event, bloomberg_minutes, bloomberg_span, event_label, asset),
+          key=f"{asset}_bloomberg")
+
+    st.subheader(f"{event_label} path comparison (T=0 at release)")
+    st.caption("Each line is one event date, aligned to T=0 at release. Steeper slopes imply faster "
+               "repricing; early reversals suggest two-way flow/whipsaw.")
+    _show(chart_event_spider(events, ohlc_by_event, spider_pre_h, spider_post_h), key=f"{asset}_spider")
 
     st.markdown("---")
 
@@ -397,12 +655,18 @@ def _send_chart(fig: go.Figure | None, caption: str) -> bool:
     return send_photo(img, caption=caption[:1024])
 
 
-def send_asset_report_to_telegram(asset: str, event_types: list[str], n_events: int, timeframe: str) -> tuple[int, list[str]]:
+def send_asset_report_to_telegram(asset: str, event_keys: tuple[str, ...], event_label: str, timeframe: str,
+                                   spider_pre_h: int, spider_post_h: int, bloomberg_span: str) -> tuple[int, list[str]]:
     window_minutes = macro.TIMEFRAME_MINUTES[timeframe]
-    window_before_h, window_after_h = 4, max(24, window_minutes // 60 + 4)
-    impact = build_impact_table_cached(asset, event_types, n_events, timeframe, window_minutes, window_before_h, window_after_h)
+    bloomberg_minutes = BLOOMBERG_SPAN_MINUTES[bloomberg_span]
+    window_before_h = max(4, spider_pre_h)
+    window_after_h = max(24, window_minutes // 60 + 4, spider_post_h, bloomberg_minutes // 60 + 1)
+    impact = build_impact_table_cached(asset, event_keys, timeframe, window_minutes, window_before_h, window_after_h)
     if impact.empty:
         return 0, [f"{asset} (no data)"]
+
+    events = _events_by_keys(event_keys)
+    ohlc_by_event = fetch_ohlc_by_event_cached(asset, event_keys, window_before_h, window_after_h)
 
     kpis = macro.summary_kpis(impact)
     send_message(
@@ -412,7 +676,19 @@ def send_asset_report_to_telegram(asset: str, event_types: list[str], n_events: 
         f"Avg Implied Move: {kpis.get('avg_implied', float('nan')):.2f}%\n"
         f"Expectation alignment: {kpis.get('aligned_pct', float('nan')):.1f}%"
     )
+
+    sel_ts = [pd.Timestamp(t) for t in events["release_time_utc"]] if not events.empty else []
+    timeline_fig = None
+    if sel_ts:
+        timeline_start = min(sel_ts) - pd.Timedelta(days=7)
+        timeline_end = max(pd.Timestamp.now(tz=UTC), max(sel_ts)) + pd.Timedelta(days=3)
+        daily_ohlc = macro.fetch_daily_ohlc_range(asset, int(timeline_start.timestamp() * 1000), int(timeline_end.timestamp() * 1000))
+        timeline_fig = chart_event_timeline_candles(daily_ohlc, events, asset, event_label)
+
     charts = [
+        (timeline_fig, f"{asset} - Price Timeline"),
+        (chart_bloomberg_reaction(events, ohlc_by_event, bloomberg_minutes, bloomberg_span, event_label, asset), f"{asset} - Bloomberg Reaction"),
+        (chart_event_spider(events, ohlc_by_event, spider_pre_h, spider_post_h), f"{asset} - Path Comparison"),
         (chart_scatter_z_vs_actual(impact, timeframe), f"{asset} - Z-Score vs Actual Move"),
         (chart_bar_actual_vs_implied(impact, timeframe), f"{asset} - Actual vs Implied Move"),
         (chart_dvol_crush(impact), f"{asset} - DVOL Crush"),
@@ -424,6 +700,8 @@ def send_asset_report_to_telegram(asset: str, event_types: list[str], n_events: 
     ]
     sent, failed = 0, []
     for fig, name in charts:
+        if fig is None:
+            continue
         if _send_chart(fig, name):
             sent += 1
         else:
@@ -431,10 +709,11 @@ def send_asset_report_to_telegram(asset: str, event_types: list[str], n_events: 
     return sent, failed
 
 
-def send_all_reports_to_telegram(event_types: list[str], n_events: int, timeframe: str) -> tuple[int, list[str]]:
+def send_all_reports_to_telegram(event_keys: tuple[str, ...], event_label: str, timeframe: str,
+                                  spider_pre_h: int, spider_post_h: int, bloomberg_span: str) -> tuple[int, list[str]]:
     total_sent, total_failed = 0, []
     for asset in macro.MACRO_ASSETS:
-        sent, failed = send_asset_report_to_telegram(asset, event_types, n_events, timeframe)
+        sent, failed = send_asset_report_to_telegram(asset, event_keys, event_label, timeframe, spider_pre_h, spider_post_h, bloomberg_span)
         total_sent += sent
         total_failed.extend(failed)
     return total_sent, total_failed
@@ -468,6 +747,14 @@ def main() -> None:
           vs. a T−1h baseline — the vol-crush that typically follows a scheduled event.
         - **Path diagnostics** — which extreme (high/low) came first and how long each
           took, plus the larger of the two excursions vs. the close-to-close move.
+        - **Price timeline** — daily candles with each selected release's reaction window
+          shaded. **Bloomberg-style reaction** — every selected event's path overlaid from
+          release to the chosen span, plus the mean response ± 1 stdev. **Path comparison
+          (spider)** — the same idea over a longer, symmetric pre/post window around T=0.
+
+        Use **Events to include** below to pick exactly which past releases go into every
+        chart and the impact table — it defaults to the most recent matches, but any
+        subset can be selected or deselected.
 
         Release times are recovered via a fixed per-event-type ET lookup (DST-aware,
         `lib/macro.py:RELEASE_TIME_ET`) since the bundled calendar has no `time` column —
@@ -484,28 +771,52 @@ def main() -> None:
 
     event_types_all = sorted(cal["event"].unique().tolist())
 
-    col1, col2, col3 = st.columns([2, 1, 1])
+    col1, col2 = st.columns([2, 1])
     with col1:
         event_types = st.multiselect("Event types", event_types_all, default=event_types_all)
     with col2:
-        lookback_label = st.selectbox("History depth", list(LOOKBACK_OPTIONS.keys()), index=1)
-        n_events = LOOKBACK_OPTIONS[lookback_label]
-    with col3:
         timeframe = st.selectbox("Reaction timeframe", macro.TIMEFRAME_OPTIONS, index=macro.TIMEFRAME_OPTIONS.index("1h"))
 
     if not event_types:
         st.warning("Select at least one event type.")
         return
 
-    st.caption(f"📅 Last updated: {datetime.now():%Y-%m-%d %H:%M:%S}")
+    candidates = _candidate_events(event_types)  # most recent first
+    if candidates.empty:
+        st.warning("No past events match the selected event type(s).")
+        return
+    all_labels = [_event_label(r["_date_str"], r["event"]) for _, r in candidates.iterrows()]
+    label_to_key = {_event_label(r["_date_str"], r["event"]): r["_key"] for _, r in candidates.iterrows()}
+    default_labels = all_labels[:DEFAULT_RECENT_EVENTS]
+    picked_labels = st.multiselect(
+        f"Events to include ({len(all_labels)} match the type filter above — most recent first)",
+        all_labels, default=default_labels,
+        help="Uncheck any release to drop it from every chart and the impact table below.",
+    )
+    if not picked_labels:
+        st.warning("Select at least one event.")
+        return
+    event_keys = tuple(sorted(label_to_key[lb] for lb in picked_labels))
+    event_label = event_types[0] if len(event_types) == 1 else "Selected"
+
+    with st.expander("Path comparison / Bloomberg reaction settings", expanded=False):
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            spider_pre_h = st.selectbox("Spider: hours before T0", SPIDER_HOURS_BEFORE_OPTIONS, index=1)
+        with s2:
+            spider_post_h = st.selectbox("Spider: hours after T0", SPIDER_HOURS_AFTER_OPTIONS, index=1)
+        with s3:
+            bloomberg_span = st.selectbox("Bloomberg reaction span", list(BLOOMBERG_SPAN_MINUTES.keys()), index=3)
+
+    st.caption(f"📅 Last updated: {datetime.now():%Y-%m-%d %H:%M:%S} — {len(picked_labels)} event(s) selected")
     st.markdown("---")
 
     tabs = st.tabs([ASSET_NAMES.get(a, a) for a in macro.MACRO_ASSETS])
     for tab, asset in zip(tabs, macro.MACRO_ASSETS):
         with tab:
-            render_asset_tab(asset, event_types, n_events, timeframe)
+            render_asset_tab(asset, event_keys, event_label, timeframe, spider_pre_h, spider_post_h, bloomberg_span)
 
-    now_utc = pd.Timestamp.now(tz=timezone.utc)
+    now_utc = pd.Timestamp.now(tz=UTC)
     future = cal[(cal["event"].isin(event_types)) & (cal["release_time_utc"] > now_utc)]
     if not future.empty:
         st.markdown("---")
@@ -523,7 +834,7 @@ def main() -> None:
         else:
             if st.button("📤 Send All Reports to Telegram", width="stretch", type="primary", key="macro_telegram_all"):
                 with st.spinner("Generating and sending all reports to Telegram..."):
-                    sent, failed = send_all_reports_to_telegram(event_types, n_events, timeframe)
+                    sent, failed = send_all_reports_to_telegram(event_keys, event_label, timeframe, spider_pre_h, spider_post_h, bloomberg_span)
                 if failed:
                     st.warning(f"Sent {sent} chart(s). Failed: {', '.join(failed)}")
                 else:

@@ -15,7 +15,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import time
-import html
 import concurrent.futures
 from datetime import datetime, timedelta, timezone
 
@@ -23,14 +22,15 @@ import numpy as np
 import pandas as pd
 import plotly.colors as pcolors
 import plotly.graph_objects as go
-import requests
 from scipy.stats import norm
 import streamlit as st
 
 from lib import cache as cache_lib
+from lib import deribit
 from lib import fx_style
 from lib import telegram
 from lib.constants import TTL_SHORT, TTL_MEDIUM
+from lib.telegram_caption import caption_from_title
 
 # ---------------------------------------------------------------------------
 # Page Config & Styles
@@ -169,6 +169,9 @@ with st.sidebar:
 # Telegram once the tabs below are built (see the toolbar section further
 # down, and the send-dispatch block after the tab loop).
 # ---------------------------------------------------------------------------
+if cache_lib.expire_stale_auto_pipeline():
+    st.caption("Auto pipeline timed out after 15 minutes and was cleared.")
+
 _auto_pipeline_active = (st.session_state.get("auto_pipeline") == "block_trades"
                          and telegram.is_configured())
 if _auto_pipeline_active:
@@ -179,64 +182,33 @@ elif st.session_state.get("auto_pipeline") == "block_trades":
     # Shouldn't happen — the Home page button is disabled when Telegram
     # isn't configured — but clear the flag rather than getting stuck.
     st.session_state["auto_pipeline"] = None
+    st.session_state["auto_pipeline_started_at"] = None
 
 # ---------------------------------------------------------------------------
 # API Fetching Helpers
 # ---------------------------------------------------------------------------
-def _get_json_with_retry(url, params=None, timeout=10, max_retries=2, pace=0.15):
-    """GET + .json() with a couple of retries and real 429 backoff.
-
-    Previously every call here was try/except-swallowed with zero retries, so
-    a single transient timeout or rate-limit response silently turned into an
-    empty DataFrame downstream (e.g. the perp line vanishing from a chart)
-    with no sign of why. This keeps the same "never raise, just return None
-    on failure" contract callers already rely on, but gives a request an
-    actual chance to succeed first.
-    """
-    last_exc = None
-    for attempt in range(max_retries + 1):
-        try:
-            r = requests.get(url, params=params, timeout=timeout)
-            if r.status_code == 429:
-                wait = 1.0
-                try:
-                    wait = float(r.headers.get('Retry-After', wait))
-                except (TypeError, ValueError):
-                    pass
-                time.sleep(min(max(wait, 0.5), 3.0))
-                continue
-            r.raise_for_status()
-            if pace:
-                time.sleep(pace)  # Pace API limit
-            return r.json()
-        except Exception as exc:
-            last_exc = exc
-            if attempt < max_retries:
-                time.sleep(0.3 * (attempt + 1))
-    if last_exc is not None:
-        print(f"Deribit request failed after retries ({url}): {last_exc}")
-    return None
-
 @st.cache_data(ttl=TTL_SHORT, show_spinner=False)
 def get_current_spot(asset: str) -> float:
+    """Spot via lib.deribit shared cache (not a page-local requests.get)."""
     index_map = {
         'BTC': 'btc_usd', 'ETH': 'eth_usd', 'SOL_USDC': 'sol_usdc',
         'XRP_USDC': 'xrp_usdc',
         'AVAX_USDC': 'avax_usdc', 'HYPE_USDC': 'hype_usdc'
     }
     index_name = index_map.get(asset, f"{asset.lower()}_usd")
-    url = 'https://deribit.com/api/v2/public/get_index_price'
-    data = _get_json_with_retry(url, params={'index_name': index_name}, timeout=5)
-    if not data:
-        return 0.0
     try:
-        return float(data['result']['index_price'])
-    except (KeyError, TypeError, ValueError):
+        price = deribit.get_index_price(index_name)
+        return float(price) if price is not None else 0.0
+    except (TypeError, ValueError):
         return 0.0
 
 @st.cache_data(ttl=TTL_MEDIUM, show_spinner=False)
 def fetch_trades_by_currency(currency: str, start_dt_utc: datetime) -> pd.DataFrame:
     """Fetch+parse the raw trades feed for one Deribit currency (BTC/ETH/USDC).
+
+    Routed through ``lib.deribit.get_last_trades_by_currency_and_time`` so this
+    page shares the process-wide rate budget and TTL cache with the rest of
+    the app (``clear_all_caches`` already calls ``deribit.clear_cache()``).
 
     Deribit exposes all USDC-settled option flow (SOL, XRP, AVAX, HYPE)
     under a single "USDC" currency - the individual assets are filtered out
@@ -245,43 +217,36 @@ def fetch_trades_by_currency(currency: str, start_dt_utc: datetime) -> pd.DataFr
     5 redundant, identical Deribit calls per page load.
 
     Deribit caps each response at 1000 trades and sets `has_more=True` when
-    there are more in range. The old code made a single call and silently
-    dropped everything past the first 1000 - for a busy 12/24h BTC or ETH
-    window (or the combined USDC feed across 5 assets), that's enough
-    trading to blow past 1000 and quietly lose a large chunk of the window.
-    This walks forward page by page (advancing start_timestamp to just past
-    the last trade's timestamp each time, since sorting=asc) until Deribit
-    reports no more pages or a safety cap is hit.
+    there are more in range. This walks forward page by page (advancing
+    start_timestamp to just past the last trade's timestamp each time, since
+    sorting=asc) until Deribit reports no more pages or a safety cap is hit.
     """
     start_ms = int(start_dt_utc.timestamp() * 1000)
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-    url = "https://www.deribit.com/api/v2/public/get_last_trades_by_currency_and_time"
     all_trades = []
     cursor_ms = start_ms
-    max_pages = 20  # 20 x 1000 = 20k trades/currency/load - comfortably above anything realistic
+    max_pages = 20  # 20 x 1000 = 20k trades/currency/load
     for _page in range(max_pages):
-        params = {
-            'currency': currency, 'kind': 'option',
-            'start_timestamp': cursor_ms, 'end_timestamp': end_ms,
-            'count': 1000, 'sorting': 'asc',
-        }
-        data = _get_json_with_retry(url, params=params, timeout=10)
-        if not data or 'result' not in data:
+        result = deribit.get_last_trades_by_currency_and_time(
+            currency, kind="option",
+            start_ms=cursor_ms, end_ms=end_ms,
+            count=1000, sorting="asc", ttl=TTL_MEDIUM,
+        )
+        if not result:
             break
-        result = data['result']
-        page_trades = result.get('trades', [])
+        page_trades = result.get("trades", [])
         if not page_trades:
             break
         all_trades.extend(page_trades)
-        if not result.get('has_more'):
+        if not result.get("has_more"):
             break
-        last_ts = page_trades[-1].get('timestamp')
+        last_ts = page_trades[-1].get("timestamp")
         if last_ts is None:
             break
-        next_cursor = int(last_ts) + 1  # +1ms so the boundary trade isn't fetched twice
+        next_cursor = int(last_ts) + 1
         if next_cursor <= cursor_ms:
-            break  # cursor didn't move forward - stop rather than loop forever
+            break
         cursor_ms = next_cursor
 
     if not all_trades:
@@ -289,37 +254,28 @@ def fetch_trades_by_currency(currency: str, start_dt_utc: datetime) -> pd.DataFr
 
     df = pd.DataFrame(all_trades)
 
-    # The +1ms page boundary above is a "should never overlap" guard, not a
-    # guarantee - if two trades ever land in the same millisecond, drop the
-    # duplicate by trade_id rather than double-counting it.
-    if 'trade_id' in df.columns:
-        df = df.drop_duplicates(subset='trade_id', keep='last')
+    if "trade_id" in df.columns:
+        df = df.drop_duplicates(subset="trade_id", keep="last")
 
-    # Parse details
     if "timestamp" in df.columns:
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert(SGT)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(SGT)
 
     if "amount" in df.columns:
-        df['abs_amount'] = df['amount'].abs()
-        df['amount'] = np.where(df['direction'] == 'buy', df['abs_amount'], -df['abs_amount'])
+        df["abs_amount"] = df["amount"].abs()
+        df["amount"] = np.where(df["direction"] == "buy", df["abs_amount"], -df["abs_amount"])
 
-    # Parse strikes and expiries
     if "instrument_name" in df.columns:
-        df['strike'] = pd.to_numeric(df['instrument_name'].str.extract(r'-(\d+(?:\.\d+)*)-')[0], errors='coerce')
-        df['expiry'] = pd.to_datetime(df['instrument_name'].str.extract(r'^[^-]*-([0-9]{1,2}[A-Z]{3}[0-9]{2})-')[0], format='%d%b%y', errors='coerce')
-        df['option_type'] = df['instrument_name'].str.extract(r'-(C|P)$')[0]
+        df["strike"] = pd.to_numeric(df["instrument_name"].str.extract(r"-(\d+(?:\.\d+)*)-")[0], errors="coerce")
+        df["expiry"] = pd.to_datetime(df["instrument_name"].str.extract(r"^[^-]*-([0-9]{1,2}[A-Z]{3}[0-9]{2})-")[0], format="%d%b%y", errors="coerce")
+        df["option_type"] = df["instrument_name"].str.extract(r"-(C|P)$")[0]
 
-    if 'mark_price' not in df.columns and 'price' in df.columns:
-        df['mark_price'] = df['price']
+    if "mark_price" not in df.columns and "price" in df.columns:
+        df["mark_price"] = df["price"]
 
-    # Deribit normally returns a per-trade traded IV for options, but guard
-    # against a payload shape that ever omits it - several of the "Flow
-    # Analytics" charts below (IV surface, delta term structure) read this
-    # column directly and would KeyError without it.
-    if 'iv' not in df.columns:
-        df['iv'] = np.nan
+    if "iv" not in df.columns:
+        df["iv"] = np.nan
 
-    return df.dropna(subset=['strike', 'expiry']).reset_index(drop=True)
+    return df.dropna(subset=["strike", "expiry"]).reset_index(drop=True)
 
 def fetch_public_trades(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
     """Per-asset view over the shared per-currency trades feed."""
@@ -328,74 +284,48 @@ def fetch_public_trades(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Filter by instrument prefix for USDC settled (SOL, XRP, AVAX, HYPE)
     if "_USDC" in asset and "instrument_name" in df.columns:
         prefix = f"{asset}-"
-        df = df[df['instrument_name'].str.startswith(prefix)].copy()
+        df = df[df["instrument_name"].str.startswith(prefix)].copy()
 
     return df.reset_index(drop=True) if not df.empty else df
 
 @st.cache_data(ttl=TTL_MEDIUM, show_spinner=False)
 def fetch_historical_spot(asset: str, start_dt_utc: datetime) -> pd.DataFrame:
+    """Perp OHLC via lib.deribit.get_tradingview_ohlc (shared cache)."""
     perp_map = {
-        'BTC': 'BTC-PERPETUAL', 'ETH': 'ETH-PERPETUAL', 'SOL_USDC': 'SOL_USDC-PERPETUAL',
-        'XRP_USDC': 'XRP_USDC-PERPETUAL',
-        'AVAX_USDC': 'AVAX_USDC-PERPETUAL', 'HYPE_USDC': 'HYPE_USDC-PERPETUAL'
+        "BTC": "BTC-PERPETUAL", "ETH": "ETH-PERPETUAL", "SOL_USDC": "SOL_USDC-PERPETUAL",
+        "XRP_USDC": "XRP_USDC-PERPETUAL",
+        "AVAX_USDC": "AVAX_USDC-PERPETUAL", "HYPE_USDC": "HYPE_USDC-PERPETUAL"
     }
     instrument = perp_map.get(asset, f"{asset}-PERPETUAL")
     start_ms = int(start_dt_utc.timestamp() * 1000)
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-    url = "https://www.deribit.com/api/v2/public/get_tradingview_chart_data"
-    params = {
-        'instrument_name': instrument,
-        'start_timestamp': start_ms,
-        'end_timestamp': end_ms,
-        'resolution': '5'  # 5-minute candles to safely avoid the 1000 limit
-    }
-    data = _get_json_with_retry(url, params=params, timeout=10)
-    if not data:
+    ohlc = deribit.get_tradingview_ohlc(instrument, "5", start_ms, end_ms)
+    if ohlc is None or ohlc.empty or "close" not in ohlc.columns:
+        print(f"Tradingview API did not return OK for {instrument}")
         return pd.DataFrame()
-    chart = data.get('result', {})
-    if chart.get('status') == 'ok' and chart.get('ticks') and chart.get('close'):
-        # NB: chart['ticks'] is a plain list, so pd.to_datetime(...) here
-        # returns a DatetimeIndex, not a Series - it has no `.dt` accessor
-        # (that only exists on Series). The old `.dt.tz_convert(...)` call
-        # raised AttributeError on every single invocation; wrapped in the
-        # try/except this used to live in, that made this function return an
-        # empty DataFrame 100% of the time, which is why the perp price line
-        # never actually appeared on the "Block Trades Over Time" chart.
-        ts = pd.to_datetime(chart['ticks'], unit='ms', utc=True).tz_convert(SGT)
-        return pd.DataFrame({'timestamp': ts, 'close': chart['close']})
-    print(f"Tradingview API did not return OK for {instrument}: {chart}")
-    return pd.DataFrame()
+    # get_tradingview_ohlc returns naive UTC ms timestamps — localize then SGT.
+    ts = pd.to_datetime(ohlc["timestamp"], utc=True).dt.tz_convert(SGT)
+    return pd.DataFrame({"timestamp": ts, "close": ohlc["close"].values})
 
 @st.cache_data(ttl=TTL_MEDIUM, show_spinner=False)
 def fetch_dvol(asset: str, start_dt_utc: datetime) -> pd.Series:
-    if asset not in ['BTC', 'ETH']:
+    """DVOL via lib.deribit.get_dvol (shared cache). BTC/ETH only."""
+    if asset not in ["BTC", "ETH"]:
         return pd.Series(dtype=float)
 
     start_ms = int(start_dt_utc.timestamp() * 1000)
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-    url = "https://www.deribit.com/api/v2/public/get_volatility_index_data"
-    params = {
-        'currency': asset,
-        'start_timestamp': start_ms,
-        'end_timestamp': end_ms,
-        'resolution': '60'
-    }
-    data = _get_json_with_retry(url, params=params, timeout=10)
-    if data:
-        result = data.get('result', {})
-        rows = result.get('data', [])
-        if rows:
-            cols = ['timestamp', 'open', 'high', 'low', 'close']
-            df = pd.DataFrame(rows, columns=cols)
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert(SGT)
-            df.set_index('timestamp', inplace=True)
-            return df['close'].sort_index()
-    return pd.Series(dtype=float)
+    df = deribit.get_dvol(asset, resolution="60", start_ms=start_ms, end_ms=end_ms)
+    if df is None or df.empty or "close" not in df.columns:
+        return pd.Series(dtype=float)
+    out = df.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True).dt.tz_convert(SGT)
+    out = out.set_index("timestamp")
+    return out["close"].sort_index()
 
 # ---------------------------------------------------------------------------
 # Greeks Math
@@ -1258,17 +1188,7 @@ def plot_cumulative_aggression(data, asset):
 # tables here, so it's just "render each figure to PNG, sanitize its title
 # into a caption, send")
 # ---------------------------------------------------------------------------
-def _caption_from_title(title_text, fallback: str) -> str:
-    """Telegram-safe caption from a figure's title. Our titles here are
-    plain f-strings with no Plotly <span>/<br> markup, but html.escape()
-    is cheap insurance against parse_mode=HTML choking on a literal '<' or
-    '&' (e.g. a future title containing a raw comparison operator) - see
-    pages/01_MCM_Bot.py's _caption_from_title for the incident this pattern
-    was built to avoid."""
-    if not title_text:
-        return fallback
-    text = html.escape(str(title_text).replace("<br>", "\n").strip())
-    return (text[:1024] if len(text) > 1024 else text) or fallback
+# caption_from_title imported from lib.telegram_caption
 
 def _render_png_with_reason(fig):
     """Render one themed figure to PNG bytes via kaleido - same call as
@@ -1295,7 +1215,7 @@ def _send_chart_to_telegram(fig, caption_base: str):
         return False, f"{caption_base}: no chart to send"
     title_obj = getattr(getattr(fig, "layout", None), "title", None)
     title_text = getattr(title_obj, "text", None) if title_obj else None
-    caption = _caption_from_title(title_text, caption_base)
+    caption = caption_from_title(title_text, caption_base)
 
     themed = fx_style.apply_theme(fig, "light")
     png, err = _render_png_with_reason(themed)
@@ -1371,7 +1291,7 @@ with st.spinner("Fetching Block Trades, Spot, and DVOL data..."):
     # chart even though the plotting code for it is correct.
     # Fetching every asset/currency concurrently cuts wall-clock time down to
     # roughly the slowest single call instead of the sum of all of them, and
-    # the retry/backoff in _get_json_with_retry makes each call more likely
+    # the retry/backoff in lib.deribit._request makes each call more likely
     # to actually succeed.
     unique_currencies = sorted(set(CURRENCY_MAP.get(a, a) for a in ASSETS))
 
@@ -1577,6 +1497,7 @@ if send_all_clicked:
 
 if _auto_pipeline_active:
     st.session_state["auto_pipeline"] = "tbrv_btc"
+    # keep auto_pipeline_started_at — timeout covers the whole chain
     st.switch_page("pages/06_Time_Based_Realized_Vol.py")
 
 # ---------------------------------------------------------------------------

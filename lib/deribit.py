@@ -223,6 +223,38 @@ def get_trades(currency: str, kind: str = "option",
     return result if isinstance(result, list) else None
 
 
+def get_last_trades_by_currency_and_time(
+    currency: str,
+    kind: str = "option",
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    count: int = 1000,
+    sorting: str = "asc",
+    ttl: float = TTL_MEDIUM,
+) -> dict | None:
+    """One page of ``get_last_trades_by_currency_and_time``.
+
+    Returns Deribit's result dict (``trades``, ``has_more``, …) so callers
+    that need pagination — notably ``pages/02_Block_Trades_-_Deribit.py`` —
+    can advance ``start_timestamp`` without bypassing this module's shared
+    rate budget and TTL cache. Prefer this over raw ``requests.get``.
+    """
+    if end_ms is None:
+        end_ms = int(time.time() * 1000)
+    if start_ms is None:
+        start_ms = end_ms - 24 * 3600 * 1000
+
+    result = _request("get_last_trades_by_currency_and_time", {
+        "currency": currency,
+        "kind": kind,
+        "start_timestamp": start_ms,
+        "end_timestamp": end_ms,
+        "count": count,
+        "sorting": sorting,
+    }, ttl=ttl)
+    return result if isinstance(result, dict) else None
+
+
 def get_funding_history(instrument_name: str,
                         start_ms: int | None = None,
                         end_ms: int | None = None) -> pd.DataFrame | None:

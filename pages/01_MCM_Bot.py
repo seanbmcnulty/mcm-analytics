@@ -1,16 +1,15 @@
 """
 MCM Bot — the full markets bot, Deribit public data only.
 
-Layout: a compact toolbar (expiry + load/refresh/send), then one tab per
-asset for the report grid plus a final "Run single command" tab — so
+Layout: a compact toolbar (expiry + load/refresh/core/send), then one tab
+per asset for the report grid plus a final "Run single command" tab — so
 switching between assets (or to the ad-hoc single-command tool) is a tab
-click instead of a long scroll. "What each report shows" lives in the
-sidebar as reference material.
+click instead of a long scroll. "What each report shows" lives in a
+main-area expander under the title.
 """
 
 import sys
 import html
-import re
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -24,6 +23,7 @@ from lib import cache as cache_lib
 from lib import commands as cmdreg
 from lib import fx_style, history, surface, telegram
 from lib.constants import ASSETS
+from lib.telegram_caption import caption_from_title
 
 st.set_page_config(page_title="MCM Bot", page_icon="🤖", layout="wide",
                    initial_sidebar_state="expanded")
@@ -41,6 +41,20 @@ MCM_ORDER = [(a, cn) for a in ASSETS for cn in cmdreg.COMMAND_NAMES]
 # sharing a row of 3 with neighboring commands — same treatment vol_run's
 # table already gets (see the dashboard grid loop below).
 FULL_ROW_COMMANDS = {"basis_run", "block_trades_summary"}
+
+# Desk-speed subset: the five reports desks ask for most often on BTC/ETH.
+CORE_COMMANDS = (
+    "vol_run",
+    "vol_term_structure",
+    "skew_term_structure",
+    "basis_run",
+    "block_trades_summary",
+)
+CORE_ASSETS = ("BTC", "ETH")
+
+# Wide-table heuristic: known full-row commands OR any result whose dataframe
+# has more than this many columns (too many to read in a 1/3-width cell).
+FULL_ROW_MIN_COLS = 6
 
 for _k, _v in (("mcm_all_results", None), ("mcm_all_results_ts", None),
                ("mcm_fig", None), ("mcm_df", None), ("mcm_text", None)):
@@ -169,49 +183,6 @@ def render_output(fig, df, text, key_prefix: str = "out",
         st.markdown(text)
 
 
-_SPAN_TAG_RE = re.compile(r"</?span[^>]*>", re.IGNORECASE)
-_CAPTION_SAFE_LEN = 700  # generous for a chart title; keeps well under
-                          # Telegram's 1024-char caption cap even after
-                          # HTML-escaping expands some characters
-
-
-def _caption_from_title(title_text: str | None, fallback: str) -> str:
-    """Turn a Plotly figure's title.text into a safe Telegram HTML-mode
-    caption.
-
-    Plotly titles carry Plotly's own light markup (<br> for a line
-    break, <span style=...> for the smaller reconstruction-note line
-    that fx_style.finalize() adds) — but note text itself can contain
-    literal characters that aren't markup at all, e.g.
-    forward_vol_steepness's note reads "excludes <=3DTE". Sent verbatim
-    under Telegram's parse_mode=HTML, that "<=" combined with a real
-    closing </span> tag later in the string reads as one huge malformed
-    tag to Telegram's parser, which rejects the whole message with a 400
-    ("can't parse entities") — every single time, deterministically, for
-    any chart whose note/title contains that pattern. That's why
-    forward_vol_steepness and its 25d_call/25d_put variants failed to
-    send 100% of the time while spacing/rate-limit fixes did nothing for
-    them: it was never a rate limit.
-
-    Fix: convert <br> to a newline, strip Plotly's <span> tags (Telegram
-    doesn't support arbitrary style attributes on <span> anyway), then
-    html.escape() whatever's left so any remaining literal '<'/'&'/'>'
-    renders as itself instead of being parsed as markup. This does mean
-    a title's own bold/italic styling (none currently used in title text)
-    would render as escaped text rather than formatting — an acceptable
-    trade for "always delivers."
-    """
-    if not title_text:
-        return fallback
-    text = (title_text.replace("<br>", "\n")
-                       .replace("<br/>", "\n")
-                       .replace("<br />", "\n"))
-    text = _SPAN_TAG_RE.sub("", text).strip()
-    if len(text) > _CAPTION_SAFE_LEN:
-        text = text[:_CAPTION_SAFE_LEN].rstrip() + "…"
-    text = html.escape(text)
-    return text or fallback
-
 
 def _send_photo(png: bytes | None, caption: str) -> bool:
     """Send one PNG to Telegram. telegram.send_photo already retries a
@@ -248,8 +219,6 @@ def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> tuple[b
     if has_table:
         png = fx_style.dataframe_to_table_image(df, header_text=text or caption_base)
         if png is None:
-            png = fx_style.dataframe_to_table_image(df, header_text=text or caption_base)
-        if png is None:
             reasons.append(f"{caption_base}: table image failed to **render**")
         elif _send_photo(png, f"<b>{caption_base}</b>"):
             ok = True
@@ -259,12 +228,10 @@ def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> tuple[b
     for idx, f in enumerate(figs, start=1):
         title_obj = getattr(getattr(f, "layout", None), "title", None)
         title_text = getattr(title_obj, "text", None) if title_obj else None
-        caption = _caption_from_title(title_text, caption_base)
+        caption = caption_from_title(title_text, caption_base)
         label = f"{caption_base} chart {idx}/{len(figs)}"
 
         png = fx_style.fig_to_png(fx_style.apply_theme(f, "light"), width=1200, height=800)
-        if png is None:
-            png = fx_style.fig_to_png(fx_style.apply_theme(f, "light"), width=1200, height=800)
         if png is None:
             reasons.append(f"{label}: failed to **render**")
         elif _send_photo(png, caption):
@@ -317,23 +284,27 @@ def _send_to_telegram(assets: list[str], label: str) -> None:
               if any((a, cn) not in results for cn in cmdreg.COMMAND_NAMES)]
     if missing:
         with st.spinner(f"Running commands for {', '.join(missing)}…"):
-            fresh = run_reports(missing, list(cmdreg.COMMAND_NAMES),
-                                st.session_state.get("mcm_dte_days", 30))
-            results = {**results, **fresh}
+            results = dict(results)
+            run_reports(missing, list(cmdreg.COMMAND_NAMES),
+                        st.session_state.get("mcm_dte_days", 30),
+                        merge_into=results)
             st.session_state.mcm_all_results = results
             st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
 
     to_send = _telegram_queue(assets, results)
     sent = failed = 0
     all_reasons: list[str] = []
-    with st.spinner(f"Sending {label} to Telegram…"):
-        for (a, cn, fig, df, text) in to_send:
-            ok, reasons = send_result_to_telegram(a, cn, fig, df, text)
-            if ok:
-                sent += 1
-            else:
-                failed += 1
-            all_reasons.extend(reasons)
+    n_send = max(1, len(to_send))
+    bar = st.progress(0.0, text=f"Sending 0/{len(to_send)}…")
+    for i, (a, cn, fig, df, text) in enumerate(to_send, start=1):
+        bar.progress(i / n_send, text=f"Sending {i}/{len(to_send)}…")
+        ok, reasons = send_result_to_telegram(a, cn, fig, df, text)
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+        all_reasons.extend(reasons)
+    bar.empty()
     if sent:
         st.success(f"Sent {sent} report(s) to Telegram."
                    + (f" ({failed} failed to render/send — see detail below.)"
@@ -358,19 +329,45 @@ def _send_to_telegram(assets: list[str], label: str) -> None:
                 st.markdown(f"- {r}")
 
 
-def run_reports(assets: list[str], cmd_names: list[str], target_days: int) -> dict:
-    results = {}
-    total = max(1, len(assets) * len(cmd_names))
-    bar = st.progress(0.0)
+def run_reports(assets: list[str], cmd_names: list[str], target_days: int,
+                merge_into: dict | None = None) -> dict:
+    """Run commands with per-asset progress (``BTC 5/22``).
+
+    When ``merge_into`` is provided (typically ``st.session_state.mcm_all_results``),
+    each finished command is written back immediately so a mid-run failure
+    still leaves partial results in session_state. Errors from
+    ``run_command`` are returned as text on the tile (not swallowed); any
+    that look like hard failures are listed after the sweep.
+    """
+    results = merge_into if merge_into is not None else {}
+    n_cmds = max(1, len(cmd_names))
+    total = max(1, len(assets) * n_cmds)
+    bar = st.progress(0.0, text="Starting…")
+    status = st.empty()
     done = 0
+    hard_errors: list[str] = []
     for a in assets:
-        for cn in cmd_names:
-            results[(a, cn)] = cmdreg.run_command(
+        for i_cmd, cn in enumerate(cmd_names, start=1):
+            status.caption(f"**{a}** {i_cmd}/{n_cmds} — /{cn}")
+            fig, df, text = cmdreg.run_command(
                 a, "/" + cn,
                 expiry_target_days=target_days if cn in cmdreg.EXPIRY_COMMANDS else None)
+            results[(a, cn)] = (fig, df, text)
+            if merge_into is not None:
+                st.session_state.mcm_all_results = results
+                st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
+            has_table = df is not None and not getattr(df, "empty", True)
+            nfigs = len(fig) if isinstance(fig, list) else (1 if fig is not None else 0)
+            if text and nfigs == 0 and not has_table:
+                hard_errors.append(f"{a} /{cn}: {text}")
             done += 1
-            bar.progress(done / total)
+            bar.progress(done / total, text=f"{a} {i_cmd}/{n_cmds}")
     bar.empty()
+    status.empty()
+    if hard_errors:
+        with st.expander(f"⚠️ {len(hard_errors)} command(s) returned no chart/table"):
+            for err in hard_errors:
+                st.markdown(f"- {err}")
     return results
 
 
@@ -395,9 +392,20 @@ with st.sidebar:
     if st.button("Clear data cache", **_stretch()):
         cache_lib.clear_all_caches()
         st.rerun()
-    st.divider()
-    with st.expander("What each report shows"):
-        st.markdown("""
+
+for _asset in ASSETS:
+    try:
+        history.record_snapshot(_asset)
+    except Exception:
+        pass
+
+st.title("🤖 MCM Bot")
+st.caption("Crypto derivatives analytics · Deribit public API · "
+           f"{fx_style.local_now():%d-%b-%Y %H:%M} "
+           f"{fx_style.DISPLAY_TZ_LABEL} time")
+
+with st.expander("What each report shows"):
+    st.markdown("""
 | Command | What it shows |
 |--------|----------------|
 | **Vol run** | Implied volatility by expiry (ATM σ, 3h/open change, RV, IV−RV, 25Δ wings, forward IV). Green/red = up/down. |
@@ -421,16 +429,8 @@ with st.sidebar:
 | **Moonphase** | Perp price with lunar phases; bands show full/new moon windows. |
 """)
 
-for _asset in ASSETS:
-    try:
-        history.record_snapshot(_asset)
-    except Exception:
-        pass
-
-st.title("🤖 MCM Bot")
-st.caption("Crypto derivatives analytics · Deribit public API · "
-           f"{fx_style.local_now():%d-%b-%Y %H:%M} "
-           f"{fx_style.DISPLAY_TZ_LABEL} time")
+if cache_lib.expire_stale_auto_pipeline():
+    st.caption("Auto pipeline timed out after 15 minutes and was cleared.")
 
 # ---------------------------------------------------------------------------
 # Auto pipeline (triggered from the Home page's "Refresh BTC/ETH & send to
@@ -446,10 +446,13 @@ if st.session_state.get("auto_pipeline") == "mcm_bot":
                 f"{', '.join(_auto_assets)} and sending to Telegram…")
         with st.spinner(f"Refreshing MCM Bot commands for {', '.join(_auto_assets)}…"):
             cache_lib.clear_all_caches()
-            _fresh = run_reports(_auto_assets, list(cmdreg.COMMAND_NAMES),
-                                 st.session_state.get("mcm_dte_days", 30))
-            st.session_state.mcm_all_results = {
-                **(st.session_state.mcm_all_results or {}), **_fresh}
+            if st.session_state.mcm_all_results is None:
+                st.session_state.mcm_all_results = {}
+            _merged = dict(st.session_state.mcm_all_results)
+            run_reports(_auto_assets, list(cmdreg.COMMAND_NAMES),
+                        st.session_state.get("mcm_dte_days", 30),
+                        merge_into=_merged)
+            st.session_state.mcm_all_results = _merged
             st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
         _send_to_telegram(_auto_assets, "BTC+ETH")
         st.session_state["auto_pipeline"] = "block_trades"
@@ -458,9 +461,10 @@ if st.session_state.get("auto_pipeline") == "mcm_bot":
         # Shouldn't happen — the Home page button is disabled when Telegram
         # isn't configured — but clear the flag rather than getting stuck.
         st.session_state["auto_pipeline"] = None
+        st.session_state["auto_pipeline_started_at"] = None
 
 # ---------------------------------------------------------------------------
-# Toolbar — expiry + load/refresh/send, one compact row instead of three
+# Toolbar — expiry + load/refresh/core/send, one compact row instead of three
 # stacked sections. Everything here used to take ~40 lines of subheaders and
 # always-visible captions before a single chart appeared; the explanatory
 # text now lives in tooltips (hover ⓘ). The old "Load selected…" popover
@@ -472,7 +476,10 @@ if st.session_state.get("auto_pipeline") == "mcm_bot":
 _expiries, _using_fallback = _expiry_options()
 _default_idx = _expiries.index(min(_expiries, key=lambda d: abs(d - 30)))
 
-_tb1, _tb2, _tb3 = st.columns([2.6, 1.2, 1.2])
+_core_help = ("Run desk-speed subset for BTC+ETH only: "
+              + ", ".join(CORE_COMMANDS)
+              + ". Merges into the dashboard without clearing other assets/commands.")
+_tb1, _tb2, _tb3, _tb4 = st.columns([2.2, 1.0, 1.0, 1.5])
 with _tb1:
     st.selectbox(
         "Default expiry", options=_expiries, index=_default_idx,
@@ -494,6 +501,10 @@ with _tb3:
     refresh_all_btn = st.button("Refresh all", key="mcm_refresh_all", **_stretch(),
                                 help="Re-run all commands for every asset and "
                                      "replace the dashboard with the latest data.")
+with _tb4:
+    st.write("")
+    core_btn = st.button("Run core BTC+ETH", key="mcm_run_core", **_stretch(),
+                         help=_core_help)
 
 # Send to Telegram — one button per asset, a BTC+ETH combo, plus "All",
 # instead of a single all-or-nothing send. A per-asset (or combo) button
@@ -527,11 +538,30 @@ with _sb_all:
 
 if load_all_btn or refresh_all_btn:
     with st.spinner(f"Running all commands for {', '.join(ASSETS)}…"):
+        if st.session_state.mcm_all_results is None:
+            st.session_state.mcm_all_results = {}
         st.session_state.mcm_all_results = run_reports(
             list(ASSETS), list(cmdreg.COMMAND_NAMES),
-            st.session_state.get("mcm_dte_days", 30))
+            st.session_state.get("mcm_dte_days", 30),
+            merge_into={} if refresh_all_btn else dict(st.session_state.mcm_all_results or {}))
         st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
     st.success("All reports loaded." if load_all_btn else "All reports refreshed.")
+    st.rerun()
+
+if core_btn:
+    _core_assets = [a for a in ASSETS if a in CORE_ASSETS]
+    with st.spinner(f"Running core commands for {', '.join(_core_assets)}…"):
+        if st.session_state.mcm_all_results is None:
+            st.session_state.mcm_all_results = {}
+        _merged = dict(st.session_state.mcm_all_results)
+        run_reports(
+            _core_assets, list(CORE_COMMANDS),
+            st.session_state.get("mcm_dte_days", 30),
+            merge_into=_merged)
+        st.session_state.mcm_all_results = _merged
+        st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
+    st.success(f"Core reports loaded for {', '.join(_core_assets)} "
+               f"({len(CORE_COMMANDS)} commands).")
     st.rerun()
 
 for _a in ASSETS:
@@ -557,13 +587,30 @@ if st.session_state.mcm_all_results is None:
 results = st.session_state.mcm_all_results or {}
 _ts = st.session_state.get("mcm_all_results_ts")
 
+
+def _needs_full_row(asset: str, cn: str) -> bool:
+    """Full-width row if the command is in FULL_ROW_COMMANDS, or its loaded
+    dataframe has more than FULL_ROW_MIN_COLS columns (wide tables are
+    unreadable in a 1/3-width grid cell)."""
+    if cn in FULL_ROW_COMMANDS:
+        return True
+    entry = results.get((asset, cn))
+    if not entry:
+        return False
+    _fig, _df, _text = entry
+    try:
+        return _df is not None and len(getattr(_df, "columns", [])) > FULL_ROW_MIN_COLS
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Dashboard — one tab per asset, plus a tab for the single-command tool.
 # Replaces the old layout of "every asset's full grid, stacked vertically,
 # then the single-command panel below all of them" — which meant scrolling
 # past BTC's ~21 charts to see ETH's, then SOL's, then HYPE's, then the
 # single-command tool at the very bottom. Now switching between them is a
-# tab click, not a scroll. ("What each report shows" moved to the sidebar.)
+# tab click, not a scroll. ("What each report shows" is a main-area expander.)
 # ---------------------------------------------------------------------------
 
 st.divider()
@@ -600,9 +647,11 @@ for ia, a in enumerate(ASSETS):
             with st.spinner(f"Running all commands for {a}…"):
                 if st.session_state.mcm_all_results is None:
                     st.session_state.mcm_all_results = {}
-                st.session_state.mcm_all_results.update(
-                    run_reports([a], list(cmdreg.COMMAND_NAMES),
-                                st.session_state.get("mcm_dte_days", 30)))
+                _base = dict(st.session_state.mcm_all_results)
+                run_reports([a], list(cmdreg.COMMAND_NAMES),
+                            st.session_state.get("mcm_dte_days", 30),
+                            merge_into=_base)
+                st.session_state.mcm_all_results = _base
                 st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
             st.rerun()
 
@@ -611,7 +660,7 @@ for ia, a in enumerate(ASSETS):
         i = 0
         while i < n_a:
             cn0 = order_a[i][1]
-            if cn0 in FULL_ROW_COMMANDS:
+            if _needs_full_row(a, cn0):
                 st.caption(f"**{a}** /{cn0}")
                 if (a, cn0) in results:
                     f2, d2, t2 = results[(a, cn0)]
@@ -628,7 +677,7 @@ for ia, a in enumerate(ASSETS):
             # that command starts its own row instead of being pulled in.
             row_items = []
             j = i
-            while j < n_a and len(row_items) < 3 and order_a[j][1] not in FULL_ROW_COMMANDS:
+            while j < n_a and len(row_items) < 3 and not _needs_full_row(a, order_a[j][1]):
                 row_items.append(order_a[j])
                 j += 1
             i = j

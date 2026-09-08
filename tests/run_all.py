@@ -1,7 +1,25 @@
-"""Exercise every bot command against the synthetic feed."""
+"""Exercise offline unit checks, then every bot command against the synthetic feed."""
 import sys, traceback
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# --- lightweight unit regressions (no Deribit / no plotly needed) ---
+_unit_failures = []
+for _mod_name in ("tests.test_telegram_caption", "tests.test_requirements_pins"):
+    try:
+        _mod = __import__(_mod_name, fromlist=["*"])
+        for _attr in dir(_mod):
+            if _attr.startswith("test_"):
+                getattr(_mod, _attr)()
+        print(f"ok  unit {_mod_name}")
+    except Exception:
+        _unit_failures.append((_mod_name, traceback.format_exc()))
+        print(f"ERR unit {_mod_name}")
+        print(traceback.format_exc())
+
+if _unit_failures:
+    print(f"\n{len(_unit_failures)} unit test module(s) failed.")
+    sys.exit(1)
 
 from tests import fake_deribit
 from lib import deribit

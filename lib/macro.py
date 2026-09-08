@@ -37,11 +37,13 @@ Adapted, not verbatim:
   lookup (DST-aware ET->UTC) restores the minute-level T0 exodus had from
   its own explicit ``time`` column.
 - Dropped as out of portable scope (no data source, or not a metric):
-  Amberdata's 1W/1M ATM term-structure change chart, the Wikipedia
-  hover-context enrichment, the Bloomberg-style multi-span reaction chart,
-  the event-spider chart, and the event-timeline-candles chart. Kept
-  everything that measures the actual price/vol reaction to a release,
-  which is the substance of the page.
+  Amberdata's 1W/1M ATM term-structure change chart (replaced by a DVOL-
+  crush-by-horizon chart — see pages/10) and the Wikipedia hover-context
+  enrichment used in exodus's spider/Bloomberg-reaction/event-timeline
+  charts (no substitute source; those three charts are otherwise fully
+  ported in pages/10 as of 2026-09-06, using ``fetch_daily_ohlc_range``
+  below for the timeline and per-event OHLC for the other two — event
+  labels/hovers just carry one fewer field than exodus's).
 """
 
 from __future__ import annotations
@@ -178,6 +180,22 @@ def fetch_event_ohlc(asset: str, event_ts_ms: int, window_before_h: int, window_
     start_ms = event_ts_ms - window_before_h * 3600 * 1000
     end_ms = event_ts_ms + window_after_h * 3600 * 1000
     df = deribit.get_tradingview_ohlc(cfg["perp"], "1", start_ms, end_ms)
+    if df is None or df.empty:
+        return None
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    return df.set_index("timestamp").sort_index()
+
+
+@st.cache_data(ttl=TTL_SLOW, max_entries=16, show_spinner=False)
+def fetch_daily_ohlc_range(asset: str, start_ms: int, end_ms: int) -> pd.DataFrame | None:
+    """Daily perp OHLC across an arbitrary [start, end] span — used by the
+    price-timeline chart (not per-event, so it doesn't share fetch_event_ohlc's
+    per-event cache key)."""
+    cfg = ASSET_CONFIG.get(asset)
+    if not cfg:
+        return None
+    df = deribit.get_tradingview_ohlc(cfg["perp"], "1D", start_ms, end_ms)
     if df is None or df.empty:
         return None
     df = df.copy()
