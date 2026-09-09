@@ -591,9 +591,21 @@ _ts = st.session_state.get("mcm_all_results_ts")
 def _needs_full_row(asset: str, cn: str) -> bool:
     """Full-width row if the command is in FULL_ROW_COMMANDS, or its loaded
     dataframe has more than FULL_ROW_MIN_COLS columns (wide tables are
-    unreadable in a 1/3-width grid cell)."""
+    unreadable in a 1/3-width grid cell).
+
+    vol_run is exempt from the wide-table heuristic even though its table
+    is wide (10+ columns): it's handled specially via the multi_idx path
+    below (table rendered inline with skip_figures=True; its figure list
+    is rendered once, separately, in the "Vol surface by expiry" section
+    at the bottom of the tab). Letting the heuristic catch it here would
+    push it into the plain full-row branch instead, which renders its
+    figures too — duplicating every vol surface chart at the top of the
+    page as well as at the bottom.
+    """
     if cn in FULL_ROW_COMMANDS:
         return True
+    if cn == "vol_run":
+        return False
     entry = results.get((asset, cn))
     if not entry:
         return False
