@@ -36,6 +36,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -66,6 +67,10 @@ MIN_ROLLING_POINTS = 20
 ROLLING_WINDOW = 30
 RESOLUTION_MAP = {"1 hr": "60", "4 hr": "240", "12 hr": "720", "1D": "1D"}
 DATE_RANGE_PRESETS = {"Last 2 weeks": 14, "Last 1 month": 30, "Last 3 months": 90, "Last 6 months": 180, "Last 1 year": 365}
+RV_WINDOW_DAYS = 30           # realized-vol lookback, matched to CVOL's fixed 30 DTE
+ZSCORE_WINDOW = 90            # points, for DVOL/skew spread z-scores and percentile rank
+DVOL_BETA_WINDOW = 30         # bars (native resolution), for rolling ETH-on-BTC DVOL beta
+ALERT_STATE_PATH = Path(__file__).parent.parent / "data" / "dvol_spread_alert_state.json"
 
 
 def _show(fig: go.Figure | None, key: str) -> None:
@@ -168,6 +173,60 @@ def _bf_series(asset: str, days: int):
     a = atm.reindex(idx).interpolate(limit_direction="both")
     bf = ((c + p) / 2 - a).dropna()
     return bf, (est_c or est_p or est_a), src_a
+
+
+@st.cache_data(ttl=300, max_entries=16, show_spinner=False)
+def _dvol_close_series(asset: str, days: int, resolution: str) -> pd.Series:
+    """Real Deribit DVOL index close series (not the reconstructed CVOL used
+    elsewhere on this page) over the given lookback window."""
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=days)
+    df = deribit.get_dvol(ASSET_CONFIG[asset]["deribit_ccy"], resolution=resolution,
+                           start_ms=int(start_dt.timestamp() * 1000), end_ms=int(end_dt.timestamp() * 1000))
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    s = df.set_index("timestamp")["close"].sort_index()
+    return _normalize_dt_index(s)
+
+
+@st.cache_data(ttl=300, max_entries=16, show_spinner=False)
+def _funding_rate_series(asset: str, days: int) -> pd.Series:
+    """Perp funding rate history, annualized (%). Hourly `interest_1h` from
+    Deribit's funding-rate-history endpoint, scaled to an annualized rate for
+    direct comparison against vol-point spreads on the same chart."""
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=days)
+    df = deribit.get_funding_history(ASSET_CONFIG[asset]["perp"],
+                                      start_ms=int(start_dt.timestamp() * 1000), end_ms=int(end_dt.timestamp() * 1000))
+    if df is None or df.empty or "interest_1h" not in df.columns:
+        return pd.Series(dtype=float)
+    ts = pd.to_datetime(df["timestamp"])
+    if ts.dt.tz is None:
+        ts = ts.dt.tz_localize("UTC")
+    s = pd.Series(df["interest_1h"].to_numpy(dtype=float), index=ts).sort_index()
+    return _normalize_dt_index(s * 24 * 365 * 100)  # hourly rate -> annualized %
+
+
+@st.cache_data(ttl=300, max_entries=16, show_spinner=False)
+def _realized_vol_series(asset: str, days: int, rv_window_days: int = RV_WINDOW_DAYS) -> pd.Series:
+    """Rolling close-to-close realized vol (annualized %) on hourly perp
+    closes, windowed to `rv_window_days` days — same horizon and units as
+    CVOL (30d ATM IV, %), so the two can be differenced directly for an
+    RV-IV basis."""
+    df = history.perp_ohlc(asset, days=days + rv_window_days + 5, resolution="60")
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    close = _normalize_dt_index(df["close"].dropna())
+    if len(close) < 10:
+        return pd.Series(dtype=float)
+    bars_per_day = 24
+    window_bars = max(rv_window_days * bars_per_day, 2)
+    log_ret = np.log(close / close.shift(1))
+    rv = (log_ret.rolling(window_bars).std() * np.sqrt(bars_per_day * 365) * 100).dropna()
+    cutoff = pd.Timestamp(datetime.now(timezone.utc) - timedelta(days=days))
+    return rv[rv.index >= cutoff]
 
 
 def _normalize_dt_index(s: pd.Series) -> pd.Series:
@@ -351,23 +410,171 @@ def _chart_rolling_covariance(spot: pd.Series, cvol: pd.Series, asset: str, wind
     return fig
 
 
-def _area_ratio_spread(num: str, den: str, days: int, ratio_type: str) -> go.Figure:
-    num_s, _, _ = _cvol_series(num, days)
-    den_s, _, _ = _cvol_series(den, days)
-    if num_s.empty or den_s.empty:
-        return _insufficient_data_fig(f"{num}/{den} DVol Ratio & Spread", "Insufficient CVOL history for one or both legs.")
-    idx = num_s.index.union(den_s.index)
-    n = num_s.reindex(idx).interpolate(limit_direction="both")
-    d = den_s.reindex(idx).interpolate(limit_direction="both")
-    if ratio_type == "Ratio":
-        y = (n / d).dropna()
-        y_label = f"{num}/{den} Vol Ratio"
-    else:
-        y = (n - d).dropna()
-        y_label = f"{num}-{den} Vol Spread (pts)"
+def _rolling_zscore(series: pd.Series, window: int = ZSCORE_WINDOW) -> pd.Series:
+    """Rolling z-score: (x - rolling mean) / rolling std, over `window` points
+    of the series' own native cadence (not necessarily days)."""
+    if series.empty:
+        return pd.Series(dtype=float)
+    min_p = max(5, window // 3)
+    mean = series.rolling(window, min_periods=min_p).mean()
+    std = series.rolling(window, min_periods=min_p).std()
+    z = (series - mean) / std.replace(0, np.nan)
+    return z.dropna()
+
+
+def _percentile_rank(series: pd.Series, window: int = ZSCORE_WINDOW) -> float | None:
+    """Percentile rank (0-100) of the series' latest value within its own
+    trailing `window` points."""
+    if series.empty or len(series) < max(5, window // 3):
+        return None
+    tail = series.iloc[-window:] if len(series) >= window else series
+    latest = series.iloc[-1]
+    return float((tail <= latest).mean() * 100)
+
+
+def _zscore_chart(z: pd.Series, title: str, window: int = ZSCORE_WINDOW) -> go.Figure:
+    """Generic rolling z-score line chart with +-1/+-2 sigma reference bands.
+    Shared by the DVOL spread and 25Δ skew spread z-score panels."""
+    if z.empty:
+        return _insufficient_data_fig(f"{title} Z-Score", "Insufficient history for a stable z-score.")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=y.index, y=y.values, mode="lines", name=y_label, line=dict(color="#3790C7", width=2), fill="tozeroy", fillcolor="rgba(55,144,199,0.12)"))
-    fig.update_layout(**PLOTLY_LAYOUT, title=f"{num}/{den} DVol {ratio_type}", xaxis_title="Date", yaxis_title=y_label, height=CHART_HEIGHT, hovermode="x unified")
+    fig.add_trace(go.Scatter(x=z.index, y=z.values, mode="lines", name="Z-score", line=dict(color="#6a1b9a", width=2)))
+    for level in (1, 2):
+        fig.add_hline(y=level, line_dash="dot", line_color="#9aa4b2")
+        fig.add_hline(y=-level, line_dash="dot", line_color="#9aa4b2")
+    fig.add_hline(y=0, line_color="#9aa4b2")
+    fig.update_layout(**PLOTLY_LAYOUT, title=f"{title} ({window}-point Z-Score)", xaxis_title="Date", yaxis_title="Z-Score", height=CHART_HEIGHT, yaxis=dict(range=[-3.5, 3.5]))
+    return fig
+
+
+def _dvol_spread_series(days: int, resolution: str) -> pd.Series:
+    """Raw ETH DVOL - BTC DVOL spread series (vol points), shared by the
+    spread chart, its z-score panel, and the sidebar alert check."""
+    eth = _dvol_close_series("ETH", days, resolution)
+    btc = _dvol_close_series("BTC", days, resolution)
+    if eth.empty or btc.empty:
+        return pd.Series(dtype=float)
+    idx = eth.index.union(btc.index)
+    e = eth.reindex(idx).interpolate(limit_direction="both")
+    b = btc.reindex(idx).interpolate(limit_direction="both")
+    return (e - b).dropna()
+
+
+def _dvol_spread_chart(days: int, resolution: str) -> go.Figure:
+    """Absolute spread of the real Deribit DVOL index: ETH DVOL - BTC DVOL,
+    in vol points, with the ETH-BTC perp funding-rate differential overlaid
+    on a secondary axis (a second, correlated driver of relative vol)."""
+    y = _dvol_spread_series(days, resolution)
+    if y.empty:
+        return _insufficient_data_fig("ETH-BTC DVOL Spread", "Insufficient DVOL history for one or both legs.")
+    y_label = "ETH-BTC DVOL Spread (pts)"
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(x=y.index, y=y.values, mode="lines", name=y_label, line=dict(color="#3790C7", width=2), fill="tozeroy", fillcolor="rgba(55,144,199,0.12)"), secondary_y=False)
+    eth_fund = _funding_rate_series("ETH", days)
+    btc_fund = _funding_rate_series("BTC", days)
+    if not eth_fund.empty and not btc_fund.empty:
+        fidx = eth_fund.index.union(btc_fund.index)
+        fund_diff = (eth_fund.reindex(fidx).interpolate(limit_direction="both") - btc_fund.reindex(fidx).interpolate(limit_direction="both")).dropna()
+        if not fund_diff.empty:
+            fig.add_trace(go.Scatter(x=fund_diff.index, y=fund_diff.values, mode="lines", name="ETH-BTC Funding Diff (ann. %)", line=dict(color="#fb8c00", width=1.5, dash="dot")), secondary_y=True)
+    fig.add_hline(y=0, line_dash="dash", line_color="#9aa4b2", secondary_y=False)
+    fig.update_yaxes(title_text=y_label, secondary_y=False)
+    fig.update_yaxes(title_text="Funding Diff (ann. %)", secondary_y=True, showgrid=False)
+    fig.update_layout(**PLOTLY_LAYOUT, title="ETH-BTC DVOL Spread (with funding-rate differential)", xaxis_title="Date", height=CHART_HEIGHT, hovermode="x unified")
+    return fig
+
+
+def _dvol_beta_series(days: int, resolution: str, window: int = DVOL_BETA_WINDOW) -> pd.Series:
+    """Rolling regression beta of ETH DVOL changes on BTC DVOL changes —
+    how many points ETH DVOL moves per 1-point BTC DVOL move, distinct from
+    the level spread above."""
+    eth = _dvol_close_series("ETH", days, resolution)
+    btc = _dvol_close_series("BTC", days, resolution)
+    if eth.empty or btc.empty:
+        return pd.Series(dtype=float)
+    idx = eth.index.union(btc.index)
+    de = eth.reindex(idx).interpolate(limit_direction="both").diff()
+    db = btc.reindex(idx).interpolate(limit_direction="both").diff()
+    cov = de.rolling(window).cov(db)
+    var = db.rolling(window).var()
+    return (cov / var.replace(0, np.nan)).dropna()
+
+
+def _dvol_beta_chart(days: int, resolution: str, window: int = DVOL_BETA_WINDOW) -> go.Figure:
+    beta = _dvol_beta_series(days, resolution, window)
+    if beta.empty:
+        return _insufficient_data_fig("ETH DVOL Beta to BTC DVOL", "Insufficient DVOL history for a stable rolling beta.")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=beta.index, y=beta.values, mode="lines", name="Rolling beta", line=dict(color="#00695c", width=2)))
+    fig.add_hline(y=1.0, line_dash="dash", line_color="#9aa4b2")
+    fig.update_layout(**PLOTLY_LAYOUT, title=f"ETH DVOL Beta to BTC DVOL ({window}-bar rolling)", xaxis_title="Date", yaxis_title="Beta", height=CHART_HEIGHT, hovermode="x unified")
+    return fig
+
+
+def _skew_spread_series(days: int) -> pd.Series:
+    """Raw ETH 25Δ skew - BTC 25Δ skew spread (pts), on the same
+    reconstructed-CVOL-derived skew used elsewhere on this page (Deribit has
+    no standalone skew index the way it does DVOL)."""
+    eth, _, _ = _svol_series("ETH", days)
+    btc, _, _ = _svol_series("BTC", days)
+    if eth.empty or btc.empty:
+        return pd.Series(dtype=float)
+    idx = eth.index.union(btc.index)
+    e = eth.reindex(idx).interpolate(limit_direction="both")
+    b = btc.reindex(idx).interpolate(limit_direction="both")
+    return (e - b).dropna()
+
+
+def _skew_spread_chart(days: int) -> go.Figure:
+    y = _skew_spread_series(days)
+    if y.empty:
+        return _insufficient_data_fig("ETH-BTC 25Δ Skew Spread", "Insufficient skew history for one or both legs.")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=y.index, y=y.values, mode="lines", name="ETH-BTC Skew Spread", line=dict(color="#c62828", width=2), fill="tozeroy", fillcolor="rgba(198,40,40,0.10)"))
+    fig.add_hline(y=0, line_dash="dash", line_color="#9aa4b2")
+    fig.update_layout(**PLOTLY_LAYOUT, title="ETH-BTC 25Δ Skew Spread", xaxis_title="Date", yaxis_title="Skew Spread (pts)", height=CHART_HEIGHT, hovermode="x unified")
+    return fig
+
+
+def _rv_iv_basis_series(asset: str, days: int) -> pd.Series:
+    """Per-asset RV-IV basis: rolling realized vol minus CVOL (both 30d,
+    annualized, %). Positive = realized running hot vs. what's priced."""
+    rv = _realized_vol_series(asset, days)
+    cvol, _, _ = _cvol_series(asset, days)
+    if rv.empty or cvol.empty:
+        return pd.Series(dtype=float)
+    idx = rv.index.union(cvol.index)
+    r = rv.reindex(idx).interpolate(limit_direction="both")
+    c = cvol.reindex(idx).interpolate(limit_direction="both")
+    return (r - c).dropna()
+
+
+def _rv_iv_basis_chart(asset: str, days: int) -> go.Figure:
+    basis = _rv_iv_basis_series(asset, days)
+    if basis.empty:
+        return _insufficient_data_fig(f"{RV_WINDOW_DAYS}d RV - CVOL Basis - {asset}", "Insufficient realized-vol or CVOL history.")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=basis.index, y=basis.values, mode="lines", name=f"{asset} RV-IV Basis", line=dict(color="#ef6c00", width=2), fill="tozeroy", fillcolor="rgba(239,108,0,0.10)"))
+    fig.add_hline(y=0, line_dash="dash", line_color="#9aa4b2")
+    fig.update_layout(**PLOTLY_LAYOUT, title=f"{RV_WINDOW_DAYS}d Realized Vol - CVOL Basis - {asset}", xaxis_title="Date", yaxis_title="Basis (pts)", height=CHART_HEIGHT, hovermode="x unified")
+    return fig
+
+
+def _rv_iv_basis_spread_chart(days: int) -> go.Figure:
+    """Cross-asset: (ETH RV-IV basis) - (BTC RV-IV basis) — which leg's
+    implied vol is more mispriced against its own realized vol, relatively."""
+    eth = _rv_iv_basis_series("ETH", days)
+    btc = _rv_iv_basis_series("BTC", days)
+    if eth.empty or btc.empty:
+        return _insufficient_data_fig("ETH-BTC RV-IV Basis Spread", "Insufficient realized-vol or CVOL history for one or both legs.")
+    idx = eth.index.union(btc.index)
+    e = eth.reindex(idx).interpolate(limit_direction="both")
+    b = btc.reindex(idx).interpolate(limit_direction="both")
+    y = (e - b).dropna()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=y.index, y=y.values, mode="lines", name="ETH-BTC RV-IV Basis Spread", line=dict(color="#5e35b1", width=2), fill="tozeroy", fillcolor="rgba(94,53,177,0.10)"))
+    fig.add_hline(y=0, line_dash="dash", line_color="#9aa4b2")
+    fig.update_layout(**PLOTLY_LAYOUT, title="ETH-BTC RV-IV Basis Spread (relative basis richness)", xaxis_title="Date", yaxis_title="Basis Spread (pts)", height=CHART_HEIGHT, hovermode="x unified")
     return fig
 
 
@@ -572,7 +779,7 @@ def get_summary_stats(days: int) -> tuple[pd.DataFrame, float | None]:
 # ASSET TAB
 # ============================================================================
 
-def render_asset_tab(asset: str, days: int, resolution: str, ratio_type: str, prediction_windows: tuple) -> None:
+def render_asset_tab(asset: str, days: int, resolution: str, prediction_windows: tuple) -> None:
     spot = _spot_series(asset, days)
     if spot.empty:
         st.warning(f"No {asset} spot data available for this window.")
@@ -592,9 +799,9 @@ def render_asset_tab(asset: str, days: int, resolution: str, ratio_type: str, pr
     c3, c4 = st.columns(2)
     with c3:
         if other in SV_ASSETS:
-            _show(_area_ratio_spread("ETH", "BTC", days, ratio_type), f"{asset}_ethbtc_ratio")
+            _show(_dvol_spread_chart(days, resolution), f"{asset}_ethbtc_dvol_spread")
         else:
-            st.info(f"Need {other} data (unavailable) to compute the ETH/BTC ratio.")
+            st.info(f"Need {other} data (unavailable) to compute the ETH/BTC DVOL spread.")
     with c4:
         end_dt = datetime.now(timezone.utc)
         start_dt = end_dt - timedelta(days=days)
@@ -612,6 +819,28 @@ def render_asset_tab(asset: str, days: int, resolution: str, ratio_type: str, pr
         _show(_chart_rolling_correlation(spot, cvol, asset), f"{asset}_roll_corr")
     with c8:
         _show(_chart_rolling_covariance(spot, cvol, asset), f"{asset}_roll_cov")
+
+    c9, c10 = st.columns(2)
+    with c9:
+        _show(_rv_iv_basis_chart(asset, days), f"{asset}_rv_iv_basis")
+    with c10:
+        if other in SV_ASSETS:
+            _show(_rv_iv_basis_spread_chart(days), f"{asset}_rv_iv_basis_spread")
+        else:
+            st.info(f"Need {other} data (unavailable) to compute the RV-IV basis spread.")
+
+    if other in SV_ASSETS:
+        c11, c12 = st.columns(2)
+        with c11:
+            _show(_zscore_chart(_rolling_zscore(_dvol_spread_series(days, resolution)), "ETH-BTC DVOL Spread"), f"{asset}_dvol_spread_z")
+        with c12:
+            _show(_dvol_beta_chart(days, resolution), f"{asset}_dvol_beta")
+
+        c13, c14 = st.columns(2)
+        with c13:
+            _show(_skew_spread_chart(days), f"{asset}_skew_spread")
+        with c14:
+            _show(_zscore_chart(_rolling_zscore(_skew_spread_series(days)), "ETH-BTC 25Δ Skew Spread"), f"{asset}_skew_spread_z")
 
     _show(_chart_vol_prediction(asset, prediction_windows), f"{asset}_vol_prediction")
 
@@ -635,7 +864,7 @@ def _send_chart(fig: go.Figure | None, caption: str) -> bool:
     return send_photo(img, caption=caption[:1024])
 
 
-def send_asset_report_to_telegram(asset: str, days: int, resolution: str, ratio_type: str, prediction_windows: tuple) -> tuple[int, list[str]]:
+def send_asset_report_to_telegram(asset: str, days: int, resolution: str, prediction_windows: tuple) -> tuple[int, list[str]]:
     """Every chart for one asset's tab, sent as a Telegram photo album
     preceded by a text summary. Returns (sent_count, failed_chart_names)."""
     spot = _spot_series(asset, days)
@@ -663,12 +892,18 @@ def send_asset_report_to_telegram(asset: str, days: int, resolution: str, ratio_
     charts = [
         (_scatter_vs_spot(_align_to_spot(cvol, spot), asset, f"CVOL vs Spot — {asset}", "CVOL (%)", cvol_est, cvol_src), f"{asset} - CVOL vs Spot"),
         (_scatter_vs_spot(_align_to_spot(svol, spot), asset, f"25Δ Skew vs Spot — {asset}", "25Δ Skew (%)", svol_est, svol_src), f"{asset} - 25Δ Skew vs Spot"),
-        (_area_ratio_spread("ETH", "BTC", days, ratio_type) if other in SV_ASSETS else None, "ETH/BTC Ratio"),
+        (_dvol_spread_chart(days, resolution) if other in SV_ASSETS else None, "ETH/BTC DVOL Spread"),
         (_candlestick_dvol(asset, start_ms, end_ms, resolution, svol), f"{asset} - DVol Snapshot"),
         (_scatter_vs_spot(_align_to_spot(rr, spot), asset, f"10Δ Risk Reversal vs Spot — {asset}", "10Δ RR (%)", rr_est, rr_src), f"{asset} - 10Δ RR vs Spot"),
         (_scatter_vs_spot(_align_to_spot(bf, spot), asset, f"10Δ Butterfly vs Spot — {asset}", "10Δ BF (%)", bf_est, bf_src), f"{asset} - 10Δ BF vs Spot"),
         (_chart_rolling_correlation(spot, cvol, asset), f"{asset} - Rolling Correlation"),
         (_chart_rolling_covariance(spot, cvol, asset), f"{asset} - Rolling Covariance"),
+        (_rv_iv_basis_chart(asset, days), f"{asset} - RV-IV Basis"),
+        (_rv_iv_basis_spread_chart(days) if other in SV_ASSETS else None, "ETH-BTC RV-IV Basis Spread"),
+        (_zscore_chart(_rolling_zscore(_dvol_spread_series(days, resolution)), "ETH-BTC DVOL Spread") if other in SV_ASSETS else None, "ETH-BTC DVOL Spread Z-Score"),
+        (_dvol_beta_chart(days, resolution) if other in SV_ASSETS else None, "ETH DVOL Beta to BTC DVOL"),
+        (_skew_spread_chart(days) if other in SV_ASSETS else None, "ETH-BTC 25Δ Skew Spread"),
+        (_zscore_chart(_rolling_zscore(_skew_spread_series(days)), "ETH-BTC 25Δ Skew Spread") if other in SV_ASSETS else None, "ETH-BTC Skew Spread Z-Score"),
         (_chart_vol_prediction(asset, prediction_windows), f"{asset} - Vol Prediction"),
     ]
     sent, failed = 0, []
@@ -680,13 +915,60 @@ def send_asset_report_to_telegram(asset: str, days: int, resolution: str, ratio_
     return sent, failed
 
 
-def send_all_reports_to_telegram(days: int, resolution: str, ratio_type: str, prediction_windows: tuple) -> tuple[int, list[str]]:
+def send_all_reports_to_telegram(days: int, resolution: str, prediction_windows: tuple) -> tuple[int, list[str]]:
     total_sent, total_failed = 0, []
     for asset in SV_ASSETS:
-        sent, failed = send_asset_report_to_telegram(asset, days, resolution, ratio_type, prediction_windows)
+        sent, failed = send_asset_report_to_telegram(asset, days, resolution, prediction_windows)
         total_sent += sent
         total_failed.extend(failed)
     return total_sent, total_failed
+
+
+# ============================================================================
+# DVOL SPREAD ALERT
+# ============================================================================
+
+def _load_alert_state() -> dict:
+    try:
+        return json.loads(ALERT_STATE_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _save_alert_state(state: dict) -> None:
+    try:
+        ALERT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ALERT_STATE_PATH.write_text(json.dumps(state))
+    except Exception:
+        pass
+
+
+def _check_dvol_spread_alert(z: float, sigma_threshold: float, spread_now: float) -> bool:
+    """Send (and dedupe) a Telegram alert when the DVOL spread z-score
+    crosses +/-sigma_threshold. Dedup state persists to disk (data/
+    dvol_spread_alert_state.json) so a breach fires once per regime, not on
+    every rerun/page load while it stays breached. Returns True if a new
+    alert was sent."""
+    if not np.isfinite(z):
+        return False
+    direction = "high" if z >= sigma_threshold else ("low" if z <= -sigma_threshold else "none")
+    state = _load_alert_state()
+    if direction == "none":
+        if state.get("direction") != "none":
+            _save_alert_state({"direction": "none", "z": z, "ts": datetime.now(timezone.utc).isoformat()})
+        return False
+    if state.get("direction") == direction:
+        return False
+    msg = (
+        f"🔔 <b>ETH-BTC DVOL Spread Alert</b>\n\n"
+        f"Spread: {spread_now:+.2f} pts\n"
+        f"Z-score ({ZSCORE_WINDOW}-pt): {z:+.2f} (threshold ±{sigma_threshold:.2f})\n"
+        f"Regime: {'ETH vol rich vs BTC' if direction == 'high' else 'ETH vol cheap vs BTC'}"
+    )
+    if send_message(msg):
+        _save_alert_state({"direction": direction, "z": z, "ts": datetime.now(timezone.utc).isoformat()})
+        return True
+    return False
 
 
 # ============================================================================
@@ -740,7 +1022,7 @@ def main() -> None:
 
     st.markdown("---")
 
-    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+    col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         range_label = st.selectbox("Date range", list(DATE_RANGE_PRESETS.keys()), index=2)
         days = DATE_RANGE_PRESETS[range_label]
@@ -748,8 +1030,6 @@ def main() -> None:
         interval_label = st.selectbox("DVol candle interval", list(RESOLUTION_MAP.keys()), index=3)
         resolution = RESOLUTION_MAP[interval_label]
     with col3:
-        ratio_type = st.radio("ETH/BTC chart", ["Ratio", "Spread"], horizontal=True)
-    with col4:
         st.caption(f"📅 Last updated: {datetime.now():%Y-%m-%d %H:%M:%S}")
     prediction_windows = _prediction_windows_for_lookback(days)
 
@@ -758,7 +1038,7 @@ def main() -> None:
     tabs = st.tabs([ASSET_NAMES.get(a, a) for a in SV_ASSETS])
     for tab, asset in zip(tabs, SV_ASSETS):
         with tab:
-            render_asset_tab(asset, days, resolution, ratio_type, prediction_windows)
+            render_asset_tab(asset, days, resolution, prediction_windows)
 
     with st.sidebar:
         cache_lib.render_refresh_button(help="Clear cache and refetch price/vol data from Deribit.")
@@ -771,7 +1051,7 @@ def main() -> None:
         else:
             if st.button("📤 Send All Reports to Telegram", width="stretch", type="primary", key="sv_telegram_all"):
                 with st.spinner("Generating and sending all reports to Telegram..."):
-                    sent, failed = send_all_reports_to_telegram(days, resolution, ratio_type, prediction_windows)
+                    sent, failed = send_all_reports_to_telegram(days, resolution, prediction_windows)
                 if failed:
                     st.warning(f"Sent {sent} chart(s). Failed: {', '.join(failed)}")
                 else:
@@ -782,11 +1062,44 @@ def main() -> None:
                 with col:
                     if st.button(asset, width="stretch", key=f"sv_telegram_{asset}"):
                         with st.spinner(f"Sending {asset} report..."):
-                            sent, failed = send_asset_report_to_telegram(asset, days, resolution, ratio_type, prediction_windows)
+                            sent, failed = send_asset_report_to_telegram(asset, days, resolution, prediction_windows)
                         if failed:
                             st.warning(f"Sent {sent} chart(s). Failed: {', '.join(failed)}")
                         else:
                             st.success(f"Sent {sent} chart(s) to Telegram.")
+
+        st.markdown("---")
+        st.subheader("🔔 DVOL Spread Alert")
+        spread_series = _dvol_spread_series(days, resolution)
+        z_series = _rolling_zscore(spread_series)
+        if z_series.empty:
+            st.caption("Not enough DVOL history yet for a stable z-score.")
+        else:
+            current_z = float(z_series.iloc[-1])
+            current_spread = float(spread_series.iloc[-1])
+            pct = _percentile_rank(spread_series)
+            pct_txt = f" · {pct:.0f}th %ile" if pct is not None else ""
+            st.caption(f"Current: {current_spread:+.2f} pts · z={current_z:+.2f}{pct_txt}")
+            sigma_threshold = st.number_input("Alert threshold (|z| ≥)", min_value=0.5, max_value=4.0, value=1.5, step=0.25, key="sv_alert_sigma")
+            auto_alert = st.checkbox(
+                "Auto-send Telegram alert on breach", value=False, key="sv_alert_auto",
+                help="Checked on every page load/refresh; fires once per regime change, deduped via data/dvol_spread_alert_state.json.",
+            )
+            if not is_configured():
+                st.warning("Telegram not configured — set bot_token and chat_id (see lib/telegram.py).")
+            else:
+                if auto_alert and _check_dvol_spread_alert(current_z, sigma_threshold, current_spread):
+                    st.success("Threshold breached — alert sent to Telegram.")
+                if st.button("Send Alert Now (manual)", key="sv_alert_manual", width="stretch"):
+                    msg = (
+                        f"🔔 <b>ETH-BTC DVOL Spread Alert (manual)</b>\n\n"
+                        f"Spread: {current_spread:+.2f} pts\n"
+                        f"Z-score ({ZSCORE_WINDOW}-pt): {current_z:+.2f}"
+                    )
+                    if send_message(msg):
+                        st.success("Alert sent.")
+                    else:
+                        st.warning("Send failed — check Telegram config.")
 
 
 try:

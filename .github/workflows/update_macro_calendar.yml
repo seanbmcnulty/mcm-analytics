@@ -1,0 +1,53 @@
+name: Update macro events calendar
+
+# Weekly is plenty: FOMC decisions happen roughly every six weeks and
+# CPI/NFP once a month each, so nothing is time-sensitive within the app.
+# Runs against main directly (unlike record_snapshots.yml's snapshots
+# branch) because data/macro_events_calendar.csv is a normal tracked file
+# that pages/10_Macro_Event_Impact.py reads straight off the checked-out
+# repo, not over HTTPS from a data-mirror branch.
+
+on:
+  schedule:
+    - cron: '0 6 * * 6'   # Saturdays 06:00 UTC, well after Friday's NFP release
+  workflow_dispatch: {}    # allow manual "Run workflow" from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-macro-calendar
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check requests
+
+      - name: Update calendar
+        run: python tools/build_macro_calendar.py
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "mcm-macro-calendar-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/macro_events_calendar.csv
+          if git diff --cached --quiet; then
+            echo "No new macro events; nothing to commit."
+            exit 0
+          fi
+          git commit -m "macro calendar: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git push origin HEAD:refs/heads/main

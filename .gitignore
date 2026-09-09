@@ -28,6 +28,7 @@ Thumbs.db
 
 # Data (generated)
 data/snapshots/
+data/dvol_spread_alert_state.json
 
 # Secrets
 secrets.toml
