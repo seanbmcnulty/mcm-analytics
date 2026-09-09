@@ -70,7 +70,7 @@ st.set_page_config(page_title="Macro Event Impact", page_icon="📅", layout="wi
 
 CSV_PATH = Path(__file__).parent.parent / "data" / "macro_events_calendar.csv"
 CHART_HEIGHT = 420
-DEFAULT_RECENT_EVENTS = 15  # default multiselect selection: most recent N matching events
+DEFAULT_RECENT_EVENTS = 5  # default value of the "Number of recent events" input
 
 SPIDER_HOURS_BEFORE_OPTIONS = [6, 12, 24, 48]
 SPIDER_HOURS_AFTER_OPTIONS = [24, 48, 72, 168]
@@ -486,6 +486,19 @@ def build_impact_table_cached(asset: str, event_keys: tuple[str, ...], timeframe
     return macro.build_impact_table(events, asset, timeframe, window_minutes, window_before_h, window_after_h)
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def scenario_impact_cached(asset: str, event_type: str, timeframe: str,
+                            window_minutes: int, window_before_h: int, window_after_h: int) -> pd.DataFrame:
+    """Impact table for EVERY past event of a single type -- deliberately
+    independent of the recent-events picker above (which may show as few as
+    1) so the scenario forecast's surprise-std/regression fit has as many
+    historical samples as the calendar actually holds."""
+    events = _candidate_events([event_type])
+    if events.empty:
+        return pd.DataFrame()
+    return macro.build_impact_table(events, asset, timeframe, window_minutes, window_before_h, window_after_h)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_ohlc_by_event_cached(asset: str, event_keys: tuple[str, ...], window_before_h: int, window_after_h: int) -> dict:
     """Per-event OHLC for the spider/Bloomberg-reaction charts, keyed by
@@ -507,8 +520,75 @@ def fetch_ohlc_by_event_cached(asset: str, event_keys: tuple[str, ...], window_b
 # RENDER
 # ============================================================================
 
+_SCENARIO_COLORS = {
+    "Base case (in line)": "#8f9aa8",
+    "Small beat": "#8bc98b",
+    "Small miss": "#e0a75e",
+    "Large beat": "#2ecc71",
+    "Large miss": "#e74c3c",
+}
+
+
+def _fmt_scenario_value(event_type: str, value: float) -> str:
+    if event_type == "NFP":
+        return f"{value:+,.0f}K"
+    return f"{value:.2f}%"
+
+
+def render_scenario_forecast(asset: str, event_type: str, upcoming_row: pd.Series, timeframe: str,
+                              window_minutes: int, window_before_h: int, window_after_h: int) -> None:
+    """5-scenario forward table for the next scheduled ``event_type`` release
+    -- see lib/macro.py:build_scenario_forecast for the full methodology and
+    its caveats (anchor = last actual as a consensus proxy, small/large =
+    +-0.75/2.0 sigma of this event type's own historical surprise, $ move =
+    a historical linear fit of price reaction vs. surprise size)."""
+    hist_events = _candidate_events([event_type])
+    if hist_events.empty:
+        return
+    last_actual_row = hist_events.sort_values("date", ascending=False).iloc[0]
+    anchor_value = last_actual_row.get("actual_num")
+    if pd.isna(anchor_value):
+        return
+
+    with st.spinner(f"Building {event_type} scenario forecast for {asset}…"):
+        hist_impact = scenario_impact_cached(asset, event_type, timeframe, window_minutes, window_before_h, window_after_h)
+        spot = macro.current_spot(asset)
+        forecast = macro.build_scenario_forecast(hist_impact, float(anchor_value))
+
+    release_date = upcoming_row["date"]
+    release_date = release_date.strftime("%Y-%m-%d") if hasattr(release_date, "strftime") else str(release_date)
+
+    if forecast is None or spot is None:
+        reason = "not enough historical surprise variance for this event type yet" if spot is not None else "couldn't fetch a live spot price"
+        st.caption(f"**{event_type}** (next release {release_date}): scenario forecast unavailable — {reason}.")
+        return
+
+    st.markdown(f"**{event_type}** — next release **{release_date}** · "
+                f"anchor {_fmt_scenario_value(event_type, anchor_value)} (last actual, proxy for consensus)")
+    cols = st.columns(5)
+    for col, (_, r) in zip(cols, forecast.iterrows()):
+        move_usd = r["expected_move_pct"] / 100.0 * spot
+        color = _SCENARIO_COLORS.get(r["scenario"], "#8f9aa8")
+        arrow = "▲" if r["expected_move_pct"] > 0.01 else ("▼" if r["expected_move_pct"] < -0.01 else "▬")
+        with col:
+            st.markdown(f"""
+<div style="border-top:4px solid {color}; padding:10px 10px 12px; border-radius:6px;
+            background:rgba(127,127,127,0.07); text-align:center;">
+  <div style="font-size:0.74em; opacity:0.75; margin-bottom:6px; white-space:nowrap;">{r['scenario']}</div>
+  <div style="font-size:1.2em; font-weight:700;">{_fmt_scenario_value(event_type, r['forecast_value'])}</div>
+  <div style="font-size:0.95em; margin-top:8px; color:{color}; font-weight:600;">{arrow} ${abs(move_usd):,.0f}</div>
+  <div style="font-size:0.72em; opacity:0.6; margin-top:2px;">{r['expected_move_pct']:+.2f}% {asset}</div>
+</div>
+""", unsafe_allow_html=True)
+    n = int(forecast.attrs.get("n_samples", 0))
+    st.caption(f"Scenario sizing = ±0.75σ / ±2σ of {event_type}'s own historical surprise (n={n} past releases); "
+               f"$ move = historical linear fit of {asset} {timeframe} reaction vs. surprise size, "
+               f"applied to the current spot (${spot:,.0f}). A historically-grounded range, not a prediction.")
+
+
 def render_asset_tab(asset: str, event_keys: tuple[str, ...], event_label: str, timeframe: str,
-                      spider_pre_h: int, spider_post_h: int, bloomberg_span: str) -> pd.DataFrame:
+                      spider_pre_h: int, spider_post_h: int, bloomberg_span: str,
+                      next_by_type: dict[str, pd.Series] | None = None) -> pd.DataFrame:
     window_minutes = macro.TIMEFRAME_MINUTES[timeframe]
     bloomberg_minutes = BLOOMBERG_SPAN_MINUTES[bloomberg_span]
     window_before_h = max(4, spider_pre_h)
@@ -536,6 +616,12 @@ def render_asset_tab(asset: str, event_keys: tuple[str, ...], event_label: str, 
     c5.metric("Expectation alignment", f"{kpis.get('aligned_pct', np.nan):.1f}%")
     c6.metric("Up-first paths", f"{kpis.get('up_first_pct', np.nan):.1f}%")
     c7.metric("Typical first touch", kpis.get("first_touch", "—"))
+
+    if next_by_type:
+        st.markdown("---")
+        st.subheader("🎯 Scenario Forecast — Next Release")
+        for et, row in next_by_type.items():
+            render_scenario_forecast(asset, et, row, timeframe, window_minutes, window_before_h, window_after_h)
 
     st.markdown("---")
 
@@ -752,9 +838,8 @@ def main() -> None:
           release to the chosen span, plus the mean response ± 1 stdev. **Path comparison
           (spider)** — the same idea over a longer, symmetric pre/post window around T=0.
 
-        Use **Events to include** below to pick exactly which past releases go into every
-        chart and the impact table — it defaults to the most recent matches, but any
-        subset can be selected or deselected.
+        **Number of recent events** below sets how many of the most recent past
+        releases (matching the type filter) go into every chart and the impact table.
 
         Release times are recovered via a fixed per-event-type ET lookup (DST-aware,
         `lib/macro.py:RELEASE_TIME_ET`) since the bundled calendar has no `time` column —
@@ -785,18 +870,13 @@ def main() -> None:
     if candidates.empty:
         st.warning("No past events match the selected event type(s).")
         return
-    all_labels = [_event_label(r["_date_str"], r["event"]) for _, r in candidates.iterrows()]
-    label_to_key = {_event_label(r["_date_str"], r["event"]): r["_key"] for _, r in candidates.iterrows()}
-    default_labels = all_labels[:DEFAULT_RECENT_EVENTS]
-    picked_labels = st.multiselect(
-        f"Events to include ({len(all_labels)} match the type filter above — most recent first)",
-        all_labels, default=default_labels,
-        help="Uncheck any release to drop it from every chart and the impact table below.",
+    n_recent = st.number_input(
+        f"Number of recent events ({len(candidates)} match the type filter above)",
+        min_value=1, max_value=len(candidates), value=min(DEFAULT_RECENT_EVENTS, len(candidates)), step=1,
+        help="Pulls in exactly this many of the most recent matching releases — most recent first.",
     )
-    if not picked_labels:
-        st.warning("Select at least one event.")
-        return
-    event_keys = tuple(sorted(label_to_key[lb] for lb in picked_labels))
+    picked = candidates.head(int(n_recent))
+    event_keys = tuple(sorted(picked["_key"].tolist()))
     event_label = event_types[0] if len(event_types) == 1 else "Selected"
 
     with st.expander("Path comparison / Bloomberg reaction settings", expanded=False):
@@ -808,16 +888,19 @@ def main() -> None:
         with s3:
             bloomberg_span = st.selectbox("Bloomberg reaction span", list(BLOOMBERG_SPAN_MINUTES.keys()), index=3)
 
-    st.caption(f"📅 Last updated: {datetime.now():%Y-%m-%d %H:%M:%S} — {len(picked_labels)} event(s) selected")
+    st.caption(f"📅 Last updated: {datetime.now():%Y-%m-%d %H:%M:%S} — {len(picked)} event(s) selected")
     st.markdown("---")
+
+    now_utc = pd.Timestamp.now(tz=UTC)
+    future = cal[(cal["event"].isin(event_types)) & (cal["release_time_utc"] > now_utc)].sort_values("date")
+    # nearest upcoming row per event type, for the per-asset scenario forecast below
+    next_by_type = {et: g.iloc[0] for et, g in future.groupby("event") if not g.empty}
 
     tabs = st.tabs([ASSET_NAMES.get(a, a) for a in macro.MACRO_ASSETS])
     for tab, asset in zip(tabs, macro.MACRO_ASSETS):
         with tab:
-            render_asset_tab(asset, event_keys, event_label, timeframe, spider_pre_h, spider_post_h, bloomberg_span)
+            render_asset_tab(asset, event_keys, event_label, timeframe, spider_pre_h, spider_post_h, bloomberg_span, next_by_type)
 
-    now_utc = pd.Timestamp.now(tz=UTC)
-    future = cal[(cal["event"].isin(event_types)) & (cal["release_time_utc"] > now_utc)]
     if not future.empty:
         st.markdown("---")
         st.subheader("Upcoming events")

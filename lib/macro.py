@@ -212,7 +212,14 @@ def fetch_event_dvol(asset: str, event_ts_ms: int, window_before_h: int, window_
         return None
     start_ms = event_ts_ms - (window_before_h + 1) * 3600 * 1000
     end_ms = event_ts_ms + window_after_h * 3600 * 1000
-    df = deribit.get_dvol(cfg["deribit_ccy"], resolution="60", start_ms=start_ms, end_ms=end_ms)
+    # NOTE: Deribit's get_volatility_index_data resolution enum is in SECONDS
+    # (1, 60, 3600, 43200, 1D) -- "60" is 1-minute candles, not hourly. Over
+    # this function's typical multi-day window that requested thousands of
+    # 1-minute candles per call, which silently failed (get_dvol/._request
+    # returns None on any non-200), producing zero DVOL data for every event
+    # (both the Implied Move and DVOL Crush charts). "3600" is the real
+    # hourly resolution this function's docstring always intended.
+    df = deribit.get_dvol(cfg["deribit_ccy"], resolution="3600", start_ms=start_ms, end_ms=end_ms)
     if df is None or df.empty:
         return None
     df = df.copy()
@@ -499,3 +506,103 @@ def expectations_summary_table(df: pd.DataFrame) -> pd.DataFrame:
              aligned_pct=("response_alignment", lambda s: (s == "Aligned").mean() * 100))
         .sort_values("events", ascending=False)
     )
+
+
+# ---------------------------------------------------------------------------
+# Scenario forecast (5-scenario forward table for the next scheduled event)
+# ---------------------------------------------------------------------------
+#
+# Methodology, and its honest limits:
+#   - "Anchor" (the base-case number) is the event type's own last actual
+#     print, not a real forward consensus -- this app has no free forward
+#     consensus feed (same known limitation documented in
+#     tools/build_macro_calendar.py and the CSV backfill: consensus for CPI/
+#     NFP already falls back to prior-actual as its weakest tier). For FOMC
+#     specifically this is also the conventional "no change priced in"
+#     assumption absent other information.
+#   - "Small"/"large" surprise sizes are +-0.75 / +-2.0 standard deviations
+#     of *this event type's own* historical (actual - consensus) surprise
+#     series -- not arbitrary round numbers, and not shared across event
+#     types.
+#   - The expected price move per scenario comes from a simple linear fit
+#     (np.polyfit, degree 1) of actual_move_pct against surprise across that
+#     event type's full history for the asset in question -- the same
+#     "surprise vs. reaction" relationship the existing Decision vs
+#     Expectations scatter chart already shows, just fit to a line instead
+#     of eyeballed. It is a small-sample linear approximation, not a model;
+#     treat the output as a historically-grounded range, not a prediction.
+#   - FOMC surprise history in this file is close to degenerate: every FOMC
+#     row's consensus was set equal to its actual (see
+#     tools/build_macro_calendar.py's attach_consensus_and_prior and the
+#     original hand-backfill, both following the "fully priced in per CME
+#     FedWatch" convention already established here) -- so surprise_std
+#     collapses to 0 and build_scenario_forecast() returns None for FOMC.
+#     That is a data-availability gap (no real survey-median history to
+#     measure surprise against), surfaced as "not enough data" rather than
+#     silently fabricated variance.
+
+MIN_SCENARIO_SAMPLES = 6  # minimum historical (surprise, reaction) pairs before a fit is shown at all
+
+SCENARIO_DEFS = [
+    ("Base case (in line)", 0.0),
+    ("Small beat", 0.75),
+    ("Small miss", -0.75),
+    ("Large beat", 2.0),
+    ("Large miss", -2.0),
+]
+
+
+def current_spot(asset: str) -> float | None:
+    """Live index price for an asset's ASSET_CONFIG entry, used to convert a
+    scenario's expected % move into a $ amount."""
+    cfg = ASSET_CONFIG.get(asset)
+    if not cfg:
+        return None
+    return deribit.get_index_price(cfg["index"])
+
+
+def build_scenario_forecast(hist_impact: pd.DataFrame, anchor_value: float | None) -> pd.DataFrame | None:
+    """5-row scenario table (see module-level note above for the full
+    methodology): base / small beat / small miss / large beat / large miss,
+    each with a plausible printed number (``forecast_value``) and an
+    expected price reaction (``expected_move_pct``), both derived from
+    ``hist_impact`` -- this event type's own full impact-table history for
+    one asset (build_impact_table() output, NOT filtered down to whatever
+    subset of events the recent-events picker happens to show, so the fit
+    has as many samples as the calendar actually has).
+
+    Returns None if there's no anchor, too few historical (surprise,
+    reaction) pairs, or the historical surprise series has no variance to
+    scale scenarios against (see FOMC note above).
+    """
+    if anchor_value is None or not np.isfinite(anchor_value):
+        return None
+    if hist_impact is None or hist_impact.empty:
+        return None
+    valid = hist_impact.dropna(subset=["surprise", "actual_move_pct"])
+    if len(valid) < MIN_SCENARIO_SAMPLES:
+        return None
+    surprise_std = float(valid["surprise"].std(ddof=1))
+    if not np.isfinite(surprise_std) or surprise_std <= 0:
+        return None
+
+    x = valid["surprise"].to_numpy(dtype=float)
+    y = valid["actual_move_pct"].to_numpy(dtype=float)
+    slope, intercept = np.polyfit(x, y, 1)
+
+    rows = []
+    for label, sigma in SCENARIO_DEFS:
+        surprise = sigma * surprise_std
+        rows.append({
+            "scenario": label,
+            "surprise_sigma": sigma,
+            "forecast_value": anchor_value + surprise,
+            "expected_move_pct": float(intercept + slope * surprise),
+        })
+    df = pd.DataFrame(rows)
+    df.attrs["surprise_std"] = surprise_std
+    df.attrs["slope"] = float(slope)
+    df.attrs["intercept"] = float(intercept)
+    df.attrs["n_samples"] = int(len(valid))
+    df.attrs["anchor_value"] = float(anchor_value)
+    return df

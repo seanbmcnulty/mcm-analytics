@@ -74,6 +74,22 @@ EVENT_CPI = "CPI YoY"
 EVENT_NFP = "NFP"
 FIELDS = ["date", "event", "actual", "consensus", "prior", "currency"]
 
+# Scheduled (not-yet-occurred) FOMC decision/announcement dates -- the 2nd
+# day of each 2-day meeting, per federalreserve.gov/monetarypolicy/
+# fomccalendars.htm. Unlike CPI/NFP (see bls_schedule() below, which scrapes
+# BLS's own full-year schedule table), there is no scrapable *future*-dated
+# FOMC statement URL to discover these from (collect_fomc() only finds
+# meetings that already happened, by searching for press-release links that
+# only exist after the fact) -- so this list is hand-maintained. The Fed
+# itself calls meetings this far out "tentative until confirmed at the
+# meeting immediately preceding it," so re-check this list once a year
+# against the calendar page above.
+FOMC_UPCOMING = [
+    "2026-09-16",
+    "2026-10-28",
+    "2026-12-09",
+]
+
 _FRACTION = r"\d+(?:-\d+/\d+)?|\d+/\d+"
 _DECISION_RE = re.compile(
     r"(?:maintain|lower|rais|keep|increas|reduc)\w*\s+the\s+target\s+range\s+for\s+the\s+federal\s+funds\s+rate",
@@ -277,6 +293,49 @@ def collect_bls(start_year: int, end_year: int) -> List[dict]:
     return rows
 
 
+def collect_upcoming(start_year: int, end_year: int, max_per_event: int = 4) -> List[dict]:
+    """Scheduled-but-not-yet-occurred FOMC/CPI/NFP rows, so pages/10's
+    "Upcoming events" panel (which just filters the CSV for
+    release_time_utc > now) has real forward dates to show -- it has no
+    other data source. actual/consensus/prior are left blank; the next
+    normal run of this script fills them in for real once BLS/the Fed
+    publish the actual, the same as any other row (see main()).
+
+    Capped at ``max_per_event`` per event type so the file doesn't fill up
+    with placeholders a year in advance -- these are refreshed (dropped and
+    recomputed) on every run, they are never treated as accumulated history.
+    """
+    today = date.today()
+    rows: List[dict] = []
+
+    for d in FOMC_UPCOMING:
+        dt = datetime.strptime(d, "%Y-%m-%d").date()
+        if dt > today:
+            rows.append({"date": d, "event": EVENT_FOMC})
+
+    # bls_schedule() already returns the *full* published year schedule
+    # (collect_bls() above just throws away everything <= today) -- reuse it
+    # rather than re-scraping.
+    for year in range(start_year, end_year + 1):
+        for when, name in bls_schedule(year):
+            if when <= today:
+                continue
+            event = EVENT_CPI if name == "Consumer Price Index" else EVENT_NFP
+            rows.append({"date": when.isoformat(), "event": event})
+
+    by_event: Dict[str, List[dict]] = {}
+    for r in sorted(rows, key=lambda r: r["date"]):
+        by_event.setdefault(r["event"], []).append(r)
+    capped = [r for rs in by_event.values() for r in rs[:max_per_event]]
+
+    for r in capped:
+        r["actual"] = ""
+        r["consensus"] = ""
+        r["prior"] = ""
+        r["currency"] = "USD"
+    return capped
+
+
 # ---------------------------------------------------------------------------
 # Assembly
 # ---------------------------------------------------------------------------
@@ -315,6 +374,8 @@ def main() -> int:
     parser.add_argument("--csv", type=Path, default=DEFAULT_CSV)
     parser.add_argument("--start", type=int, default=2024, help="first calendar year to scan (kept small; only rows after the CSV's last date are ever written)")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-upcoming", action="store_true", help="skip refreshing the forward-looking placeholder rows (actual/consensus blank) that pages/10's Upcoming events panel reads")
+    parser.add_argument("--upcoming-per-event", type=int, default=4, help="how many future placeholder rows to keep per event type")
     args = parser.parse_args()
 
     existing = load_existing(args.csv)
@@ -322,9 +383,20 @@ def main() -> int:
         print(f"error: {args.csv} has no existing rows to anchor off; run the full exodus-style backfill first", file=sys.stderr)
         return 1
 
-    last_date = max(r["date"] for r in existing)
+    # Placeholder rows (blank actual) from a previous run's upcoming-events
+    # pass carry no history worth keeping -- drop them and recompute fresh
+    # below, anchoring the real incremental-append logic only off rows that
+    # have a real actual (otherwise a future-dated placeholder would become
+    # `last_date` and permanently block real actuals older than it from ever
+    # being appended).
+    actual_existing = [r for r in existing if (r.get("actual") or "").strip() != ""]
+    if not actual_existing:
+        print(f"error: {args.csv} has no rows with an actual value to anchor off", file=sys.stderr)
+        return 1
+
+    last_date = max(r["date"] for r in actual_existing)
     last_actual: Dict[str, float] = {}
-    for r in sorted(existing, key=lambda r: r["date"]):
+    for r in sorted(actual_existing, key=lambda r: r["date"]):
         try:
             last_actual[r["event"]] = float(r["actual"])
         except (KeyError, ValueError):
@@ -338,18 +410,29 @@ def main() -> int:
 
     all_rows = fomc_rows + bls_rows
     new_rows = [r for r in all_rows if r["date"] > last_date]
-    if not new_rows:
-        print(f"no new rows after {last_date}; nothing to do")
+    attach_consensus_and_prior(new_rows, last_actual)
+    new_rows_out = [{k: r.get(k, "") for k in FIELDS} for r in new_rows]
+
+    upcoming_rows: List[dict] = []
+    if not args.no_upcoming:
+        upcoming_rows = collect_upcoming(args.start, today_year + 1, max_per_event=args.upcoming_per_event)
+    upcoming_rows_out = [{k: r.get(k, "") for k in FIELDS} for r in upcoming_rows]
+
+    if not new_rows and not upcoming_rows:
+        print(f"no new rows after {last_date} and no upcoming rows to refresh; nothing to do")
         return 0
 
-    attach_consensus_and_prior(new_rows, last_actual)
-
-    combined = existing + [{k: r.get(k, "") for k in FIELDS} for r in new_rows]
+    combined = actual_existing + new_rows_out + upcoming_rows_out
     combined.sort(key=lambda r: (r["date"], r["event"]))
 
-    print(f"{len(new_rows)} new row(s) after {last_date}:", file=sys.stderr)
-    for r in sorted(new_rows, key=lambda r: r["date"]):
-        print(f"  {r['date']} {r['event']:20s} actual={r['actual']} consensus={r['consensus']} prior={r['prior']}", file=sys.stderr)
+    if new_rows:
+        print(f"{len(new_rows)} new actual row(s) after {last_date}:", file=sys.stderr)
+        for r in sorted(new_rows, key=lambda r: r["date"]):
+            print(f"  {r['date']} {r['event']:20s} actual={r['actual']} consensus={r['consensus']} prior={r['prior']}", file=sys.stderr)
+    if upcoming_rows:
+        print(f"{len(upcoming_rows)} upcoming placeholder row(s):", file=sys.stderr)
+        for r in sorted(upcoming_rows, key=lambda r: r["date"]):
+            print(f"  {r['date']} {r['event']}", file=sys.stderr)
 
     if args.dry_run:
         print("dry run - not writing", file=sys.stderr)
