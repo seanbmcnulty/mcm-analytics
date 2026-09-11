@@ -135,28 +135,38 @@ def chart_scatter_z_vs_actual(df: pd.DataFrame, timeframe: str) -> go.Figure:
     return fig
 
 
-def chart_bar_actual_vs_implied(df: pd.DataFrame, timeframe: str) -> go.Figure:
+def chart_bar_actual_vs_implied(df: pd.DataFrame) -> go.Figure:
+    """Actual vs. DVOL-implied move from release to the next Deribit daily
+    options expiry (08:00 UTC) -- independent of the page's selected
+    reaction ``timeframe``, since a same-day/next-day expiry is the
+    horizon that's actually tradeable around these events."""
     if df.empty:
-        return _empty_fig(f"Actual vs Implied Move ({timeframe})", "No events in the selected range")
+        return _empty_fig("Actual vs Implied Move (to next-day expiry)", "No events in the selected range")
     d = df.sort_values("date")
-    actual_abs = d["actual_move_pct"].abs()
-    implied_abs = d["implied_move_pct"].abs()
+    actual_abs = d["actual_move_pct_expiry"].abs()
+    implied_abs = d["implied_move_pct_expiry"].abs()
     comparable = actual_abs.notna() & implied_abs.notna()
     outperform = comparable & (actual_abs > implied_abs)
     actual_colors = np.where(outperform, "#2ecc71", np.where(comparable, "#e74c3c", "#7f8c8d"))
+    window_h = d["expiry_window_hours"]
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=d["date"], y=d["implied_move_pct"], name="Implied Move %", marker_color="lightgray",
-                          hovertemplate="Date %{x}<br>Implied move %{y:.2f}%<extra></extra>"))
-    fig.add_trace(go.Bar(x=d["date"], y=d["actual_move_pct"], name="Actual Move %", marker_color=actual_colors,
-                          hovertemplate="Date %{x}<br>Actual move %{y:.2f}%<extra></extra>"))
-    fig.update_layout(**PLOTLY_LAYOUT, height=CHART_HEIGHT, title=f"Actual vs Implied Move ({timeframe})",
+    fig.add_trace(go.Bar(x=d["date"], y=d["implied_move_pct_expiry"], name="Implied Move %", marker_color="lightgray",
+                          customdata=window_h,
+                          hovertemplate="Date %{x}<br>Implied move %{y:.2f}%<br>Window %{customdata:.1f}h to next expiry<extra></extra>"))
+    fig.add_trace(go.Bar(x=d["date"], y=d["actual_move_pct_expiry"], name="Actual Move %", marker_color=actual_colors,
+                          customdata=window_h,
+                          hovertemplate="Date %{x}<br>Actual move %{y:.2f}%<br>Window %{customdata:.1f}h to next expiry<extra></extra>"))
+    fig.update_layout(**PLOTLY_LAYOUT, height=CHART_HEIGHT, title="Actual vs Implied Move (to next-day expiry)",
                        barmode="group", xaxis_title="Date", yaxis_title="% Move")
     return fig
 
 
 def chart_dvol_crush(df: pd.DataFrame) -> go.Figure:
     """Mean DVOL crush % at each horizon — replaces exodus's ATM 1W/1M term
-    structure chart (see module docstring)."""
+    structure chart (see module docstring). Bars are plotted as the
+    negative of the crush % so a typical crush (vol falling) reads as a
+    downward bar; the underlying signed value (positive = vol fell) is
+    unchanged and shown in the hover."""
     cols = {"1h": "dvol_crush_1h", "4h": "dvol_crush_4h", "24h": "dvol_crush_24h",
             "48h": "dvol_crush_48h", "72h": "dvol_crush_72h"}
     means, counts = [], []
@@ -166,11 +176,13 @@ def chart_dvol_crush(df: pd.DataFrame) -> go.Figure:
         counts.append(int(len(v)))
     if all(pd.isna(m) for m in means):
         return _empty_fig("Mean DVOL Crush % by Horizon (vs T−1h)", "No DVOL data for these events (SOL/HYPE have no DVOL index)")
-    fig = go.Figure(go.Bar(x=list(cols.keys()), y=means, marker_color="coral", customdata=np.column_stack([counts]),
-                            hovertemplate="Horizon %{x}<br>Mean DVOL crush %{y:.2f}%<br>Events %{customdata[0]}<extra></extra>"))
+    plot_vals = [-m if pd.notna(m) else m for m in means]
+    fig = go.Figure(go.Bar(x=list(cols.keys()), y=plot_vals, marker_color="coral",
+                            customdata=np.column_stack([means, counts]),
+                            hovertemplate="Horizon %{x}<br>Mean DVOL crush %{customdata[0]:.2f}%<br>Events %{customdata[1]}<extra></extra>"))
     fig.add_hline(y=0, line_dash="dot", line_color="gray")
     fig.update_layout(**PLOTLY_LAYOUT, height=CHART_HEIGHT, title="Mean DVOL Crush % by Horizon (vs T−1h baseline)",
-                       xaxis_title="Hours after release", yaxis_title="DVOL Crush % (positive = vol fell)")
+                       xaxis_title="Hours after release", yaxis_title="DVOL Crush % (down = vol fell)")
     return fig
 
 
@@ -657,9 +669,10 @@ def render_asset_tab(asset: str, event_keys: tuple[str, ...], event_label: str, 
                    "Points far from the OLS line are outlier reactions.")
         _show(chart_scatter_z_vs_actual(impact, timeframe), key=f"{asset}_scatter_z")
     with col2:
-        st.caption("Actual vs Implied Move: green bars beat the implied move (from DVOL); "
-                   "red bars fell short of it.")
-        _show(chart_bar_actual_vs_implied(impact, timeframe), key=f"{asset}_bar_ai")
+        st.caption("Actual vs Implied Move: computed from release to the next Deribit daily options "
+                   "expiry (08:00 UTC), not the reaction timeframe above. Green bars beat the implied "
+                   "move (from DVOL); red bars fell short of it.")
+        _show(chart_bar_actual_vs_implied(impact), key=f"{asset}_bar_ai")
 
     st.subheader("DVOL Crush")
     st.caption("Mean % change in Deribit's DVOL index at each horizon after release, vs. a T−1h baseline. "
@@ -776,7 +789,7 @@ def send_asset_report_to_telegram(asset: str, event_keys: tuple[str, ...], event
         (chart_bloomberg_reaction(events, ohlc_by_event, bloomberg_minutes, bloomberg_span, event_label, asset), f"{asset} - Bloomberg Reaction"),
         (chart_event_spider(events, ohlc_by_event, spider_pre_h, spider_post_h), f"{asset} - Path Comparison"),
         (chart_scatter_z_vs_actual(impact, timeframe), f"{asset} - Z-Score vs Actual Move"),
-        (chart_bar_actual_vs_implied(impact, timeframe), f"{asset} - Actual vs Implied Move"),
+        (chart_bar_actual_vs_implied(impact), f"{asset} - Actual vs Implied Move"),
         (chart_dvol_crush(impact), f"{asset} - DVOL Crush"),
         (chart_asymmetry(impact), f"{asset} - Asymmetry"),
         (chart_distribution(impact), f"{asset} - Distribution"),

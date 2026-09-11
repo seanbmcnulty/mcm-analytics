@@ -798,21 +798,21 @@ def render_asset_tab(asset: str, days: int, resolution: str, prediction_windows:
 
     c3, c4 = st.columns(2)
     with c3:
+        _show(_scatter_vs_spot(_align_to_spot(rr, spot), asset, f"10Δ Risk Reversal vs Spot — {asset}", "10Δ RR (%)", rr_est, rr_src), f"{asset}_rr_spot")
+    with c4:
+        _show(_scatter_vs_spot(_align_to_spot(bf, spot), asset, f"10Δ Butterfly vs Spot — {asset}", "10Δ BF (%)", bf_est, bf_src), f"{asset}_bf_spot")
+
+    c5, c6 = st.columns(2)
+    with c5:
         if other in SV_ASSETS:
             _show(_dvol_spread_chart(days, resolution), f"{asset}_ethbtc_dvol_spread")
         else:
             st.info(f"Need {other} data (unavailable) to compute the ETH/BTC DVOL spread.")
-    with c4:
+    with c6:
         end_dt = datetime.now(timezone.utc)
         start_dt = end_dt - timedelta(days=days)
         start_ms, end_ms = int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
         _show(_candlestick_dvol(asset, start_ms, end_ms, resolution, svol), f"{asset}_dvol_candles")
-
-    c5, c6 = st.columns(2)
-    with c5:
-        _show(_scatter_vs_spot(_align_to_spot(rr, spot), asset, f"10Δ Risk Reversal vs Spot — {asset}", "10Δ RR (%)", rr_est, rr_src), f"{asset}_rr_spot")
-    with c6:
-        _show(_scatter_vs_spot(_align_to_spot(bf, spot), asset, f"10Δ Butterfly vs Spot — {asset}", "10Δ BF (%)", bf_est, bf_src), f"{asset}_bf_spot")
 
     c7, c8 = st.columns(2)
     with c7:
@@ -892,10 +892,10 @@ def send_asset_report_to_telegram(asset: str, days: int, resolution: str, predic
     charts = [
         (_scatter_vs_spot(_align_to_spot(cvol, spot), asset, f"CVOL vs Spot — {asset}", "CVOL (%)", cvol_est, cvol_src), f"{asset} - CVOL vs Spot"),
         (_scatter_vs_spot(_align_to_spot(svol, spot), asset, f"25Δ Skew vs Spot — {asset}", "25Δ Skew (%)", svol_est, svol_src), f"{asset} - 25Δ Skew vs Spot"),
-        (_dvol_spread_chart(days, resolution) if other in SV_ASSETS else None, "ETH/BTC DVOL Spread"),
-        (_candlestick_dvol(asset, start_ms, end_ms, resolution, svol), f"{asset} - DVol Snapshot"),
         (_scatter_vs_spot(_align_to_spot(rr, spot), asset, f"10Δ Risk Reversal vs Spot — {asset}", "10Δ RR (%)", rr_est, rr_src), f"{asset} - 10Δ RR vs Spot"),
         (_scatter_vs_spot(_align_to_spot(bf, spot), asset, f"10Δ Butterfly vs Spot — {asset}", "10Δ BF (%)", bf_est, bf_src), f"{asset} - 10Δ BF vs Spot"),
+        (_dvol_spread_chart(days, resolution) if other in SV_ASSETS else None, "ETH/BTC DVOL Spread"),
+        (_candlestick_dvol(asset, start_ms, end_ms, resolution, svol), f"{asset} - DVol Snapshot"),
         (_chart_rolling_correlation(spot, cvol, asset), f"{asset} - Rolling Correlation"),
         (_chart_rolling_covariance(spot, cvol, asset), f"{asset} - Rolling Covariance"),
         (_rv_iv_basis_chart(asset, days), f"{asset} - RV-IV Basis"),

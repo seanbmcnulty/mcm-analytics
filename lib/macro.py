@@ -77,6 +77,12 @@ TIMEFRAME_OPTIONS = ["1m", "5m", "15m", "1h", "4h", "24h"]
 TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "24h": 1440}
 MINUTES_PER_DAY = 24 * 60
 
+# Deribit's daily options expire at 08:00 UTC every day. The "Actual vs
+# Implied Move" chart compares realized vs. DVOL-implied move over the
+# window from release to this next daily expiry, not the user-selected
+# reaction ``timeframe`` -- see next_daily_expiry_utc() below.
+DERIBIT_DAILY_EXPIRY_UTC_HOUR = 8
+
 # Vol Crush horizons (hours post-release)
 VOL_CRUSH_HOURS = [1, 4, 24, 48, 72]
 
@@ -264,6 +270,43 @@ def compute_pct_changes(ohlc: pd.DataFrame | None, release_ts, windows_minutes: 
     return out
 
 
+def next_daily_expiry_utc(ts) -> pd.Timestamp:
+    """The next Deribit daily-options expiry (08:00 UTC) strictly after
+    ``ts``. All of this app's macro release times (08:30/14:00 ET) fall
+    after 08:00 UTC, so in practice this is always the *following*
+    calendar day's expiry, matching how the Actual vs Implied Move chart
+    is described."""
+    ts = pd.Timestamp(ts)
+    ts = ts.tz_localize(UTC) if ts.tzinfo is None else ts.tz_convert(UTC)
+    expiry = ts.normalize() + timedelta(hours=DERIBIT_DAILY_EXPIRY_UTC_HOUR)
+    if expiry <= ts:
+        expiry += timedelta(days=1)
+    return expiry
+
+
+def compute_pct_change_to_ts(ohlc: pd.DataFrame | None, release_ts, end_ts) -> float:
+    """Price % change from T0 close to the close at/just before an arbitrary
+    absolute ``end_ts`` -- same lookup logic as compute_pct_changes, but for
+    a single target timestamp (e.g. the next daily options expiry) rather
+    than a fixed T0+minutes window."""
+    if ohlc is None or ohlc.empty:
+        return np.nan
+    idx = ohlc.index
+    release_cmp = _align_ts(idx, release_ts)
+    pre = np.asarray(idx <= release_cmp)
+    if not pre.any():
+        return np.nan
+    price_t0 = float(ohlc.iloc[pre].iloc[-1]["close"])
+    if price_t0 <= 0:
+        return np.nan
+    end_cmp = _align_ts(idx, end_ts)
+    pos = idx.searchsorted(end_cmp, side="left")
+    if pos >= len(ohlc):
+        return np.nan
+    price_end = float(ohlc.iloc[pos]["close"])
+    return (price_end - price_t0) / price_t0 * 100
+
+
 def compute_max_up_down(ohlc: pd.DataFrame | None, release_ts, window_minutes: int) -> tuple[float, float, float]:
     """Max up %, max down %, range % within [T0, T0+window]."""
     if ohlc is None or ohlc.empty:
@@ -421,6 +464,15 @@ def build_impact_table(events: pd.DataFrame, asset: str, timeframe: str, window_
         dvol_before = crush.get("before")
         impl = implied_move_pct(dvol_before, window_minutes)
         mr = move_ratio(actual_pct, impl)
+
+        # Actual vs Implied Move chart: always compared over [T0, next daily
+        # expiry] regardless of the selected reaction `timeframe` (see
+        # DERIBIT_DAILY_EXPIRY_UTC_HOUR docstring).
+        expiry_ts = next_daily_expiry_utc(t0)
+        expiry_minutes = (expiry_ts - pd.Timestamp(t0)).total_seconds() / 60.0
+        actual_pct_expiry = compute_pct_change_to_ts(ohlc, t0, expiry_ts)
+        impl_expiry = implied_move_pct(dvol_before, expiry_minutes)
+        mr_expiry = move_ratio(actual_pct_expiry, impl_expiry)
         max_up, max_down, range_pct = compute_max_up_down(ohlc, t0, window_minutes)
         pre_drift = compute_pre_event_drift(ohlc, t0, 240)
         path = compute_path_dependency_details(ohlc, t0, window_minutes)
@@ -453,6 +505,10 @@ def build_impact_table(events: pd.DataFrame, asset: str, timeframe: str, window_
             "implied_move_pct": impl,
             "actual_move_pct": actual_pct,
             "move_ratio": mr,
+            "expiry_window_hours": expiry_minutes / 60.0,
+            "implied_move_pct_expiry": impl_expiry,
+            "actual_move_pct_expiry": actual_pct_expiry,
+            "move_ratio_expiry": mr_expiry,
             "dvol_crush_1h": crush.get(1),
             "dvol_crush_4h": crush.get(4),
             "dvol_crush_24h": crush.get(24),
