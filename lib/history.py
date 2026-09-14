@@ -438,8 +438,24 @@ def surface_history(asset: str, delta_key: str = "delta50",
 
     frame = pd.DataFrame(cols).sort_index()
     if recorded is not None:
-        # Splice: recorded rows win wherever we actually have them.
-        frame = frame[~frame.index.isin(recorded.index)]
+        # Splice: recorded rows are ground truth wherever we have them, so
+        # the reconstruction should only ever extend the line *before* the
+        # earliest recorded snapshot or *after* the latest one -- never
+        # compete with a real row from roughly the same moment.
+        #
+        # The old check dropped reconstructed rows only on an *exact*
+        # timestamp match (`frame.index.isin(recorded.index)`), which almost
+        # never fired: reconstructed timestamps land on DVOL's on-the-hour
+        # bars while recorded snapshots land at whatever irregular second
+        # the recorder happened to run. So both a reconstructed point and a
+        # real recorded point -- each a plausible but different IV reading
+        # for nearly the same time -- ended up plotted side by side. That
+        # interleaving is what produced the zig-zagging/spiking intraday
+        # charts (worsened by the spline line shape overshooting between
+        # them). Restricting the reconstruction to outside recorded's
+        # covered span removes the overlap entirely.
+        lo, hi = recorded.index.min(), recorded.index.max()
+        frame = frame[(frame.index < lo) | (frame.index > hi)]
         shared = [c for c in recorded.columns if c in frame.columns]
         if shared:
             frame = pd.concat([frame[shared], recorded[shared]]).sort_index()

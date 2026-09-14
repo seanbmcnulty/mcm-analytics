@@ -1039,6 +1039,12 @@ def _vol_series_chart(asset: str, dte: int, days: int, title: str,
             ("deltaCall10", "10Δ Call Vol", GREEN, "dash"),
             ("deltaPut10", "10Δ Put Vol", ORANGE, "dash")]
 
+    # Intraday series mix a dense DVOL-scaled reconstruction with sparse,
+    # irregularly-spaced recorded snapshots (see history.surface_history).
+    # A spline through such uneven spacing can overshoot well past the real
+    # data range right at the seam between the two; a straight line can't.
+    line_shape = "linear" if intraday else "spline"
+
     fig = go.Figure()
     for key, name, color, dash in spec:
         s = frames.get(key)
@@ -1047,7 +1053,7 @@ def _vol_series_chart(asset: str, dte: int, days: int, title: str,
         fig.add_trace(go.Scatter(
             x=to_local(s.index), y=s.values, name=name,
             mode="lines+markers" if intraday else "lines",
-            line=dict(color=color, dash=dash, shape="spline")))
+            line=dict(color=color, dash=dash, shape=line_shape)))
 
     if intraday:
         px = history.perp_ohlc(asset, days=2, resolution="15")
@@ -1056,7 +1062,7 @@ def _vol_series_chart(asset: str, dte: int, days: int, title: str,
             if not px.empty:
                 fig.add_trace(go.Scatter(
                     x=to_local(px.index), y=px["close"].values, name="Perp",
-                    line=dict(color=ORANGE, width=1.5, dash="dot", shape="spline"),
+                    line=dict(color=ORANGE, width=1.5, dash="dot", shape=line_shape),
                     mode="lines", yaxis="y2", connectgaps=False))
                 fig.update_layout(yaxis2=dict(overlaying="y", side="right",
                                               title="Perp", showgrid=False,
@@ -1104,11 +1110,17 @@ def _skew_series_chart(asset: str, dte: int, days: int, title: str,
     if len(s25) < 2:
         return None, None, "No skew time series data."
 
+    # Intraday series mix a dense DVOL-scaled reconstruction with sparse,
+    # irregularly-spaced recorded snapshots (see history.surface_history).
+    # A spline through such uneven spacing can overshoot well past the real
+    # data range right at the seam between the two; a straight line can't.
+    line_shape = "linear" if intraday else "spline"
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=to_local(s25.index), y=s25.values, name="25Δ Skew (Call − Put)",
         mode="lines+markers" if intraday else "lines",
-        line=dict(color=NAVY, shape="spline")))
+        line=dict(color=NAVY, shape=line_shape)))
 
     if not intraday and "deltaCall10" in frames and "deltaPut10" in frames:
         pair10 = _align(frames["deltaCall10"], frames["deltaPut10"])
@@ -1134,7 +1146,7 @@ def _skew_series_chart(asset: str, dte: int, days: int, title: str,
             if not px.empty:
                 fig.add_trace(go.Scatter(
                     x=to_local(px.index), y=px["close"].values, name="Perp",
-                    line=dict(color=ORANGE, width=1.5, dash="dot", shape="spline"),
+                    line=dict(color=ORANGE, width=1.5, dash="dot", shape=line_shape),
                     mode="lines", yaxis="y2", connectgaps=False))
                 fig.update_layout(yaxis2=dict(overlaying="y", side="right",
                                               title="Perp", showgrid=False,
