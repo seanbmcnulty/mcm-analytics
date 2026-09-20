@@ -981,6 +981,43 @@ ASSET_NAMES = {"BTC": "₿ Bitcoin (BTC)", "ETH": "⟠ Ethereum (ETH)"}
 def main() -> None:
     st.title("📈 Spot Vol Correlation")
 
+    # -----------------------------------------------------------------------
+    # Auto pipeline (chained from pages/06_Time_Based_Realized_Vol.py step 3):
+    # refresh Spot Vol Correlation for BTC+ETH with UI defaults and send to
+    # Telegram, then clear the pipeline flag. Runs on page entry via
+    # switch_page — must be near the top of main(), before sidebar buttons.
+    # -----------------------------------------------------------------------
+    if cache_lib.expire_stale_auto_pipeline():
+        st.caption("Auto pipeline timed out after 15 minutes and was cleared.")
+
+    if st.session_state.get("auto_pipeline") == "spot_vol":
+        if is_configured():
+            st.info("🔄📤 Auto pipeline — step 4/4: refreshing Spot Vol "
+                    "Correlation for BTC+ETH and sending to Telegram…")
+            cache_lib.clear_all_caches()
+            days = 90  # "Last 3 months" UI default (DATE_RANGE_PRESETS index 2)
+            resolution = RESOLUTION_MAP["1D"]
+            prediction_windows = _prediction_windows_for_lookback(days)
+            with st.spinner("Sending Spot Vol Correlation reports for BTC+ETH…"):
+                sent, failed = send_all_reports_to_telegram(
+                    days, resolution, prediction_windows)
+            st.session_state["auto_pipeline"] = None
+            st.session_state["auto_pipeline_started_at"] = None
+            if failed:
+                st.warning(
+                    f"Auto pipeline finished Spot Vol with {sent} chart(s) "
+                    f"sent; failed: {', '.join(failed)}"
+                )
+            st.success(
+                "✅ Auto pipeline complete — MCM Bot, Block Trades, Time Based "
+                "Realized Vol, and Spot Vol Correlation reports for BTC/ETH "
+                "have all been sent to Telegram."
+            )
+        else:
+            # Same guard as other pipeline pages — clear rather than stuck.
+            st.session_state["auto_pipeline"] = None
+            st.session_state["auto_pipeline_started_at"] = None
+
     with st.expander("📖 How to Use This Dashboard", expanded=False):
         st.markdown("""
         Explores how **spot price** relates to **options volatility** for BTC and ETH

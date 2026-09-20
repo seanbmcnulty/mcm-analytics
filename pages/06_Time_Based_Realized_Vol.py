@@ -1472,8 +1472,8 @@ with st.expander("Estimator glossary (assumptions and caveats)", expanded=False)
 # this page only ever shows one asset at a time (sidebar selectbox), so the
 # BTC and ETH legs run as two separate passes over this same page rather
 # than in one run — see the pipeline-continuation block near the bottom,
-# which reruns for "tbrv_eth" after "tbrv_btc" finishes, then clears the
-# flag. `_auto_tbrv_asset`, when set, overrides the asset the rest of this
+# which reruns for "tbrv_eth" after "tbrv_btc" finishes, then hands off
+# to Spot Vol Correlation. `_auto_tbrv_asset`, when set, overrides the asset the rest of this
 # script uses regardless of what the sidebar widget shows.
 # ---------------------------------------------------------------------------
 if cache_lib.expire_stale_auto_pipeline():
@@ -1484,7 +1484,7 @@ _auto_tbrv_asset = None
 if _auto_pipeline_step in ("tbrv_btc", "tbrv_eth"):
     if is_configured():
         _auto_tbrv_asset = "BTC" if _auto_pipeline_step == "tbrv_btc" else "ETH"
-        st.info(f"🔄📤 Auto pipeline — step 3/3: refreshing Time Based Realized "
+        st.info(f"🔄📤 Auto pipeline — step 3/4: refreshing Time Based Realized "
                 f"Vol data for {_auto_tbrv_asset} and sending to Telegram…")
         try:
             st.cache_data.clear()
@@ -1877,11 +1877,9 @@ if _auto_tbrv_asset:
         st.session_state["auto_pipeline"] = "tbrv_eth"
         st.rerun()
     else:
-        st.session_state["auto_pipeline"] = None
-        st.session_state["auto_pipeline_started_at"] = None
-        st.success("✅ Auto pipeline complete — MCM Bot, Block Trades, and "
-                   "Time Based Realized Vol reports for BTC/ETH have all "
-                   "been sent to Telegram.")
+        # Hand off to Spot Vol Correlation (keep started_at for chain timeout).
+        st.session_state["auto_pipeline"] = "spot_vol"
+        st.switch_page("pages/08_Spot_Vol_Correlation.py")
 
 # ---------------------------------------------------------------------------
 # Footer

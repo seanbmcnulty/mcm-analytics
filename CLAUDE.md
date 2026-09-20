@@ -287,6 +287,7 @@ add_workflow.bat                user-run: move staged .github/workflows file int
 
 ## Session log
 
+- **2026-09-21 — Home auto-pipeline + Spot Vol Correlation:** Extended the Home Quick Actions chain to four steps: MCM Bot → Block Trades → Time Based RV → Spot Vol Correlation (`auto_pipeline="spot_vol"` on `pages/08_Spot_Vol_Correlation.py`). TBRV no longer clears the flag at the end of `tbrv_eth`; it switches to Spot Vol. Step labels bumped to n/4. Defaults for the auto send match the page UI (90d / 1D). Local only — push via `push_to_github.bat`.
 Keep this updated: when a session makes a non-trivial change, decision, or
 finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —

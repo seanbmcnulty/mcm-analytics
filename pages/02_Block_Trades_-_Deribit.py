@@ -175,7 +175,7 @@ if cache_lib.expire_stale_auto_pipeline():
 _auto_pipeline_active = (st.session_state.get("auto_pipeline") == "block_trades"
                          and telegram.is_configured())
 if _auto_pipeline_active:
-    st.info("🔄📤 Auto pipeline — step 2/3: refreshing Block Trades data for "
+    st.info("🔄📤 Auto pipeline — step 2/4: refreshing Block Trades data for "
             "BTC/ETH and sending to Telegram…")
     cache_lib.clear_all_caches()
 elif st.session_state.get("auto_pipeline") == "block_trades":

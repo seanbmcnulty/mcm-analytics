@@ -321,12 +321,40 @@ def _surface_from_snapshots(asset: str, delta_key: str,
 # Level driver: DVOL, else realized vol
 # ---------------------------------------------------------------------------
 
+def _dvol_resolution_for_days(days: float) -> str:
+    """
+    Coarsest Deribit ``get_volatility_index_data`` resolution that still
+    covers ``days`` of history without hitting the API's ~1000-candle cap,
+    preferring the finest resolution that fits.
+    """
+    total_seconds = max(float(days), 0.01) * 86400.0
+    for res in (3600, 43200, 86400):
+        if total_seconds / res <= 1000:
+            return str(res)
+    return "86400"
+
+
 def dvol_history(asset: str, days: int = 90,
-                 resolution: str = "60") -> pd.Series | None:
-    """DVOL close history in vol points, indexed by UTC timestamp."""
+                 resolution: str | None = None) -> pd.Series | None:
+    """
+    DVOL close history in vol points, indexed by UTC timestamp.
+
+    ``resolution`` is Deribit's ``get_volatility_index_data`` bar width in
+    *seconds* (60, 3600, 43200, 86400) -- NOT minutes, despite the name
+    matching ``perp_ohlc``'s minutes-based convention. Passing "60" here
+    used to be read by Deribit as 60 *seconds* (1-minute bars), and the API
+    caps a single request at ~1000 candles, so any ``days`` window wider
+    than about 16.7 hours silently came back covering only its most recent
+    sliver instead of the full requested span -- the level driver behind
+    every DVOL-scaled reconstruction (intraday and multi-day alike) was
+    quietly missing most of its history. Leave ``resolution`` unset to
+    auto-pick the coarsest bar width that still covers the full window.
+    """
     cfg = ASSET_CONFIG.get(asset, ASSET_CONFIG["BTC"])
     if not cfg.get("has_dvol"):
         return None
+    if resolution is None:
+        resolution = _dvol_resolution_for_days(days)
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - int(days * 24 * 3600 * 1000)
     df = deribit.get_dvol(cfg["deribit_ccy"], resolution=resolution,
@@ -384,7 +412,7 @@ def level_driver(asset: str, days: int = 90) -> tuple[pd.Series | None, str]:
 
 
 def _compute_level_driver(asset: str, days: int) -> tuple[pd.Series | None, str]:
-    dv = dvol_history(asset, days=days, resolution="60")
+    dv = dvol_history(asset, days=days)
     if dv is not None and len(dv) >= 2:
         return dv, "DVOL"
     rv = _rv_level_series(asset, days)
