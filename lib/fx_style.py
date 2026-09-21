@@ -191,11 +191,20 @@ def finalize(fig: go.Figure, note: str = None, legend_rows: int = 1,
 
 
 def fig_to_png(fig: go.Figure, width: int = 1200, height: int = 800) -> bytes:
-    """Convert a Plotly figure into PNG image bytes."""
+    """Convert a Plotly figure into PNG image bytes for Telegram / downloads.
+
+    Always applies the light export theme on a *copy* of the figure so
+    Streamlit on-screen charts (often built with PLOTLY_LAYOUT's near-white
+    fonts for dark UI) are not mutated, while kaleido gets dark axis ticks
+    and titles on a white background. Callers may still pre-theme with
+    ``apply_theme(..., "light")``; that is harmless and redundant.
+    """
     if fig is None:
         return None
     try:
-        return fig.to_image(format="png", width=width, height=height)
+        export = go.Figure(fig)
+        apply_theme(export, "light")
+        return export.to_image(format="png", width=width, height=height)
     except Exception as e:
         # Previously silent — a chart-image failure was indistinguishable
         # from "there was no chart." Printed so it shows up in Streamlit
