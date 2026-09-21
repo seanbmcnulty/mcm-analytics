@@ -853,12 +853,16 @@ def _send_chart(fig: go.Figure | None, caption: str) -> bool:
     """fig -> PNG (fx_style.fig_to_png / kaleido) -> telegram.send_photo.
     Mirrors the images-only pattern established in pages/01_MCM_Bot.py and
     pages/06/07 (see CLAUDE.md's 2026-08-20 session-log entries) — a render
-    failure is reported, never silently swapped for a text dump."""
+    failure is reported, never silently swapped for a text dump.
+
+    Always apply_theme(..., "light") before export: charts are built with
+    PLOTLY_LAYOUT's near-white fonts for the dark Streamlit UI; without the
+    light theme pass, kaleido renders blank/missing axis ticks and titles.
+    """
     if fig is None:
         return False
-    img = fx_style.fig_to_png(fig)
-    if img is None:
-        img = fx_style.fig_to_png(fig)  # one retry — kaleido occasionally misfires cold
+    themed = fx_style.apply_theme(fig, "light")
+    img = fx_style.fig_to_png(themed, width=1200, height=800)
     if img is None:
         return False
     return send_photo(img, caption=caption[:1024])

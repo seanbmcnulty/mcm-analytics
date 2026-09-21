@@ -120,16 +120,28 @@ def add_watermark(fig: go.Figure, text: str = "MCM Analytics") -> None:
 
 
 def apply_theme(fig: go.Figure, theme: str = "auto") -> go.Figure:
-    """Apply standard clean styling and template to a Plotly figure."""
+    """Apply standard clean styling and template to a Plotly figure.
+
+    theme="light" is required for Telegram/kaleido PNG exports: Spot Vol and
+    other pages set PLOTLY_LAYOUT with near-white font (#fafafa) and transparent
+    backgrounds for the Streamlit dark UI. Kaleido paints that as white-on-white,
+    so axis tick numbers and titles vanish unless we force dark text + white bg.
+    """
     if fig is None:
         return None
 
+    light = theme.lower() == "light"
     fig.update_layout(
         template=TEMPLATE,
         font=dict(family=_TBL_FONT_FAMILY, color=_TBL_TEXT),
-        paper_bgcolor="white" if theme.lower() == "light" else None,
-        plot_bgcolor="white" if theme.lower() == "light" else None,
+        paper_bgcolor="white" if light else None,
+        plot_bgcolor="white" if light else None,
     )
+    if light:
+        # Cover primary + secondary axes (Spot Vol dual-y charts, subplots).
+        axis_font = dict(color=_TBL_TEXT)
+        fig.update_xaxes(tickfont=axis_font, title_font=axis_font, color=_TBL_TEXT)
+        fig.update_yaxes(tickfont=axis_font, title_font=axis_font, color=_TBL_TEXT)
     return fig
 
 
