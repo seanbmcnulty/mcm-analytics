@@ -1149,13 +1149,18 @@ def plot_net_positioning_by_strike_weighted(data, asset, current_spot=0.0):
     fx_style.add_watermark(fig)
     return fx_style.apply_theme(fig)
 
+# Tenor buckets for plot_cumulative_aggression, by calendar days to expiry.
+# Edges are contiguous (each bucket starts where the previous ends).
+TENOR_BUCKET_EDGES = [0, 7, 30, 90, 365, float('inf')]
+TENOR_BUCKET_LABELS = ['0d-1w', '1w-1m', '1m-3m', '3m-1y', '1y+']
+
 def plot_cumulative_aggression(data, asset):
-    """Cumulative premium paid through mark (>0 = takers paying up), total
-    plus the 4 busiest expiries."""
+    """Cumulative premium paid through mark (>0 = takers paying up): total
+    plus 5 tenor buckets (by days-to-expiry, not individual expiries)."""
     if data.empty or 'aggression_usd' not in data.columns:
         return _empty_flow_fig(f'{asset} Aggression: No Data')
 
-    f = data[data['aggression_usd'].notna()]
+    f = data[data['aggression_usd'].notna()].copy()
     if f.empty:
         return _empty_flow_fig(f'{asset} Aggression: No Data')
 
@@ -1164,12 +1169,15 @@ def plot_cumulative_aggression(data, asset):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=total.index, y=total.values, mode='lines', line=dict(color=TEXT_COLOR, width=2), name='Total'))
 
-    top = f.groupby('expiry_str')['abs_amount'].sum().nlargest(4).index.tolist()
-    if top:
-        colors = pcolors.sample_colorscale('Turbo', [i / max(len(top) - 1, 1) for i in range(len(top))])
-        for e, color in zip(top, colors):
-            s = f[f['expiry_str'] == e].groupby('minute')['aggression_usd'].sum().cumsum()
-            fig.add_trace(go.Scatter(x=s.index, y=s.values, mode='lines', line=dict(color=color, width=1.5), name=e))
+    days_to_expiry = f['tte'] * 365.25
+    f['tenor_bucket'] = pd.cut(days_to_expiry, bins=TENOR_BUCKET_EDGES, labels=TENOR_BUCKET_LABELS, right=False)
+
+    present = [b for b in TENOR_BUCKET_LABELS if (f['tenor_bucket'] == b).any()]
+    colors = pcolors.sample_colorscale('Turbo', [i / max(len(TENOR_BUCKET_LABELS) - 1, 1) for i in range(len(TENOR_BUCKET_LABELS))])
+    color_by_label = dict(zip(TENOR_BUCKET_LABELS, colors))
+    for b in present:
+        s = f[f['tenor_bucket'] == b].groupby('minute')['aggression_usd'].sum().cumsum()
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode='lines', line=dict(color=color_by_label[b], width=1.5), name=b))
 
     fig.add_hline(y=0, line_color='rgba(0,0,0,0.3)')
     fig.update_layout(
@@ -1178,6 +1186,11 @@ def plot_cumulative_aggression(data, asset):
         paper_bgcolor=BACKGROUND_COLOR, plot_bgcolor=BACKGROUND_COLOR, font=dict(color=TEXT_COLOR),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
         height=400, margin=dict(l=40, r=40, t=40, b=40)
+    )
+    fig.add_annotation(
+        text='Total = all expiries. Lines = tenor buckets by days-to-expiry (0d-1w, 1w-1m, 1m-3m, 3m-1y, 1y+).',
+        xref='paper', yref='paper', x=0.5, y=-0.18, showarrow=False,
+        font=dict(size=10, color='rgba(128,128,128,0.9)')
     )
     fx_style.add_watermark(fig)
     return fx_style.apply_theme(fig)
