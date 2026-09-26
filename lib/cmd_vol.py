@@ -1016,6 +1016,24 @@ def _align(a: pd.Series, b: pd.Series) -> tuple[pd.Series, pd.Series] | None:
     return a.reindex(b2.index), b2
 
 
+PERP_SMOOTH_WINDOW = "45min"  # rolling-mean window for the intraday Perp overlay (raw 15m closes are too jumpy to read against the sparser vol/skew points)
+
+
+def _smoothed_perp(asset: str, since) -> pd.DataFrame | None:
+    """15m perp closes, smoothed with a short rolling mean so the overlay
+    reads as a trend line rather than tick noise next to the sparse,
+    irregularly-spaced recorded vol/skew points."""
+    px = history.perp_ohlc(asset, days=2, resolution="15")
+    if px is None or px.empty:
+        return None
+    px = px[px.index >= since]
+    if px.empty:
+        return None
+    px = px.copy()
+    px["close"] = px["close"].rolling(PERP_SMOOTH_WINDOW, min_periods=1).mean()
+    return px
+
+
 def _est_note(estimated: bool, src: str) -> str | None:
     """Text for the reconstruction caveat, or None when the data is recorded."""
     if estimated and src != "none":
@@ -1056,17 +1074,15 @@ def _vol_series_chart(asset: str, dte: int, days: int, title: str,
             line=dict(color=color, dash=dash, shape=line_shape)))
 
     if intraday:
-        px = history.perp_ohlc(asset, days=2, resolution="15")
-        if px is not None and not px.empty:
-            px = px[px.index >= frames["delta50"].index[0]]
-            if not px.empty:
-                fig.add_trace(go.Scatter(
-                    x=to_local(px.index), y=px["close"].values, name="Perp",
-                    line=dict(color=ORANGE, width=1.5, dash="dot", shape=line_shape),
-                    mode="lines", yaxis="y2", connectgaps=False))
-                fig.update_layout(yaxis2=dict(overlaying="y", side="right",
-                                              title="Perp", showgrid=False,
-                                              tickformat=",.0f"))
+        px = _smoothed_perp(asset, frames["delta50"].index[0])
+        if px is not None:
+            fig.add_trace(go.Scatter(
+                x=to_local(px.index), y=px["close"].values, name="Perp",
+                line=dict(color=ORANGE, width=1.5, dash="dot", shape=line_shape),
+                mode="lines", yaxis="y2", connectgaps=False))
+            fig.update_layout(yaxis2=dict(overlaying="y", side="right",
+                                          title="Perp", showgrid=False,
+                                          tickformat=",.0f"))
 
     fig.update_layout(
         title=title, xaxis_title=XAXIS_TIME,
@@ -1140,15 +1156,13 @@ def _skew_series_chart(asset: str, dte: int, days: int, title: str,
                                           title="10Δ Skew (pp)", showgrid=False))
 
     if intraday:
-        px = history.perp_ohlc(asset, days=2, resolution="15")
-        if px is not None and not px.empty:
-            px = px[px.index >= s25.index[0]]
-            if not px.empty:
-                fig.add_trace(go.Scatter(
-                    x=to_local(px.index), y=px["close"].values, name="Perp",
-                    line=dict(color=ORANGE, width=1.5, dash="dot", shape=line_shape),
-                    mode="lines", yaxis="y2", connectgaps=False))
-                fig.update_layout(yaxis2=dict(overlaying="y", side="right",
+        px = _smoothed_perp(asset, s25.index[0])
+        if px is not None:
+            fig.add_trace(go.Scatter(
+                x=to_local(px.index), y=px["close"].values, name="Perp",
+                line=dict(color=ORANGE, width=1.5, dash="dot", shape=line_shape),
+                mode="lines", yaxis="y2", connectgaps=False))
+            fig.update_layout(yaxis2=dict(overlaying="y", side="right",
                                               title="Perp", showgrid=False,
                                               tickformat=",.0f"))
 

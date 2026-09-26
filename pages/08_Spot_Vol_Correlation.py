@@ -70,6 +70,7 @@ DATE_RANGE_PRESETS = {"Last 2 weeks": 14, "Last 1 month": 30, "Last 3 months": 9
 RV_WINDOW_DAYS = 30           # realized-vol lookback, matched to CVOL's fixed 30 DTE
 ZSCORE_WINDOW = 90            # points, for DVOL/skew spread z-scores and percentile rank
 DVOL_BETA_WINDOW = 30         # bars (native resolution), for rolling ETH-on-BTC DVOL beta
+FUNDING_DIFF_MA_DAYS = 3       # smoothing window for the funding-rate-differential overlay (raw hourly is too noisy to read)
 ALERT_STATE_PATH = Path(__file__).parent.parent / "data" / "dvol_spread_alert_state.json"
 
 
@@ -476,7 +477,12 @@ def _dvol_spread_chart(days: int, resolution: str) -> go.Figure:
         fidx = eth_fund.index.union(btc_fund.index)
         fund_diff = (eth_fund.reindex(fidx).interpolate(limit_direction="both") - btc_fund.reindex(fidx).interpolate(limit_direction="both")).dropna()
         if not fund_diff.empty:
-            fig.add_trace(go.Scatter(x=fund_diff.index, y=fund_diff.values, mode="lines", name="ETH-BTC Funding Diff (ann. %)", line=dict(color="#fb8c00", width=1.5, dash="dot")), secondary_y=True)
+            # Raw hourly-annualized diff is too noisy to read at this horizon (funding resets
+            # every 8h and the annualization multiplies that noise by ~8760x); show it faint
+            # in the background and lead with a time-based rolling mean.
+            fund_diff_ma = fund_diff.rolling(f"{FUNDING_DIFF_MA_DAYS}D", min_periods=1).mean()
+            fig.add_trace(go.Scatter(x=fund_diff.index, y=fund_diff.values, mode="lines", name="ETH-BTC Funding Diff (raw, ann. %)", line=dict(color="#fb8c00", width=1), opacity=0.25, hoverinfo="skip", showlegend=False), secondary_y=True)
+            fig.add_trace(go.Scatter(x=fund_diff_ma.index, y=fund_diff_ma.values, mode="lines", name=f"ETH-BTC Funding Diff ({FUNDING_DIFF_MA_DAYS}D avg, ann. %)", line=dict(color="#fb8c00", width=2)), secondary_y=True)
     fig.add_hline(y=0, line_dash="dash", line_color="#9aa4b2", secondary_y=False)
     fig.update_yaxes(title_text=y_label, secondary_y=False)
     fig.update_yaxes(title_text="Funding Diff (ann. %)", secondary_y=True, showgrid=False)

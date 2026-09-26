@@ -255,31 +255,47 @@ def get_last_trades_by_currency_and_time(
     return result if isinstance(result, dict) else None
 
 
+_FUNDING_HISTORY_MAX_SPAN_MS = 30 * 24 * 3600 * 1000  # Deribit caps this endpoint at ~31d/request
+
+
 def get_funding_history(instrument_name: str,
                         start_ms: int | None = None,
                         end_ms: int | None = None) -> pd.DataFrame | None:
     """
     Get funding rate history for a perpetual instrument.
     Returns DataFrame with columns: timestamp, interest_1h, index_price
+
+    Deribit's get_funding_rate_history endpoint silently caps each request
+    to ~31 days of history regardless of the requested start_timestamp, so
+    a wide range is paginated here into <=30-day chunks and concatenated
+    (each chunk still goes through the shared TTL cache/rate limiter).
     """
     if end_ms is None:
         end_ms = int(time.time() * 1000)
     if start_ms is None:
         start_ms = end_ms - 30 * 24 * 3600 * 1000  # 30 days default
 
-    result = _request("get_funding_rate_history", {
-        "instrument_name": instrument_name,
-        "start_timestamp": start_ms,
-        "end_timestamp": end_ms,
-    }, ttl=TTL_SLOW)
+    chunks = []
+    chunk_end = end_ms
+    while chunk_end > start_ms:
+        chunk_start = max(start_ms, chunk_end - _FUNDING_HISTORY_MAX_SPAN_MS)
+        result = _request("get_funding_rate_history", {
+            "instrument_name": instrument_name,
+            "start_timestamp": chunk_start,
+            "end_timestamp": chunk_end,
+        }, ttl=TTL_SLOW)
+        if result and isinstance(result, list):
+            chunks.append(pd.DataFrame(result))
+        chunk_end = chunk_start
 
-    if not result or not isinstance(result, list):
+    if not chunks:
         return None
 
-    df = pd.DataFrame(result)
+    df = pd.concat(chunks, ignore_index=True)
     if "timestamp" in df.columns:
+        df = df.drop_duplicates(subset="timestamp").sort_values("timestamp")
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    return df
+    return df.reset_index(drop=True)
 
 
 def get_ticker(instrument_name: str) -> dict | None:
