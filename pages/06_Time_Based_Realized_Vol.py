@@ -1398,9 +1398,9 @@ def send_decision_matrix_3d_to_telegram(
 ) -> bool:
     png_bytes, err = render_decision_matrix_3d_png(combined_rows, asset, metric_col=metric_col, metric_label=metric_label)
     if err or not png_bytes:
-        fig_2d = fig_decision_matrix_2d(combined_rows, asset, metric_col=metric_col, metric_label=metric_label)
-        png_2d = fx_style.fig_to_png(fig_2d)
-        return bool(png_2d) and send_photo(png_2d, caption=caption)
+        # The 2D matrix is the same chart as the cross-lookback heatmap already
+        # sent just before this — don't send it a second time as a fallback.
+        return True
     return send_photo(png_bytes, caption=caption)
 
 

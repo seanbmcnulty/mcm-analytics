@@ -874,7 +874,8 @@ def _send_chart(fig: go.Figure | None, caption: str) -> bool:
     return send_photo(img, caption=caption[:1024])
 
 
-def send_asset_report_to_telegram(asset: str, days: int, resolution: str, prediction_windows: tuple) -> tuple[int, list[str]]:
+def send_asset_report_to_telegram(asset: str, days: int, resolution: str, prediction_windows: tuple,
+                                  include_pair_charts: bool = True) -> tuple[int, list[str]]:
     """Every chart for one asset's tab, sent as a Telegram photo album
     preceded by a text summary. Returns (sent_count, failed_chart_names)."""
     spot = _spot_series(asset, days)
@@ -885,6 +886,9 @@ def send_asset_report_to_telegram(asset: str, days: int, resolution: str, predic
     rr, rr_est, rr_src = _rr_series(asset, days)
     bf, bf_est, bf_src = _bf_series(asset, days)
     other = "ETH" if asset == "BTC" else "BTC"
+    # ETH-BTC pair charts are identical whichever asset is the "primary" one,
+    # so send_all_reports_to_telegram only requests them on the first asset.
+    pair_ok = include_pair_charts and other in SV_ASSETS
 
     latest_cvol = f"{cvol.iloc[-1]:.2f}%" if not cvol.empty else "—"
     latest_skew = f"{svol.iloc[-1]:.2f}%" if not svol.empty else "—"
@@ -904,16 +908,16 @@ def send_asset_report_to_telegram(asset: str, days: int, resolution: str, predic
         (_scatter_vs_spot(_align_to_spot(svol, spot), asset, f"25Δ Skew vs Spot — {asset}", "25Δ Skew (%)", svol_est, svol_src), f"{asset} - 25Δ Skew vs Spot"),
         (_scatter_vs_spot(_align_to_spot(rr, spot), asset, f"10Δ Risk Reversal vs Spot — {asset}", "10Δ RR (%)", rr_est, rr_src), f"{asset} - 10Δ RR vs Spot"),
         (_scatter_vs_spot(_align_to_spot(bf, spot), asset, f"10Δ Butterfly vs Spot — {asset}", "10Δ BF (%)", bf_est, bf_src), f"{asset} - 10Δ BF vs Spot"),
-        (_dvol_spread_chart(days, resolution) if other in SV_ASSETS else None, "ETH/BTC DVOL Spread"),
+        (_dvol_spread_chart(days, resolution) if pair_ok else None, "ETH/BTC DVOL Spread"),
         (_candlestick_dvol(asset, start_ms, end_ms, resolution, svol), f"{asset} - DVol Snapshot"),
         (_chart_rolling_correlation(spot, cvol, asset), f"{asset} - Rolling Correlation"),
         (_chart_rolling_covariance(spot, cvol, asset), f"{asset} - Rolling Covariance"),
         (_rv_iv_basis_chart(asset, days), f"{asset} - RV-IV Basis"),
-        (_rv_iv_basis_spread_chart(days) if other in SV_ASSETS else None, "ETH-BTC RV-IV Basis Spread"),
-        (_zscore_chart(_rolling_zscore(_dvol_spread_series(days, resolution)), "ETH-BTC DVOL Spread") if other in SV_ASSETS else None, "ETH-BTC DVOL Spread Z-Score"),
-        (_dvol_beta_chart(days, resolution) if other in SV_ASSETS else None, "ETH DVOL Beta to BTC DVOL"),
-        (_skew_spread_chart(days) if other in SV_ASSETS else None, "ETH-BTC 25Δ Skew Spread"),
-        (_zscore_chart(_rolling_zscore(_skew_spread_series(days)), "ETH-BTC 25Δ Skew Spread") if other in SV_ASSETS else None, "ETH-BTC Skew Spread Z-Score"),
+        (_rv_iv_basis_spread_chart(days) if pair_ok else None, "ETH-BTC RV-IV Basis Spread"),
+        (_zscore_chart(_rolling_zscore(_dvol_spread_series(days, resolution)), "ETH-BTC DVOL Spread") if pair_ok else None, "ETH-BTC DVOL Spread Z-Score"),
+        (_dvol_beta_chart(days, resolution) if pair_ok else None, "ETH DVOL Beta to BTC DVOL"),
+        (_skew_spread_chart(days) if pair_ok else None, "ETH-BTC 25Δ Skew Spread"),
+        (_zscore_chart(_rolling_zscore(_skew_spread_series(days)), "ETH-BTC 25Δ Skew Spread") if pair_ok else None, "ETH-BTC Skew Spread Z-Score"),
         (_chart_vol_prediction(asset, prediction_windows), f"{asset} - Vol Prediction"),
     ]
     sent, failed = 0, []
@@ -927,8 +931,9 @@ def send_asset_report_to_telegram(asset: str, days: int, resolution: str, predic
 
 def send_all_reports_to_telegram(days: int, resolution: str, prediction_windows: tuple) -> tuple[int, list[str]]:
     total_sent, total_failed = 0, []
-    for asset in SV_ASSETS:
-        sent, failed = send_asset_report_to_telegram(asset, days, resolution, prediction_windows)
+    for i, asset in enumerate(SV_ASSETS):
+        sent, failed = send_asset_report_to_telegram(
+            asset, days, resolution, prediction_windows, include_pair_charts=(i == 0))
         total_sent += sent
         total_failed.extend(failed)
     return total_sent, total_failed
