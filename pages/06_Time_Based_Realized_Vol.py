@@ -6,11 +6,12 @@ quality controls, decision matrices, Telegram report.
 Ported from the exodus-analytics "Time Based Realized Vol" page. The
 original compared Binance spot/perp klines across ~28 assets; this version
 is Deribit-only (project-wide constraint — see CLAUDE.md) and fetches
-BTC-PERPETUAL / ETH-PERPETUAL via lib/deribit.py's tradingview endpoint,
-always on the perpetual (no spot leg — Deribit's public API has no spot
-market to compare against). Scope is BTC/ETH for now; more Deribit-listed
-perps (SOL, HYPE) can be added once their tradingview history depth is
-verified.
+BTC / ETH / SOL_USDC / HYPE_USDC perpetuals via lib/deribit.py's tradingview
+endpoint, always on the perpetual (no spot leg — Deribit's public API has no
+spot market to compare against). SOL and HYPE were added 2026-10-10 after
+confirming 1m/5m/1h/1D candles are served for both (HYPE's perp only has
+history since ~mid-June 2026, so 30d lookbacks are fine but nothing longer
+exists to fetch). The Home-page auto pipeline still only runs BTC/ETH.
 
 Core question this page answers: if you hedge every X minutes/hours, what
 realized vol do you actually experience? Seven estimators (close-to-close,
@@ -58,7 +59,7 @@ st.set_page_config(
 
 st.title("📈 Time Based Realized Vol")
 st.caption(
-    "Compare **annualized realized vol across hedging frequencies** for BTC/ETH "
+    "Compare **annualized realized vol across hedging frequencies** for BTC/ETH/SOL/HYPE "
     "perpetuals. Use the table and rolling charts to choose intervals for "
     "**long gamma (seek higher RV)** or **short gamma (seek lower RV)**. "
     "Crypto annualization uses **365** days."
@@ -68,10 +69,10 @@ st.caption(
 # Constants
 # ---------------------------------------------------------------------------
 
-# Focused on BTC/ETH perps for now — both have deep tradingview history on
-# Deribit. SOL/HYPE could be added once their candle history depth at short
-# resolutions (1m/5m) has been checked.
-TBRV_ASSETS = ("BTC", "ETH")
+# All four Deribit perps with option markets. Checked 2026-10-10: SOL_USDC and
+# HYPE_USDC serve 1m/5m/1h/1D tradingview candles just like BTC (HYPE's perp
+# only lists since ~2026-06-16, which still covers every lookback here).
+TBRV_ASSETS = ("BTC", "ETH", "SOL", "HYPE")
 
 LOOKBACK_OPTIONS = ("1d", "3d", "7d", "14d", "21d", "30d")
 # 4h (resolution "240") deliberately excluded: confirmed via live testing

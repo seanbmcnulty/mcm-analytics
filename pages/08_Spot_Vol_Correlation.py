@@ -16,12 +16,14 @@ module docstrings), so the whole Amberdata layer is replaced with:
 - **BF**   (10Δ butterfly)     = (10Δ call + 10Δ put)/2 − ATM, all at 30 DTE
 - **DVol Snapshot** panel = the real Deribit DVOL index (``lib.deribit.get_dvol``)
 
-Scoped to **BTC and ETH only** — both have a Deribit DVOL index; SOL/HYPE do
-not (``ASSET_CONFIG[...]["has_dvol"] is False``), which was exodus's own
-reason for treating them differently throughout this page, so dropping them
-removes an entire fallback code path (the "no DVOL, show 30d ATM instead"
-branch) rather than adapting it. Matches the scope decision made with the
-user for pages/07 (Regime Identifier) — see CLAUDE.md's session log.
+Covers **BTC, ETH, SOL and HYPE**. Only BTC/ETH have a Deribit DVOL index
+(``ASSET_CONFIG[...]["has_dvol"]``). SOL/HYPE (added 2026-10-10) run on the
+same history layer, but ``history.level_driver`` falls back to a 7d Parkinson
+RV ratio instead of DVOL (unless >= 8 recorded snapshots exist), so their
+CVOL / skew / RR / BF history is *RV-scaled*: shape fixed at today's surface,
+level moving with realized vol. Those tabs show a warning saying so, and skip
+the panels that need a real DVOL (DVol candles), would be circular on
+RV-scaled data (RV-IV basis), or are ETH/BTC-specific (the pair panels).
 
 Dropped as dead code (never called from exodus's own UI or Telegram report —
 verified by reading the full source, per the page-06/pages-07 precedent):
@@ -58,7 +60,17 @@ from lib.telegram import send_message, send_photo, is_configured
 
 st.set_page_config(page_title="Spot Vol Correlation", page_icon="📈", layout="wide")
 
-SV_ASSETS = [a for a in ("BTC", "ETH") if ASSET_CONFIG.get(a, {}).get("has_dvol")]
+SV_ASSETS = [a for a in ("BTC", "ETH", "SOL", "HYPE") if a in ASSET_CONFIG]
+PAIR_ASSETS = ("BTC", "ETH")   # ETH/BTC cross-asset panels only make sense for these two
+AUTO_ASSETS = ("BTC", "ETH")   # legs run by the Home-page auto pipeline (SOL/HYPE: manual / Send All only)
+
+
+def _has_dvol(asset: str) -> bool:
+    return bool(ASSET_CONFIG.get(asset, {}).get("has_dvol"))
+
+
+def _spot_dp(asset: str) -> int:
+    return int(ASSET_CONFIG.get(asset, {}).get("price_dp", 0))
 CHART_HEIGHT = 480
 VOL_PREDICTION_LOOKBACKS = (7, 14, 30, 90)  # 1 week, 2 weeks, 1 month, 3 months
 MIN_POINTS_PER_DEGREE = 4
@@ -341,7 +353,7 @@ def _scatter_vs_spot(merged: pd.DataFrame, asset: str, title: str, y_label: str,
     fig.add_trace(go.Scatter(
         x=x, y=y, mode="markers",
         marker=dict(size=7, color=merged["days_ago"], colorscale="Portland", cmin=0, cmax=max(1.0, float(merged["days_ago"].max())), colorbar=dict(title="Days Ago")),
-        hovertemplate="Spot: %{x:,.0f}<br>" + y_label + ": %{y:.2f}%<extra></extra>",
+        hovertemplate="Spot: %{x:,." + str(_spot_dp(asset)) + "f}<br>" + y_label + ": %{y:.2f}%<extra></extra>",
         name="(spot, value)",
     ))
     coefs = _safe_polyfit(x, y, 2)
@@ -687,7 +699,7 @@ def _chart_vol_prediction(asset: str, prediction_windows: tuple) -> go.Figure:
         else:
             marker_kw["showscale"] = False
         fig.add_trace(go.Scatter(x=window_df["spot"], y=vol_display, mode="markers", marker=marker_kw,
-                                  hovertemplate="Spot: %{x:,.0f}<br>CVOL: %{y:.2f}%<extra></extra>",
+                                  hovertemplate="Spot: %{x:,." + str(_spot_dp(asset)) + "f}<br>CVOL: %{y:.2f}%<extra></extra>",
                                   name="(spot, vol)", showlegend=show_leg, legendgroup="scatter"), row=row, col=col)
         for y_curve, colour, dash, cname, lgroup in (
             (y_lin, "#1565c0", "solid", "Linear", "lin"), (y_quad, "#e65100", "dash", "Quadratic", "quad"),
@@ -742,7 +754,10 @@ def _chart_vol_prediction(asset: str, prediction_windows: tuple) -> go.Figure:
 @st.cache_data(ttl=300, max_entries=8, show_spinner=False)
 def _latest_dvol_index(asset: str) -> float | None:
     """Latest real Deribit DVOL index value — distinct from the reconstructed
-    CVOL (30d ATM IV) used everywhere else on this page; see module docstring."""
+    CVOL (30d ATM IV) used everywhere else on this page; see module docstring.
+    None for assets with no DVOL index (SOL, HYPE)."""
+    if not _has_dvol(asset):
+        return None
     df = deribit.get_dvol(ASSET_CONFIG[asset]["deribit_ccy"], resolution="60")
     if df is None or df.empty:
         return None
@@ -785,6 +800,14 @@ def get_summary_stats(days: int) -> tuple[pd.DataFrame, float | None]:
 # ASSET TAB
 # ============================================================================
 
+_NO_DVOL_NOTE = (
+    "{asset} has no Deribit DVOL index, so its CVOL / skew / RR / BF history is **RV-scaled** "
+    "({src}): today's surface shape, with the level moved by 7d realized vol. Spot-vs-vol "
+    "relationships here partly reflect spot-vs-RV rather than true implied-vol dynamics, "
+    "and get more real as recorded snapshots accumulate."
+)
+
+
 def render_asset_tab(asset: str, days: int, resolution: str, prediction_windows: tuple) -> None:
     spot = _spot_series(asset, days)
     if spot.empty:
@@ -794,7 +817,12 @@ def render_asset_tab(asset: str, days: int, resolution: str, prediction_windows:
     svol, svol_est, svol_src = _svol_series(asset, days)
     rr, rr_est, rr_src = _rr_series(asset, days)
     bf, bf_est, bf_src = _bf_series(asset, days)
-    other = "ETH" if asset == "BTC" else "BTC"
+    has_dvol = _has_dvol(asset)
+    pair_ok = asset in PAIR_ASSETS
+    basis_ok = has_dvol or not cvol_est   # RV-IV basis is circular when CVOL is itself RV-scaled
+
+    if not has_dvol and cvol_est:
+        st.warning(_NO_DVOL_NOTE.format(asset=asset, src=cvol_src))
 
     c1, c2 = st.columns(2)
     with c1:
@@ -810,15 +838,18 @@ def render_asset_tab(asset: str, days: int, resolution: str, prediction_windows:
 
     c5, c6 = st.columns(2)
     with c5:
-        if other in SV_ASSETS:
+        if pair_ok:
             _show(_dvol_spread_chart(days, resolution), f"{asset}_ethbtc_dvol_spread")
         else:
-            st.info(f"Need {other} data (unavailable) to compute the ETH/BTC DVOL spread.")
+            st.info(f"ETH/BTC DVOL spread is a BTC/ETH-only panel ({asset} has no DVOL index).")
     with c6:
-        end_dt = datetime.now(timezone.utc)
-        start_dt = end_dt - timedelta(days=days)
-        start_ms, end_ms = int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
-        _show(_candlestick_dvol(asset, start_ms, end_ms, resolution, svol), f"{asset}_dvol_candles")
+        if has_dvol:
+            end_dt = datetime.now(timezone.utc)
+            start_dt = end_dt - timedelta(days=days)
+            start_ms, end_ms = int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+            _show(_candlestick_dvol(asset, start_ms, end_ms, resolution, svol), f"{asset}_dvol_candles")
+        else:
+            st.info(f"No DVOL index exists for {asset} on Deribit — DVol candle panel skipped.")
 
     c7, c8 = st.columns(2)
     with c7:
@@ -826,16 +857,19 @@ def render_asset_tab(asset: str, days: int, resolution: str, prediction_windows:
     with c8:
         _show(_chart_rolling_covariance(spot, cvol, asset), f"{asset}_roll_cov")
 
-    c9, c10 = st.columns(2)
-    with c9:
-        _show(_rv_iv_basis_chart(asset, days), f"{asset}_rv_iv_basis")
-    with c10:
-        if other in SV_ASSETS:
-            _show(_rv_iv_basis_spread_chart(days), f"{asset}_rv_iv_basis_spread")
-        else:
-            st.info(f"Need {other} data (unavailable) to compute the RV-IV basis spread.")
+    if basis_ok:
+        c9, c10 = st.columns(2)
+        with c9:
+            _show(_rv_iv_basis_chart(asset, days), f"{asset}_rv_iv_basis")
+        with c10:
+            if pair_ok:
+                _show(_rv_iv_basis_spread_chart(days), f"{asset}_rv_iv_basis_spread")
+            else:
+                st.info("ETH/BTC RV-IV basis spread is a BTC/ETH-only panel.")
+    else:
+        st.caption(f"RV-IV basis skipped for {asset}: its CVOL history is itself scaled from RV, so the basis would be circular.")
 
-    if other in SV_ASSETS:
+    if pair_ok:
         c11, c12 = st.columns(2)
         with c11:
             _show(_zscore_chart(_rolling_zscore(_dvol_spread_series(days, resolution)), "ETH-BTC DVOL Spread"), f"{asset}_dvol_spread_z")
@@ -885,18 +919,20 @@ def send_asset_report_to_telegram(asset: str, days: int, resolution: str, predic
     svol, svol_est, svol_src = _svol_series(asset, days)
     rr, rr_est, rr_src = _rr_series(asset, days)
     bf, bf_est, bf_src = _bf_series(asset, days)
-    other = "ETH" if asset == "BTC" else "BTC"
     # ETH-BTC pair charts are identical whichever asset is the "primary" one,
     # so send_all_reports_to_telegram only requests them on the first asset.
-    pair_ok = include_pair_charts and other in SV_ASSETS
+    pair_ok = include_pair_charts and asset in PAIR_ASSETS
+    has_dvol = _has_dvol(asset)
+    basis_ok = has_dvol or not cvol_est   # see render_asset_tab
 
     latest_cvol = f"{cvol.iloc[-1]:.2f}%" if not cvol.empty else "—"
     latest_skew = f"{svol.iloc[-1]:.2f}%" if not svol.empty else "—"
+    rv_note = "\n⚠️ no DVOL — vol history is RV-scaled" if (not has_dvol and cvol_est) else ""
     send_message(
         f"📈 <b>Spot Vol Correlation – {asset}</b>\n\n"
         f"Spot: ${spot.iloc[-1]:,.2f}\n"
         f"CVOL 30d: {latest_cvol}\n"
-        f"25Δ Skew: {latest_skew}"
+        f"25Δ Skew: {latest_skew}{rv_note}"
     )
 
     end_dt = datetime.now(timezone.utc)
@@ -909,10 +945,10 @@ def send_asset_report_to_telegram(asset: str, days: int, resolution: str, predic
         (_scatter_vs_spot(_align_to_spot(rr, spot), asset, f"10Δ Risk Reversal vs Spot — {asset}", "10Δ RR (%)", rr_est, rr_src), f"{asset} - 10Δ RR vs Spot"),
         (_scatter_vs_spot(_align_to_spot(bf, spot), asset, f"10Δ Butterfly vs Spot — {asset}", "10Δ BF (%)", bf_est, bf_src), f"{asset} - 10Δ BF vs Spot"),
         (_dvol_spread_chart(days, resolution) if pair_ok else None, "ETH/BTC DVOL Spread"),
-        (_candlestick_dvol(asset, start_ms, end_ms, resolution, svol), f"{asset} - DVol Snapshot"),
+        (_candlestick_dvol(asset, start_ms, end_ms, resolution, svol) if has_dvol else None, f"{asset} - DVol Snapshot"),
         (_chart_rolling_correlation(spot, cvol, asset), f"{asset} - Rolling Correlation"),
         (_chart_rolling_covariance(spot, cvol, asset), f"{asset} - Rolling Covariance"),
-        (_rv_iv_basis_chart(asset, days), f"{asset} - RV-IV Basis"),
+        (_rv_iv_basis_chart(asset, days) if basis_ok else None, f"{asset} - RV-IV Basis"),
         (_rv_iv_basis_spread_chart(days) if pair_ok else None, "ETH-BTC RV-IV Basis Spread"),
         (_zscore_chart(_rolling_zscore(_dvol_spread_series(days, resolution)), "ETH-BTC DVOL Spread") if pair_ok else None, "ETH-BTC DVOL Spread Z-Score"),
         (_dvol_beta_chart(days, resolution) if pair_ok else None, "ETH DVOL Beta to BTC DVOL"),
@@ -929,9 +965,10 @@ def send_asset_report_to_telegram(asset: str, days: int, resolution: str, predic
     return sent, failed
 
 
-def send_all_reports_to_telegram(days: int, resolution: str, prediction_windows: tuple) -> tuple[int, list[str]]:
+def send_all_reports_to_telegram(days: int, resolution: str, prediction_windows: tuple,
+                                 assets: tuple | list | None = None) -> tuple[int, list[str]]:
     total_sent, total_failed = 0, []
-    for i, asset in enumerate(SV_ASSETS):
+    for i, asset in enumerate(assets or SV_ASSETS):
         sent, failed = send_asset_report_to_telegram(
             asset, days, resolution, prediction_windows, include_pair_charts=(i == 0))
         total_sent += sent
@@ -990,7 +1027,7 @@ def _check_dvol_spread_alert(z: float, sigma_threshold: float, spread_now: float
 # MAIN
 # ============================================================================
 
-ASSET_NAMES = {"BTC": "₿ Bitcoin (BTC)", "ETH": "⟠ Ethereum (ETH)"}
+ASSET_NAMES = {"BTC": "₿ Bitcoin (BTC)", "ETH": "⟠ Ethereum (ETH)", "SOL": "◎ Solana (SOL)", "HYPE": "Ⓗ Hyperliquid (HYPE)"}
 
 
 def main() -> None:
@@ -1015,7 +1052,7 @@ def main() -> None:
             prediction_windows = _prediction_windows_for_lookback(days)
             with st.spinner("Sending Spot Vol Correlation reports for BTC+ETH…"):
                 sent, failed = send_all_reports_to_telegram(
-                    days, resolution, prediction_windows)
+                    days, resolution, prediction_windows, assets=AUTO_ASSETS)
             st.session_state["auto_pipeline"] = None
             st.session_state["auto_pipeline_started_at"] = None
             if failed:
@@ -1035,9 +1072,11 @@ def main() -> None:
 
     with st.expander("📖 How to Use This Dashboard", expanded=False):
         st.markdown("""
-        Explores how **spot price** relates to **options volatility** for BTC and ETH
-        (both have a Deribit DVOL index — SOL/HYPE don't, so this page is scoped to
-        BTC/ETH only).
+        Explores how **spot price** relates to **options volatility** for BTC, ETH,
+        SOL and HYPE. Only BTC/ETH have a Deribit DVOL index; SOL/HYPE vol history is
+        **RV-scaled** (today's surface shape, level moved by 7d realized vol until
+        recorded snapshots build up), so their DVol candles and RV-IV basis panels
+        are skipped and their spot-vol relationships should be read with that in mind.
 
         - **CVOL** — 30-day ATM implied vol, reconstructed from the live Deribit
           option chain plus recorded/re-levelled history (`lib/history.py`).

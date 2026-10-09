@@ -160,9 +160,9 @@ st.subheader("Pages")
 page_info = [
     ("01 MCM Bot", f"Full markets bot: {len(cmdreg.COMMAND_NAMES)} commands — vol/skew term structure, forward vols, carry, basis, flow, RV"),
     ("02 Block Trades", "Deribit block trade analysis with Greeks and Telegram reporting"),
-    ("06 Time Based Realized Vol", "RV across hedging frequencies + lookbacks (BTC/ETH perps), 7 estimators, decision matrix"),
+    ("06 Time Based Realized Vol", "RV across hedging frequencies + lookbacks (BTC/ETH/SOL/HYPE perps), 7 estimators, decision matrix"),
     ("07 Regime Identifier", "Vol regime classification (GARCH + implied vol)"),
-    ("08 Spot-Vol Correlation", "DVOL vs spot analysis (BTC/ETH)"),
+    ("08 Spot-Vol Correlation", "DVOL vs spot analysis (BTC/ETH; SOL/HYPE on RV-scaled vol)"),
     ("10 Macro Event Impact", "CPI/FOMC/NFP surprise z-scores + price reactions"),
     ("11 Fear & Greed Signal", "Contrarian delta-lean backtest vs alternative.me Fear & Greed Index"),
 ]
