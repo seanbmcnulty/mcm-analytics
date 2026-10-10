@@ -66,7 +66,7 @@ SGT = timezone(timedelta(hours=8))
 ASSETS = ["BTC", "ETH", "SOL", "HYPE"]
 # Minimum trade size (underlying units) below which a block is hidden.
 # Deliberately low: Derive RFQ fills are far smaller than Deribit blocks.
-DEFAULT_MIN_SIZES = {"BTC": 0.1, "ETH": 1.0, "SOL": 10.0, "HYPE": 100.0}
+DEFAULT_MIN_SIZES: Dict[str, float] = {}   # 0 for every underlying: show all blocks (flows are small)
 
 _session = requests.Session()
 
@@ -314,6 +314,7 @@ class _Venue:
                   "Taker rows only; direction = taker side. IV is backed out of trade price "
                   "(Black-Scholes, r=0, per-trade index price). Index line: public/get_index_chart_data. "
                   "DVOL overlay is Deribit's.")
+    listed = staticmethod(listed_bases)
     fetch_all = staticmethod(fetch_all)
     fetch_spot = staticmethod(fetch_spot)
     fetch_hist_spot = staticmethod(fetch_hist_spot)

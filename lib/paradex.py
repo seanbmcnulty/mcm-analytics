@@ -38,7 +38,7 @@ API_BASE = "https://api.prod.paradex.trade/v1"
 SGT = timezone(timedelta(hours=8))
 
 ASSETS = ["BTC", "ETH", "SOL", "HYPE"]
-DEFAULT_MIN_SIZES = {"BTC": 0.01, "ETH": 0.1, "SOL": 1.0, "HYPE": 10.0}
+DEFAULT_MIN_SIZES: Dict[str, float] = {}   # 0 for every underlying: show all blocks (flows are small)
 
 _session = requests.Session()
 _KLINE_CHUNK_BARS = 500
@@ -230,8 +230,6 @@ def feed_status(meta: Dict, now_ms: Optional[int] = None) -> Optional[str]:
     parts = [f"{meta['option_legs']} option legs on the block tape"]
     if meta.get("non_option_legs"):
         parts.append(f"{meta['non_option_legs']} perp hedge legs (not charted)")
-    if meta.get("other_bases"):
-        parts.append("other underlyings (headline only, no tab): " + ", ".join(meta["other_bases"]))
     return "Window contains " + "; ".join(parts) + "."
 
 
@@ -249,6 +247,7 @@ class _Venue:
                   "a `block_id`. The tape has no mark or IV, so IV is backed out of price (Black-Scholes, "
                   "r=0) using the Paradex perp price at the trade minute, and the mark-based Edge and "
                   "Aggression views are not available. DVOL overlay is Deribit's.")
+    listed = staticmethod(listed_bases)
     fetch_all = staticmethod(fetch_all)
     fetch_spot = staticmethod(fetch_spot)
     fetch_hist_spot = staticmethod(fetch_hist_spot)

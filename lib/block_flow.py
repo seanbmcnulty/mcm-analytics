@@ -44,7 +44,7 @@ from lib import cache as cache_lib
 from lib import deribit
 from lib import fx_style
 from lib import telegram
-from lib.constants import TTL_MEDIUM, TTL_SHORT
+from lib.constants import TTL_MEDIUM, TTL_SHORT, TTL_SLOW
 from lib.telegram_caption import caption_from_title
 
 SGT = timezone(timedelta(hours=8))
@@ -324,7 +324,7 @@ def plot_strike_vs_expiry(data, asset):
                 continue
             fig.add_trace(go.Scatter(
                 x=s["expiry_str"], y=s["strike"], mode="markers", hoverinfo="text",
-                text=[f"Expiry: {r.expiry_str}<br>Strike: {r.strike:,.0f}<br>{d} {opt}<br>"
+                text=[f"Expiry: {r.expiry_str}<br>Strike: {r.strike:,.6g}<br>{d} {opt}<br>"
                       f"Premium: ${r.prem:,.0f}<br>Net amount: {r.amount:,.3f}" for r in s.itertuples()],
                 marker=dict(size=s["prem"], sizemode="area", sizeref=max(sizeref, 1e-12), sizemin=4,
                             color=colr, symbol=sym, opacity=0.75, line=dict(width=1, color="white")),
@@ -403,7 +403,7 @@ def plot_iv_surface(data, asset, with_note):
             fig.add_trace(go.Scatter(
                 x=s["strike"], y=s["iv"], mode="markers", hoverinfo="text", legendgroup=r["expiry_str"],
                 name=f"{r['expiry_str']} ({side})", showlegend=(side == "Buy"),
-                text=[f"{side} {x.option_type}<br>{r['expiry_str']}<br>Strike: {x.strike:,.0f}<br>"
+                text=[f"{side} {x.option_type}<br>{r['expiry_str']}<br>Strike: {x.strike:,.6g}<br>"
                       f"Size: {x.abs_amount:,.3f}<br>IV: {x.iv:.1f}%" for x in s.itertuples()],
                 marker=dict(size=_sizes(s["abs_premium_usd"], 6, 30), color=colr, symbol=sym, opacity=0.8,
                             line=dict(width=1, color="white"))))
@@ -600,11 +600,17 @@ def _send_many(pairs, label, venue_title):
 _VENUES: dict = {}
 
 
+@st.cache_data(ttl=TTL_SLOW, show_spinner=False)
+def _cached_listed(venue_key: str) -> list:
+    """Every underlying with live options on the venue."""
+    return list(_VENUES[venue_key].listed())
+
+
 @st.cache_data(ttl=TTL_MEDIUM, show_spinner=False)
-def _cached_all(venue_key: str, start_ms: int):
+def _cached_all(venue_key: str, start_ms: int, assets: tuple):
     v = _VENUES[venue_key]
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    return v.fetch_all(start_ms, end_ms, list(v.assets))
+    return v.fetch_all(start_ms, end_ms, list(assets))
 
 
 @st.cache_data(ttl=TTL_SHORT, show_spinner=False)
@@ -642,12 +648,25 @@ def _anchor(now):
     return (now - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
 
 
+def _par(fn, keys, workers=8):
+    """{key: fn(key)} in parallel; a failing call yields None instead of raising."""
+    def safe(k):
+        try:
+            return fn(k)
+        except Exception:
+            return None
+    if not keys:
+        return {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(keys), workers)) as ex:
+        return dict(zip(keys, ex.map(safe, keys)))
+
+
 # ---------------------------------------------------------------------------
 # Page
 # ---------------------------------------------------------------------------
 def render_page(venue) -> None:
     _VENUES[venue.key] = venue
-    assets = list(venue.assets)
+    core = list(venue.assets)
 
     st.set_page_config(page_title=f"Block Trades — {venue.title}", page_icon="📊", layout="wide",
                        initial_sidebar_state="expanded")
@@ -660,6 +679,10 @@ def render_page(venue) -> None:
 </style>""", unsafe_allow_html=True)
     st.markdown(f'<div class="main-header"><h1>📊 BLOCK TRADES - {venue.title.upper()}</h1></div>',
                 unsafe_allow_html=True)
+
+    # Every underlying with live options gets a tab + a min-size filter.
+    listed = _cached_listed(venue.key)
+    base_assets = core + sorted(a for a in listed if a not in core)
 
     with st.sidebar:
         st.header("⚙️ Dashboard Controls")
@@ -680,12 +703,12 @@ def render_page(venue) -> None:
         # minute-rounded so the cache key is stable within a minute
         start_ms = int(start_sgt.astimezone(timezone.utc).replace(second=0, microsecond=0).timestamp() * 1000)
 
-        st.subheader("Minimum Block Sizes")
-        min_sizes = {}
-        for a in assets:
-            dv = float(venue.default_min_sizes[a])
-            min_sizes[a] = st.number_input(f"{a} Min Size", min_value=0.0, value=dv,
-                                           step=max(dv / 10, 0.001), format="%g", key=f"{venue.key}_min_{a}")
+        with st.expander(f"Minimum Block Sizes ({len(base_assets)} underlyings, 0 = show all)"):
+            min_sizes = {}
+            for a in base_assets:
+                min_sizes[a] = st.number_input(f"{a} Min Size", min_value=0.0,
+                                               value=float(venue.default_min_sizes.get(a, 0.0)),
+                                               step=0.001, format="%g", key=f"{venue.key}_min_{a}")
         st.divider()
         if st.checkbox("Auto-refresh (60s)", value=False, key=f"{venue.key}_auto"):
             time.sleep(60)
@@ -699,76 +722,59 @@ def render_page(venue) -> None:
             st.warning("Telegram not configured")
             st.caption(telegram.config_status())
 
-    with st.spinner(f"Fetching {venue.title} block trades, spot and DVOL..."):
+    with st.spinner(f"Fetching {venue.title} block trades..."):
         try:
-            payload = _cached_all(venue.key, start_ms)
+            payload = _cached_all(venue.key, start_ms, tuple(base_assets))
         except Exception as e:
             st.error(f"{venue.title} fetch failed: {e}")
             st.stop()
         frames, meta = payload["frames"], payload["meta"]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-            spot_f = {a: ex.submit(_cached_spot, venue.key, a) for a in assets}
-            meta_hist = meta.get("hist_spot", {})
-            hist_f = {a: ex.submit(_cached_hist, venue.key, a, start_ms) for a in assets
-                      if a not in meta_hist}
-            dvol_f = {a: ex.submit(_cached_dvol, a, start_ms) for a in assets}
-            spots = {a: spot_f[a].result() for a in assets}
-            hists = {a: (meta_hist[a] if a in meta_hist else hist_f[a].result()) for a in assets}
-            dvols = {a: dvol_f[a].result() for a in assets}
+        raw_active = [a for a in base_assets if frames.get(a) is not None and not frames[a].empty]
+        spots = _par(lambda a: _cached_spot(venue.key, a), raw_active)
 
     data = {}
-    for a in assets:
-        raw = frames.get(a, pd.DataFrame())
-        if raw is None or raw.empty:
-            data[a] = pd.DataFrame()
-            continue
-        f = raw[raw["abs_amount"] >= min_sizes[a]].copy()
-        data[a] = enrich(f, spots[a], a, venue.has_mark) if not f.empty else pd.DataFrame()
+    for a in base_assets:
+        raw = frames.get(a)
+        f = raw[raw["abs_amount"] >= min_sizes[a]].copy() if raw is not None and not raw.empty else pd.DataFrame()
+        data[a] = enrich(f, spots.get(a) or 0.0, a, venue.has_mark) if not f.empty else pd.DataFrame()
+
+    # Logical order: the core assets first, then the rest by premium traded (busiest first), then name.
+    def _prem(a):
+        return float(data[a]["abs_premium_usd"].sum()) if not data[a].empty else 0.0
+    assets = core + sorted((a for a in base_assets if a not in core), key=lambda a: (-_prem(a), a))
+    active = [a for a in assets if not data[a].empty]
+
+    with st.spinner("Fetching spot history and DVOL..."):
+        hists = _par(lambda a: _cached_hist(venue.key, a, start_ms), active)
+        dvols = _par(lambda a: _cached_dvol(a, start_ms), [a for a in active if a in ("BTC", "ETH")])
+    hists = {a: (hists.get(a) if hists.get(a) is not None else pd.DataFrame()) for a in assets}
+    dvols = {a: (dvols.get(a) if dvols.get(a) is not None else pd.Series(dtype=float)) for a in assets}
 
     st.caption(venue.definition)
     note = venue.feed_status(meta)
     if note:
         st.info(note)
 
-    cols = st.columns(len(assets))
-    for c, a in zip(cols, assets):
-        n = len(data[a])
-        prem = data[a]["abs_premium_usd"].sum() if n else 0.0
-        c.metric(f"{a} Blocks", f"{n}", f"${prem:,.0f} premium" if n else None, delta_color="off")
+    # Headline: every listed underlying, one metric each, same order as the tabs.
+    for r in range(0, len(assets), 6):
+        for c, a in zip(st.columns(6), assets[r:r + 6]):
+            n = len(data[a])
+            c.metric(f"{a} Blocks", f"{n}", f"${_prem(a):,.0f} premium" if n else None, delta_color="off")
 
-    # Every other underlying listed on the venue: headline only (no tab, no size filter).
-    extras = [a for a in (meta.get("listed") or []) if a not in assets]
-    if extras:
-        def _prem(a):
-            f = frames.get(a)
-            return float((f["abs_amount"] * f["price"]).sum()) if f is not None and not f.empty else 0.0
-        extras.sort(key=lambda a: (-_prem(a), a))
-        with st.expander(f"Other listed underlyings ({len(extras)}) — blocks in window, no size filter", expanded=True):
-            for r in range(0, len(extras), 8):
-                row = extras[r:r + 8]
-                for c, a in zip(st.columns(8), row):
-                    f = frames.get(a)
-                    n = 0 if f is None else len(f)
-                    c.metric(f"{a} Blocks", f"{n}", f"${_prem(a):,.0f}" if n else None, delta_color="off")
-
-    # --- build charts once; reused by screen + Telegram
-    figs = {a: build_figs(data[a], hists[a], dvols[a], spots[a], a, venue) for a in assets}
-    n_charts = len(next(iter(figs.values())))
+    figs = {a: build_figs(data[a], hists[a], dvols[a], spots.get(a) or 0.0, a, venue) for a in active}
+    n_charts = len(next(iter(figs.values()))) if figs else 0
 
     tg_ok = telegram.is_configured()
     st.caption("Send charts to Telegram (as images):" if tg_ok else f"Telegram not configured: {telegram.config_status()}")
-    bcols = st.columns(len(assets) + 2)
-    clicked = {}
-    for a, c in zip(assets, bcols):
-        with c:
-            clicked[a] = st.button(a, key=f"{venue.key}_tg_{a}", width="stretch", disabled=not tg_ok,
-                                   help=f"Send {a}'s {n_charts} charts to Telegram.")
-    btc_eth = [a for a in assets if a in ("BTC", "ETH")]
-    with bcols[len(assets)]:
-        c_pair = st.button("BTC+ETH", key=f"{venue.key}_tg_pair", width="stretch",
-                           disabled=not tg_ok or not btc_eth)
-    with bcols[len(assets) + 1]:
-        c_all = st.button("📤 All", key=f"{venue.key}_tg_all", width="stretch", disabled=not tg_ok)
+    t1, t2, t3, t4 = st.columns([2, 1, 1, 1])
+    pick = t1.selectbox("Underlying", active or ["—"], key=f"{venue.key}_tg_pick", label_visibility="collapsed",
+                        disabled=not (tg_ok and active))
+    c_one = t2.button("Send selected", key=f"{venue.key}_tg_one", width="stretch", disabled=not (tg_ok and active),
+                      help=f"Send the selected underlying's {n_charts} charts.")
+    btc_eth = [a for a in ("BTC", "ETH") if a in figs]
+    c_pair = t3.button("BTC+ETH", key=f"{venue.key}_tg_pair", width="stretch", disabled=not (tg_ok and btc_eth))
+    c_all = t4.button("📤 All with data", key=f"{venue.key}_tg_all", width="stretch", disabled=not (tg_ok and active),
+                      help=f"Send every underlying that has blocks ({len(active)} x {n_charts} charts).")
 
     tabs = st.tabs([f"📈 {a}" for a in assets] + ["📊 ALL (2x2 Grid)", "📋 Block Trade Statistics"])
     for i, a in enumerate(assets):
@@ -777,9 +783,10 @@ def render_page(venue) -> None:
                         unsafe_allow_html=True)
             df = data[a]
             if df.empty:
-                n_raw = len(frames.get(a, pd.DataFrame()))
-                st.info(f"No {a} blocks at/above the {min_sizes[a]:g} minimum size in this window"
-                        + (f" ({n_raw} below the minimum)." if n_raw else "."))
+                n_raw = 0 if frames.get(a) is None else len(frames[a])
+                st.info(f"No {a} blocks in this window"
+                        + (f" at/above the {min_sizes[a]:g} minimum size ({n_raw} below it)." if n_raw else "."))
+                continue
             fs = figs[a]
             k = f"{venue.key}_{a}"
             st.plotly_chart(fs[0], width="stretch", key=f"{k}_scatter")
@@ -803,43 +810,40 @@ def render_page(venue) -> None:
             c8.plotly_chart(fs[12], width="stretch", key=f"{k}_wvega_strike")
             if venue.has_mark:
                 st.plotly_chart(fs[13], width="stretch", key=f"{k}_aggr")
-            if not df.empty:
-                st.divider()
-                st.subheader(f"{a} Block Packages")
-                pk = build_packages(df)
-                fmt = {"Net premium $": "${:,.0f}", "Net delta $": "${:,.0f}",
-                       "Net vega $": "${:,.0f}", "Gross premium $": "${:,.0f}"}
-                if "Perp hedge" in pk.columns:
-                    fmt["Perp hedge"] = "{:+,.3f}"
-                st.dataframe(pk.style.format(fmt),
-                             width="stretch", hide_index=True)
+            st.divider()
+            st.subheader(f"{a} Block Packages")
+            pk = build_packages(df)
+            fmt = {"Net premium $": "${:,.0f}", "Net delta $": "${:,.0f}",
+                   "Net vega $": "${:,.0f}", "Gross premium $": "${:,.0f}"}
+            if "Perp hedge" in pk.columns:
+                fmt["Perp hedge"] = "{:+,.3f}"
+            st.dataframe(pk.style.format(fmt), width="stretch", hide_index=True)
 
-    for a in assets:
-        if clicked.get(a):
-            _send_many([(a, f) for f in figs[a]], a, venue.title)
+    if c_one and pick in figs:
+        _send_many([(pick, f) for f in figs[pick]], pick, venue.title)
     if c_pair and btc_eth:
         _send_many([(a, f) for a in btc_eth for f in figs[a]], "BTC+ETH", venue.title)
     if c_all:
-        _send_many([(a, f) for a in assets for f in figs[a]], "all assets", venue.title)
+        _send_many([(a, f) for a in active for f in figs[a]], "all underlyings", venue.title)
 
     with tabs[len(assets)]:
         st.markdown(f'<div class="asset-header">📊 ALL {venue.title} Block Trades Overview</div>', unsafe_allow_html=True)
-        for r in range(0, len(assets), 2):
+        for r in range(0, len(core), 2):
             cc = st.columns(2)
-            for c, a in zip(cc, assets[r:r + 2]):
+            for c, a in zip(cc, core[r:r + 2]):
                 c.plotly_chart(plot_scatter(data[a], hists[a], dvols[a], a, venue.perp_label),
                                width="stretch", key=f"{venue.key}_grid_{a}")
 
     with tabs[len(assets) + 1]:
         st.markdown('<div class="asset-header">📋 Block Trade Statistics (Greeks & Expiry Breakdown)</div>',
                     unsafe_allow_html=True)
-        sub = st.tabs(assets)
-        for s, a in zip(sub, assets):
-            with s:
-                if data[a].empty:
-                    st.info(f"No {a} block trades in this window.")
-                    continue
-                st.subheader(f"{a} Greeks & Volume by Expiry")
-                st.dataframe(style_statistics_table(create_expiry_table(data[a], venue.has_mark)), width="stretch")
-                st.caption("Greeks are dollar Greeks at current spot using each trade's own (price-implied) IV; "
-                           "Delta/Vega/Gamma are signed from the taker's side (buy +, sell -).")
+        if not active:
+            st.info("No block trades in this window.")
+        else:
+            sub = st.tabs(active)
+            for s_tab, a in zip(sub, active):
+                with s_tab:
+                    st.subheader(f"{a} Greeks & Volume by Expiry")
+                    st.dataframe(style_statistics_table(create_expiry_table(data[a], venue.has_mark)), width="stretch")
+                    st.caption("Greeks are dollar Greeks at execution using each trade's own (price-implied) IV; "
+                               "Delta/Vega/Gamma are signed from the taker's side (buy +, sell -).")
