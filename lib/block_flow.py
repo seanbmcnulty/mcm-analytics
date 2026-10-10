@@ -705,10 +705,12 @@ def render_page(venue) -> None:
         frames, meta = payload["frames"], payload["meta"]
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
             spot_f = {a: ex.submit(_cached_spot, venue.key, a) for a in assets}
-            hist_f = {a: ex.submit(_cached_hist, venue.key, a, start_ms) for a in assets}
+            meta_hist = meta.get("hist_spot", {})
+            hist_f = {a: ex.submit(_cached_hist, venue.key, a, start_ms) for a in assets
+                      if a not in meta_hist}
             dvol_f = {a: ex.submit(_cached_dvol, a, start_ms) for a in assets}
             spots = {a: spot_f[a].result() for a in assets}
-            hists = {a: hist_f[a].result() for a in assets}
+            hists = {a: (meta_hist[a] if a in meta_hist else hist_f[a].result()) for a in assets}
             dvols = {a: dvol_f[a].result() for a in assets}
 
     data = {}
