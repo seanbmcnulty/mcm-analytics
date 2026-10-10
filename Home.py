@@ -172,3 +172,76 @@ for i, (name, desc) in enumerate(page_info):
     with grid_cols[i % 3]:
         st.markdown(f"**{name}**")
         st.caption(desc)
+
+
+# ---------------------------------------------------------------------------
+# Cross-exchange option block flow (Deribit / Derive / Paradex)
+# ---------------------------------------------------------------------------
+# Placed last so everything above renders before the (slower) three-venue fetch.
+
+st.divider()
+st.subheader("Option Block Flow — Deribit vs Derive vs Paradex")
+
+from datetime import timedelta
+
+import pandas as pd
+import plotly.graph_objects as go
+
+from lib import flow_summary
+from lib.constants import TTL_MEDIUM
+
+
+@st.cache_data(ttl=TTL_MEDIUM, show_spinner=False)
+def _flow_payloads(start_ms: int):
+    return flow_summary.collect(start_ms)
+
+
+_win = st.radio("Window", ["Last 12 Hours", "Last 24 Hours"], index=1, horizontal=True,
+                key="home_flow_window")
+_hours = 12 if _win == "Last 12 Hours" else 24
+_start_ms = int((datetime.now(timezone.utc) - timedelta(hours=_hours))
+                .replace(second=0, microsecond=0).timestamp() * 1000)
+
+with st.spinner("Loading block flow from Deribit, Derive and Paradex..."):
+    _by_venue, _by_asset, _notes = flow_summary.summarize(_flow_payloads(_start_ms))
+
+if _by_venue.empty:
+    st.info("No block flow found in this window.")
+else:
+    _money = lambda x: f"${x:,.0f}" if pd.notna(x) else "—"  # noqa: E731
+    _pct = lambda x: f"{x:.0%}" if pd.notna(x) else "—"  # noqa: E731
+    _fmt = {"Gross premium $": _money, "Net delta $": _money, "Net vega $": _money,
+            "Call %": _pct, "Taker-buy %": _pct, "Greeks cover": _pct, "Largest $": _money,
+            "Blocks": "{:,}", "Underlyings": "{:,}"}
+
+    st.dataframe(_by_venue.style.format({k: v for k, v in _fmt.items() if k in _by_venue.columns}),
+                 width="stretch", hide_index=True)
+
+    _c1, _c2 = st.columns(2)
+    for _col, _title, _col_name, _a, _b in (
+            (_c1, "Calls vs Puts (% of premium)", "Call %", "Calls", "Puts"),
+            (_c2, "Taker buys vs sells (% of premium)", "Taker-buy %", "Buys", "Sells")):
+        _fig = go.Figure()
+        _fig.add_bar(y=_by_venue["Exchange"], x=_by_venue[_col_name], orientation="h", name=_a,
+                     marker_color="#2E8B57", text=_by_venue[_col_name].map(_pct), textposition="inside")
+        _fig.add_bar(y=_by_venue["Exchange"], x=1 - _by_venue[_col_name], orientation="h", name=_b,
+                     marker_color="#C0392B", text=(1 - _by_venue[_col_name]).map(_pct), textposition="inside")
+        _fig.update_layout(barmode="stack", title=_title, height=240, margin=dict(l=10, r=10, t=40, b=10),
+                           xaxis=dict(tickformat=".0%", range=[0, 1]), yaxis=dict(autorange="reversed"),
+                           legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.5, xanchor="center"))
+        _col.plotly_chart(_fig, width="stretch", key=f"home_flow_{_col_name}")
+
+    with st.expander("By underlying"):
+        st.dataframe(_by_asset.style.format({k: v for k, v in _fmt.items() if k in _by_asset.columns}),
+                     width="stretch", hide_index=True)
+
+    for _v, _n in _notes.items():
+        st.warning(f"{_v}: {_n}")
+    st.caption(
+        "Block definitions differ by venue: Deribit = trades at/above the per-asset minimum size used on the "
+        "Block Trades — Deribit page (its public feed has no block flag); Derive = RFQ fills (quote_id/rfq_id "
+        "present); Paradex = trade_type BLOCK_TRADE. Premium is USD (coin-margined Deribit BTC/ETH converted at "
+        "each trade's index). Call %, Taker-buy % are premium-weighted; Net delta/vega are dollar Greeks at "
+        "execution, signed from the taker's side (buy +, sell -), using each trade's own IV. "
+        "Greeks cover = share of premium with an index price to compute them."
+    )

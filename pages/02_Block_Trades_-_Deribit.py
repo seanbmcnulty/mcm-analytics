@@ -31,6 +31,7 @@ from lib import fx_style
 from lib import telegram
 from lib.constants import TTL_SHORT, TTL_MEDIUM
 from lib.telegram_caption import caption_from_title
+from lib.flow_summary import DERIBIT_EXTRA_MIN_SIZES
 
 # ---------------------------------------------------------------------------
 # Page Config & Styles
@@ -146,6 +147,14 @@ with st.sidebar:
             value=float(default_val),
             step=1.0 if default_val >= 10 else 0.1
         )
+
+    # Listed on Deribit but without a tab: counted in the headline only.
+    with st.expander("Headline-only underlyings (no tab)"):
+        extra_min_sizes = {
+            a: st.number_input(f"{a.replace('_USDC', ' (USDC)')} Min Size", min_value=0.0,
+                               value=float(v), step=1.0, format="%g", key=f"extra_min_{a}")
+            for a, v in DERIBIT_EXTRA_MIN_SIZES.items()
+        }
 
     st.divider()
     auto_refresh = st.checkbox("Auto-refresh (60s)", value=False)
@@ -1356,6 +1365,15 @@ for idx, asset in enumerate(ASSETS):
     cnt = len(asset_data_dict[asset])
     vol = asset_data_dict[asset]['abs_amount'].sum() if cnt > 0 else 0
     m_cols[idx].metric(f"{clean} Blocks", f"{cnt}", f"{vol:,.0f} ctrs")
+
+# Remaining listed underlyings (BTC/ETH-USDC, TRX-USDC): headline only, same size-threshold rule.
+_usdc_raw = currency_trades.get('USDC', pd.DataFrame())
+_extra_cols = st.columns(len(extra_min_sizes))
+for _col, (_a, _ms) in zip(_extra_cols, extra_min_sizes.items()):
+    _sub = (_usdc_raw[_usdc_raw['instrument_name'].str.startswith(f"{_a}-") & (_usdc_raw['abs_amount'] >= _ms)]
+            if not _usdc_raw.empty and 'instrument_name' in _usdc_raw.columns else pd.DataFrame())
+    _vol = _sub['abs_amount'].sum() if len(_sub) else 0
+    _col.metric(f"{_a.replace('_USDC', ' (USDC)')} Blocks", f"{len(_sub)}", f"{_vol:,.0f} ctrs")
 
 # ---------------------------------------------------------------------------
 # Send to Telegram — one button per asset, a BTC+ETH combo, plus "All",

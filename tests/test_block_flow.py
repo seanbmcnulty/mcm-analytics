@@ -72,3 +72,18 @@ def test_enrich_signs_and_premium():
     assert buy.premium_usd == 4 * 1684 and sell.premium_usd == -4 * 1684
     assert buy.dollar_delta > 0 > sell.dollar_delta
     assert buy.dollar_vega > 0 > sell.dollar_vega
+
+
+def test_derive_sub_dollar_strikes_use_underscore_decimals():
+    assert derive.parse_option("PUMP-20261225-0_007-C")[2] == 0.007
+    assert derive.parse_option("LIT-20261023-3_4-P")[2] == 3.4
+
+
+def test_flow_summary_normalises_deribit_usd_premium():
+    from lib import flow_summary
+    rows = [{"trade_id": "1", "instrument_name": "BTC-26MAR27-80000-C", "timestamp": 1791000000000,
+             "amount": 20.0, "direction": "buy", "price": 0.05, "mark_price": 0.05, "index_price": 80000.0, "iv": 50.0},
+            {"trade_id": "2", "instrument_name": "BTC-26MAR27-80000-C", "timestamp": 1791000001000,
+             "amount": 1.0, "direction": "buy", "price": 0.05, "mark_price": 0.05, "index_price": 80000.0, "iv": 50.0}]
+    df = flow_summary._normalize_deribit(rows, "BTC", 12.5)   # second trade is below the block threshold
+    assert len(df) == 1 and df.iloc[0].price == 0.05 * 80000.0 and df.iloc[0].abs_amount == 20.0

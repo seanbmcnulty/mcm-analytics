@@ -238,9 +238,12 @@ def build_packages(df: pd.DataFrame) -> pd.DataFrame:
             "Net delta $": g["dollar_delta"].sum(),
             "Net vega $": g["dollar_vega"].sum(),
             "Gross premium $": g["abs_premium_usd"].sum(),
+            "Perp hedge": g["hedge_size"].iloc[0] if "hedge_size" in g else 0.0,
             "_t": g["timestamp"].min(),
         })
     out = pd.DataFrame(rows).sort_values("_t", ascending=False).drop(columns="_t")
+    if not (out["Perp hedge"] != 0).any():
+        out = out.drop(columns="Perp hedge")  # venue gives no hedge legs (or none in window)
     return out.reset_index(drop=True)
 
 
@@ -789,8 +792,11 @@ def render_page(venue) -> None:
                 st.divider()
                 st.subheader(f"{a} Block Packages")
                 pk = build_packages(df)
-                st.dataframe(pk.style.format({"Net premium $": "${:,.0f}", "Net delta $": "${:,.0f}",
-                                              "Net vega $": "${:,.0f}", "Gross premium $": "${:,.0f}"}),
+                fmt = {"Net premium $": "${:,.0f}", "Net delta $": "${:,.0f}",
+                       "Net vega $": "${:,.0f}", "Gross premium $": "${:,.0f}"}
+                if "Perp hedge" in pk.columns:
+                    fmt["Perp hedge"] = "{:+,.3f}"
+                st.dataframe(pk.style.format(fmt),
                              width="stretch", hide_index=True)
 
     for a in assets:

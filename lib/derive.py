@@ -20,9 +20,22 @@ Notes
 * v3 renamed ``tx_status`` -> ``batch_status`` (``Batching`` ... ``Settled``, plus
   ``*Error`` variants).  Unset returns every state, so fresh not-yet-settled trades
   show up; ``*Error`` rows are dropped here.  The window is capped at 30 days.
-* v3 has no spot-feed history method; the index overlay is rebuilt from the
-  per-trade ``index_price`` on every option trade, and live spot comes from
-  ``get_ticker`` (``I`` = index price).
+* v3 has no ``get_spot_feed_history``; index history comes from
+  ``public/get_index_chart_data`` (OHLC candles, UTC seconds) and live spot from
+  ``public/get_ticker`` (``I`` = index price).
+
+Public endpoints used (all POST ``/v3/public/<method>``, no auth):
+  get_trade_history      option trades incl. quote_id / rfq_id  -> the block tape
+  get_ticker             live index price (short key ``I``)
+  get_index_chart_data   index OHLC candles for the overlay
+  get_live_incidents     unresolved exchange incidents (shown as a page notice)
+
+Checked and deliberately NOT used: every RFQ/quote method (send_rfq, poll_rfqs,
+get_rfqs, get_quotes, ...) is ``private/*`` — Derive publishes no public RFQ or
+block-trade feed, so the ``quote_id`` / ``rfq_id`` tag on public trades is the
+only public block signal.  ``public/get_tickers`` would give live mark/IV per
+option (``option_pricing.i``) but only for *current* marks, not at trade time.
+Websocket ``trades.option.{currency}`` carries the same data as get_trade_history.
 * Every match is published twice (one maker row, one taker row, same
   ``trade_id``).  We keep the taker row, so ``direction`` is the taker's side —
   the same convention as ``lib.deribit`` trades.
@@ -197,12 +210,12 @@ def fetch_all(start_ms: int, end_ms: int, assets: List[str]) -> Dict:
             rows = futs[a].result()
             df = _normalize(rows, a)
             meta["all_option_rows"][a] = len(df)
-            meta.setdefault("hist_spot", {})[a] = _hist_from_trades(df)
             frames[a] = df[df["is_block"]].reset_index(drop=True) if not df.empty else df
             try:
                 meta["latest_trade_ms"][a] = latest[a].result()
             except Exception:
                 meta["latest_trade_ms"][a] = None
+    meta["incidents"] = live_incidents()
     return {"frames": frames, "meta": meta}
 
 
@@ -223,31 +236,51 @@ def fetch_spot(asset: str) -> float:
         return 0.0
 
 
-def _hist_from_trades(df: pd.DataFrame) -> pd.DataFrame:
-    """Index-price history rebuilt from per-trade ``index_price`` (5-min last)."""
-    if df.empty or "index_price" not in df.columns:
-        return pd.DataFrame()
-    s = (df.dropna(subset=["index_price"]).set_index("timestamp")["index_price"]
-           .sort_index().resample("5min").last().dropna())
-    return pd.DataFrame({"timestamp": s.index, "close": s.values})
-
-
 def fetch_hist_spot(asset: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    """Unused for Derive: v3 has no spot-feed history; fetch_all() returns the
-    series rebuilt from trades in meta['hist_spot'] instead."""
-    return pd.DataFrame()
+    """Index price history (5-min close) via public/get_index_chart_data,
+    fetched in 3-day chunks (the endpoint clamps the bucket count)."""
+    step = 3 * 86400
+    t, end = int(start_ms // 1000), int(end_ms // 1000)
+    rows: List[Dict] = []
+    while t < end:
+        e = min(t + step, end)
+        try:
+            res = _post("get_index_chart_data", {"currency": asset, "period": 300,
+                                                 "start_timestamp": t, "end_timestamp": e})
+            rows.extend(res if isinstance(res, list) else res.get("candles", []))
+        except Exception:
+            pass
+        t = e
+    if not rows:
+        return pd.DataFrame()
+    d = pd.DataFrame(rows).drop_duplicates("timestamp_bucket").sort_values("timestamp_bucket")
+    ts = pd.to_datetime(pd.to_numeric(d["timestamp_bucket"]), unit="s", utc=True).dt.tz_convert(SGT)
+    return pd.DataFrame({"timestamp": ts.values, "close": pd.to_numeric(d["close_price"], errors="coerce").values}
+                        ).dropna().reset_index(drop=True).assign(
+        timestamp=lambda x: pd.to_datetime(x["timestamp"], utc=True).dt.tz_convert(SGT))
+
+
+def live_incidents() -> List[Dict]:
+    """Unresolved exchange incidents (public/get_live_incidents); [] on failure."""
+    try:
+        return list(_post("get_live_incidents", {}).get("incidents", []))
+    except Exception:
+        return []
 
 
 def feed_status(meta: Dict, now_ms: Optional[int] = None) -> Optional[str]:
     """A human note when Derive's trade feed looks stale; None when healthy."""
     now_ms = now_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
+    inc = meta.get("incidents") or []
+    inc_txt = ("Live Derive incident(s): " + "; ".join(
+        f"[{i.get('severity', '?')}] {i.get('label', '')}: {i.get('message', '')}" for i in inc) + " ") if inc else ""
     latest = [v for v in meta.get("latest_trade_ms", {}).values() if v]
     if not latest:
-        return None
+        return inc_txt.strip() or None
     age_h = (now_ms - max(latest)) / 3.6e6
     if age_h < 6:
-        return None
-    return (f"Derive's public trade-history feed last printed an option trade "
+        return inc_txt.strip() or None
+    return inc_txt + (f"Derive's public trade-history feed last printed an option trade "
             f"{age_h:,.0f}h ago, so windows shorter than that will be empty.")
 
 
@@ -263,7 +296,7 @@ class _Venue:
     definition = ("**Block definition:** a trade is a block when it was filled via RFQ "
                   "(`quote_id` / `rfq_id` present in `public/get_trade_history`). "
                   "Taker rows only; direction = taker side. IV is backed out of trade price "
-                  "(Black-Scholes, r=0, per-trade index price). Index line is rebuilt from trade index prices. "
+                  "(Black-Scholes, r=0, per-trade index price). Index line: public/get_index_chart_data. "
                   "DVOL overlay is Deribit's.")
     fetch_all = staticmethod(fetch_all)
     fetch_spot = staticmethod(fetch_spot)

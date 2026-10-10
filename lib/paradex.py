@@ -65,6 +65,11 @@ def _get(path: str, params: Dict, timeout: int = 30, retries: int = 3) -> Dict:
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
+# Parsed from the symbol, not /v1/markets: that list only holds *live* markets, and
+# ~1/3 of a week's block prints are on options that have since expired.  (Checked
+# 2026-10-10: /v1/markets has only OPTION/PERP/SPOT kinds, no PERP_OPTION or
+# RFQ_ONLY markets, and every non-regex tape market is a perp hedge.)  Crypto
+# options expire 08:00 UTC, which lib.block_flow assumes.
 _OPT_RE = re.compile(r"^(?P<base>[A-Z0-9]+)-USD-(?P<exp>\d{1,2}[A-Z]{3}\d{2})-(?P<strike>[0-9_.]+)-(?P<cp>[CP])$")
 
 
@@ -143,6 +148,14 @@ def _normalize(rows: List[Dict], asset: str, klines: pd.DataFrame) -> pd.DataFra
     df["iv"] = np.nan          # backed out by lib.block_flow
     df["is_block"] = True
     df["wallet"] = None
+    # Perp delta hedge legs that ride in the same package (shared block_id):
+    # signed perp size (taker side, buy +) in underlying units, per package.
+    hedge: Dict[str, float] = {}
+    for r in rows:
+        if r["market"] == f"{asset}-USD-PERP" and r.get("block_id"):
+            sz = float(r["size"]) * (1 if str(r["side"]).upper() == "BUY" else -1)
+            hedge[r["block_id"]] = hedge.get(r["block_id"], 0.0) + sz
+    df["hedge_size"] = df["block_id"].map(hedge).fillna(0.0)
     return df.drop(columns="ts_ms")
 
 
