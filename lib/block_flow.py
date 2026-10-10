@@ -736,6 +736,21 @@ def render_page(venue) -> None:
         prem = data[a]["abs_premium_usd"].sum() if n else 0.0
         c.metric(f"{a} Blocks", f"{n}", f"${prem:,.0f} premium" if n else None, delta_color="off")
 
+    # Every other underlying listed on the venue: headline only (no tab, no size filter).
+    extras = [a for a in (meta.get("listed") or []) if a not in assets]
+    if extras:
+        def _prem(a):
+            f = frames.get(a)
+            return float((f["abs_amount"] * f["price"]).sum()) if f is not None and not f.empty else 0.0
+        extras.sort(key=lambda a: (-_prem(a), a))
+        with st.expander(f"Other listed underlyings ({len(extras)}) — blocks in window, no size filter", expanded=True):
+            for r in range(0, len(extras), 8):
+                row = extras[r:r + 8]
+                for c, a in zip(st.columns(8), row):
+                    f = frames.get(a)
+                    n = 0 if f is None else len(f)
+                    c.metric(f"{a} Blocks", f"{n}", f"${_prem(a):,.0f}" if n else None, delta_color="off")
+
     # --- build charts once; reused by screen + Telegram
     figs = {a: build_figs(data[a], hists[a], dvols[a], spots[a], a, venue) for a in assets}
     n_charts = len(next(iter(figs.values())))

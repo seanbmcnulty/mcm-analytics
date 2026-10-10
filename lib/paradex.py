@@ -24,6 +24,7 @@ Limitations vs. Deribit/Derive:
 
 from __future__ import annotations
 
+import concurrent.futures
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -162,31 +163,47 @@ def _normalize(rows: List[Dict], asset: str, klines: pd.DataFrame) -> pd.DataFra
 # ---------------------------------------------------------------------------
 # Public fetchers
 # ---------------------------------------------------------------------------
+def listed_bases() -> List[str]:
+    """Underlyings with options on /v1/markets (live markets only)."""
+    try:
+        m = _get("/markets", {}).get("results", [])
+        return sorted({x["base_currency"] for x in m if x.get("asset_kind") in ("OPTION", "PERP_OPTION")})
+    except Exception:
+        return []
+
+
 def fetch_all(start_ms: int, end_ms: int, assets: List[str]) -> Dict:
-    """One tape fetch + one kline fetch per asset -> {'frames': {asset: df}, 'meta': {...}}."""
+    """One tape fetch + one kline fetch per underlying on the tape
+    -> {'frames': {base: df}, 'meta': {...}}.  Every listed underlying that printed a
+    block is normalised (``meta['listed']`` = all listed bases); only ``assets`` get
+    their own tab, the rest feed the page headline / home-page summary."""
     tape = fetch_block_tape(start_ms, end_ms)
     n_opt = n_perp = 0
+    present_set = set()
     for r in tape:
         base, _, _, cp = parse_option(r["market"])
         if cp:
             n_opt += 1
+            present_set.add(base)
         else:
             n_perp += 1
-    # klines only exist for minutes with trades, so look back well before the
-    # window to give early blocks an index price to merge against
-    k_start = start_ms - 6 * 3_600_000
-    # 1-min bars up to 48h, else 5-min bars
+    k_start = start_ms - 6 * 3_600_000   # klines only exist for minutes with trades
     res = 1 if (end_ms - start_ms) <= 48 * 3.6e6 else 5
-    frames: Dict[str, pd.DataFrame] = {}
-    present = {parse_option(r["market"])[0] for r in tape}
-    for a in assets:
-        if a not in present:
-            frames[a] = pd.DataFrame()
-            continue
-        frames[a] = _normalize(tape, a, fetch_klines(a, k_start, end_ms, res))
+    listed = sorted(set(listed_bases()) | set(assets) | present_set)
+    frames: Dict[str, pd.DataFrame] = {a: pd.DataFrame() for a in listed}
+    todo = [a for a in listed if a in present_set]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max(len(todo), 1), 8)) as ex:
+        kl = {a: ex.submit(fetch_klines, a, k_start, end_ms, res) for a in todo}
+        for a in todo:
+            try:
+                k = kl[a].result()
+            except Exception:
+                k = pd.DataFrame(columns=["ts_ms", "open", "close"])
+            frames[a] = _normalize(tape, a, k)
     return {"frames": frames,
             "meta": {"tape_rows": len(tape), "option_legs": n_opt, "non_option_legs": n_perp,
-                     "other_bases": sorted(b for b in present if b and b not in assets)}}
+                     "listed": listed,
+                     "other_bases": sorted(b for b in present_set if b and b not in assets)}}
 
 
 def fetch_spot(asset: str) -> float:
@@ -214,7 +231,7 @@ def feed_status(meta: Dict, now_ms: Optional[int] = None) -> Optional[str]:
     if meta.get("non_option_legs"):
         parts.append(f"{meta['non_option_legs']} perp hedge legs (not charted)")
     if meta.get("other_bases"):
-        parts.append("other underlyings not tabbed: " + ", ".join(meta["other_bases"]))
+        parts.append("other underlyings (headline only, no tab): " + ", ".join(meta["other_bases"]))
     return "Window contains " + "; ".join(parts) + "."
 
 

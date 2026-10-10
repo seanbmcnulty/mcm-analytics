@@ -95,7 +95,7 @@ def _post(method: str, params: Dict, timeout: int = 30, retries: int = 3) -> Dic
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
-_INSTR_RE = re.compile(r"^(?P<base>[A-Z0-9]+)-(?P<exp>\d{8})-(?P<strike>[0-9.]+)-(?P<cp>[CP])$")
+_INSTR_RE = re.compile(r"^(?P<base>[A-Z0-9]+)-(?P<exp>\d{8})-(?P<strike>[0-9_.]+)-(?P<cp>[CP])$")
 
 
 def parse_option(name: str):
@@ -104,7 +104,7 @@ def parse_option(name: str):
     if not m:
         return None, pd.NaT, np.nan, None
     return (m["base"], pd.to_datetime(m["exp"], format="%Y%m%d"),
-            float(m["strike"]), m["cp"])
+            float(m["strike"].replace("_", ".")), m["cp"])  # sub-$1 strikes: "0_14" -> 0.14
 
 
 def _normalize(rows: List[Dict], asset: str) -> pd.DataFrame:
@@ -194,23 +194,39 @@ def fetch_option_trades(currency: str, start_ms: int, end_ms: int,
     return rows
 
 
+def listed_bases() -> List[str]:
+    """Underlyings with live options (public/get_all_live_instruments)."""
+    try:
+        res = _post("get_all_live_instruments", {"instrument_type": "option"})
+        names = res if isinstance(res, list) else res.get("instruments", [])
+        return sorted({n.split("-")[0] for n in names if "-" in n})
+    except Exception:
+        return []
+
+
 def fetch_all(start_ms: int, end_ms: int, assets: List[str]) -> Dict:
     """-> {'frames': {asset: DataFrame (block rows only)}, 'meta': {...}}.
 
-    Frames hold block/RFQ trades only (the page is a *block* page).  ``meta``
-    carries the count of all option trades seen and the latest option trade
-    timestamp per asset, so the page can say when the feed has gone quiet.
+    Fetches every underlying that has live options (``meta['listed']``), not just
+    the charted ``assets``, so the page headline can cover them all.  Frames hold
+    block/RFQ trades only (the page is a *block* page).  ``meta`` also carries the
+    count of all option trades seen and the latest option trade timestamp per
+    charted asset, so the page can say when the feed has gone quiet.
     """
+    listed = sorted(set(listed_bases()) | set(assets))
     frames: Dict[str, pd.DataFrame] = {}
-    meta: Dict = {"all_option_rows": {}, "latest_trade_ms": {}}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(assets)) as ex:
-        futs = {a: ex.submit(fetch_option_trades, a, start_ms, end_ms) for a in assets}
+    meta: Dict = {"all_option_rows": {}, "latest_trade_ms": {}, "listed": listed}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(listed), 8)) as ex:
+        futs = {a: ex.submit(fetch_option_trades, a, start_ms, end_ms) for a in listed}
         latest = {a: ex.submit(latest_option_trade_ms, a) for a in assets}
-        for a in assets:
-            rows = futs[a].result()
-            df = _normalize(rows, a)
+        for a in listed:
+            try:
+                df = _normalize(futs[a].result(), a)
+            except Exception:
+                df = pd.DataFrame()
             meta["all_option_rows"][a] = len(df)
             frames[a] = df[df["is_block"]].reset_index(drop=True) if not df.empty else df
+        for a in assets:
             try:
                 meta["latest_trade_ms"][a] = latest[a].result()
             except Exception:
