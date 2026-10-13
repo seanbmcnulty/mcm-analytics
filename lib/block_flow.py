@@ -721,6 +721,9 @@ def render_page(venue) -> None:
         else:
             st.warning("Telegram not configured")
             st.caption(telegram.config_status())
+        # Send-to-Telegram image buttons are drawn into this container (bottom
+        # of the sidebar) once the per-underlying figures exist.
+        tg_box = st.container()
 
     with st.spinner(f"Fetching {venue.title} block trades..."):
         try:
@@ -765,16 +768,16 @@ def render_page(venue) -> None:
     n_charts = len(next(iter(figs.values()))) if figs else 0
 
     tg_ok = telegram.is_configured()
-    st.caption("Send charts to Telegram (as images):" if tg_ok else f"Telegram not configured: {telegram.config_status()}")
-    t1, t2, t3, t4 = st.columns([2, 1, 1, 1])
-    pick = t1.selectbox("Underlying", active or ["—"], key=f"{venue.key}_tg_pick", label_visibility="collapsed",
-                        disabled=not (tg_ok and active))
-    c_one = t2.button("Send selected", key=f"{venue.key}_tg_one", width="stretch", disabled=not (tg_ok and active),
-                      help=f"Send the selected underlying's {n_charts} charts.")
     btc_eth = [a for a in ("BTC", "ETH") if a in figs]
-    c_pair = t3.button("BTC+ETH", key=f"{venue.key}_tg_pair", width="stretch", disabled=not (tg_ok and btc_eth))
-    c_all = t4.button("📤 All with data", key=f"{venue.key}_tg_all", width="stretch", disabled=not (tg_ok and active),
-                      help=f"Send every underlying that has blocks ({len(active)} x {n_charts} charts).")
+    with tg_box:
+        st.caption("Send charts to Telegram (as images):" if tg_ok else f"Telegram not configured: {telegram.config_status()}")
+        pick = st.selectbox("Underlying", active or ["—"], key=f"{venue.key}_tg_pick", label_visibility="collapsed",
+                            disabled=not (tg_ok and active))
+        c_one = st.button("🖼️ Send selected", key=f"{venue.key}_tg_one", width="stretch", disabled=not (tg_ok and active),
+                          help=f"Send the selected underlying's {n_charts} charts as images.")
+        c_pair = st.button("🖼️ BTC+ETH", key=f"{venue.key}_tg_pair", width="stretch", disabled=not (tg_ok and btc_eth))
+        c_all = st.button("📤 All with data", key=f"{venue.key}_tg_all", width="stretch", disabled=not (tg_ok and active),
+                          help=f"Send every underlying that has blocks ({len(active)} x {n_charts} charts).")
 
     tabs = st.tabs([f"📈 {a}" for a in assets] + ["📊 ALL (2x2 Grid)", "📋 Block Trade Statistics"])
     for i, a in enumerate(assets):

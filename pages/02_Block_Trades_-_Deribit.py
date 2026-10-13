@@ -75,7 +75,20 @@ SGT = timezone(timedelta(hours=8))
 BACKGROUND_COLOR = '#FFFFFF'
 TEXT_COLOR = '#000000'
 SECONDARY_COLOR = '#3790C7'
-MARKER_SIZE_CAP = 80
+MARKER_SIZE_CAP = 80        # linear region ends here (unchanged look for normal blocks)
+MARKER_SIZE_MAX = 180       # hard ceiling for outsized blocks
+MARKER_LOG_STEP = 28        # px added per doubling of size beyond the cap
+
+
+def soft_cap_sizes(raw):
+    """Marker diameter: linear up to MARKER_SIZE_CAP, then logarithmic growth
+    (MARKER_LOG_STEP px per doubling) up to MARKER_SIZE_MAX, so a 27k-lot block
+    still looks bigger than a 2.5k one instead of both pinning at the cap."""
+    raw = pd.Series(raw, dtype=float)
+    over = raw > MARKER_SIZE_CAP
+    out = raw.copy()
+    out[over] = MARKER_SIZE_CAP + MARKER_LOG_STEP * np.log2(raw[over] / MARKER_SIZE_CAP)
+    return out.clip(upper=MARKER_SIZE_MAX)
 
 DEFAULT_MIN_SIZES = {
     'BTC': 12.5,
@@ -170,6 +183,9 @@ with st.sidebar:
     else:
         st.warning("Telegram not configured")
         st.caption(telegram.config_status())
+    # Send-to-Telegram image buttons live here (bottom of the sidebar); they
+    # are drawn into this container further down, once the page body is built.
+    _tg_box = st.container()
 
 # ---------------------------------------------------------------------------
 # Auto pipeline (triggered from the Home page's "Refresh BTC/ETH & send to
@@ -551,7 +567,7 @@ def plot_scatter_with_spot_and_dvol(data, hist_spot, dvol_series, current_spot, 
                     f"Current PnL: ${pnl:,.0f}"
                 )
 
-            sizes = (trades['amount'].abs() * marker_size).clip(upper=MARKER_SIZE_CAP)
+            sizes = soft_cap_sizes(trades['amount'].abs() * marker_size)
 
             fig.add_trace(go.Scatter(
                 x=trades['minute'], y=trades['strike'], mode='markers',
@@ -1385,24 +1401,20 @@ for _col, (_a, _ms) in zip(_extra_cols, extra_min_sizes.items()):
 CHARTS_PER_ASSET = 14  # 5 original + 9 Flow Analytics - keep in sync with asset_figs_dict below
 
 _tg_configured = telegram.is_configured()
-st.caption("Send charts to Telegram (as images):" if _tg_configured
-           else f"Telegram not configured: {telegram.config_status()}")
-_tg_cols = st.columns(len(ASSETS) + 2)
 send_asset_clicked = {}
-for _a, _col in zip(ASSETS, _tg_cols[:len(ASSETS)]):
-    _clean = _a.replace('_USDC', '')
-    with _col:
-        send_asset_clicked[_a] = st.button(
-            _clean, key=f"tg_send_{_a}", width="stretch",
-            disabled=not _tg_configured,
-            help=f"Send {_clean}'s {CHARTS_PER_ASSET} charts to Telegram.")
 _BTC_ETH = [a for a in ASSETS if a in ("BTC", "ETH")]
-with _tg_cols[len(ASSETS)]:
+with _tg_box:
+    st.caption("Send charts to Telegram (as images):")
+    for _a in ASSETS:
+        _clean = _a.replace('_USDC', '')
+        send_asset_clicked[_a] = st.button(
+            f"🖼️ {_clean}", key=f"tg_send_{_a}", width="stretch",
+            disabled=not _tg_configured,
+            help=f"Send {_clean}'s {CHARTS_PER_ASSET} charts to Telegram as images.")
     send_btc_eth_clicked = st.button(
-        "BTC+ETH", key="tg_send_btc_eth", width="stretch",
+        "🖼️ BTC+ETH", key="tg_send_btc_eth", width="stretch",
         disabled=not _tg_configured or not _BTC_ETH,
         help=f"Send BTC and ETH's charts to Telegram ({CHARTS_PER_ASSET * 2} charts).") or _auto_pipeline_active
-with _tg_cols[len(ASSETS) + 1]:
     send_all_clicked = st.button(
         "📤 All", key="tg_send_all", width="stretch",
         disabled=not _tg_configured,
