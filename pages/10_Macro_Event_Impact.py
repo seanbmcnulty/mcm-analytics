@@ -51,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from datetime import datetime, timezone
 
+import math
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -210,6 +211,59 @@ def chart_distribution(df: pd.DataFrame, col: str = "actual_move_pct") -> go.Fig
                                   hovertemplate="Bin center %{x:.2f}%<br>Count %{y}<extra></extra>"))
     fig.update_layout(**PLOTLY_LAYOUT, height=CHART_HEIGHT, title=f"Distribution of {col.replace('_', ' ').title()}",
                        xaxis_title="%", yaxis_title="Count")
+    return fig
+
+
+def move_distribution_stats(df: pd.DataFrame, col: str = "actual_move_pct") -> dict:
+    """Mean / stdev / probabilities for the loaded events' moves, under a
+    normal fit and empirically. Empty dict if fewer than 3 observations."""
+    v = df[col].dropna().astype(float) if col in df.columns else pd.Series(dtype=float)
+    if len(v) < 3:
+        return {}
+    mu, sd = float(v.mean()), float(v.std(ddof=1))
+    if not np.isfinite(sd) or sd <= 0:
+        return {}
+    cdf = lambda x: 0.5 * (1.0 + math.erf((x - mu) / (sd * math.sqrt(2.0))))
+    return {
+        "n": int(len(v)), "mu": mu, "sd": sd,
+        "p_up_norm": 1.0 - cdf(0.0), "p_up_emp": float((v > 0).mean()),
+        "p_gt1sd_norm": cdf(mu - sd) + 1.0 - cdf(mu + sd),  # = 31.7% for any normal
+        "p_gt1sd_emp": float(((v - mu).abs() > sd).mean()),
+        "skew": float(v.skew()) if len(v) >= 3 else float("nan"),
+        "kurt": float(v.kurt()) if len(v) >= 4 else float("nan"),
+    }
+
+
+def chart_bell_curve(df: pd.DataFrame, timeframe: str, col: str = "actual_move_pct") -> go.Figure:
+    """Histogram of historical event moves (probability density) with a fitted
+    normal curve and shaded +/-1 and 2 stdev bands."""
+    st_ = move_distribution_stats(df, col)
+    title = f"Move Probability Distribution ({timeframe} reaction)"
+    if not st_:
+        return _empty_fig(title, "Need at least 3 events with a computed move")
+    v = df[col].dropna().astype(float)
+    mu, sd = st_["mu"], st_["sd"]
+    xs = np.linspace(min(mu - 4 * sd, v.min() - 0.5 * sd), max(mu + 4 * sd, v.max() + 0.5 * sd), 400)
+    pdf = np.exp(-0.5 * ((xs - mu) / sd) ** 2) / (sd * math.sqrt(2 * math.pi))
+    fig = go.Figure()
+    fig.add_vrect(x0=mu - 2 * sd, x1=mu + 2 * sd, fillcolor="rgba(70,130,180,0.10)", line_width=0)
+    fig.add_vrect(x0=mu - sd, x1=mu + sd, fillcolor="rgba(70,130,180,0.20)", line_width=0)
+    fig.add_trace(go.Histogram(x=v, histnorm="probability density", nbinsx=max(6, min(20, len(v) // 2)),
+                               marker_color="rgba(70,130,180,0.55)", name="Observed events",
+                               hovertemplate="Move %{x:.2f}%<br>Density %{y:.3f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=xs, y=pdf, mode="lines", name=f"Normal fit (mu={mu:+.2f}%, sd={sd:.2f}%)",
+                             line=dict(color="#f1c40f", width=3),
+                             hovertemplate="Move %{x:.2f}%<br>Density %{y:.3f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=v, y=np.full(len(v), -0.02 * pdf.max()), mode="markers", name="Events",
+                             marker=dict(symbol="line-ns-open", size=12, color="white"),
+                             hovertemplate="Move %{x:.2f}%<extra></extra>"))
+    fig.add_vline(x=0, line_dash="dash", line_color="gray")
+    fig.add_vline(x=mu, line_dash="dot", line_color="#f1c40f")
+    for k in (-2, -1, 1, 2):
+        fig.add_vline(x=mu + k * sd, line_dash="dot", line_color="rgba(255,255,255,0.35)",
+                      annotation_text=f"{k:+d}sd", annotation_position="top", annotation_font_size=10)
+    fig.update_layout(**PLOTLY_LAYOUT, height=CHART_HEIGHT, title=f"{title} - n={st_['n']}",
+                      xaxis_title="Move %", yaxis_title="Probability density", bargap=0.05)
     return fig
 
 
@@ -673,6 +727,20 @@ def render_asset_tab(asset: str, event_keys: tuple[str, ...], event_label: str, 
                    "expiry (08:00 UTC), not the reaction timeframe above. Green bars beat the implied "
                    "move (from DVOL); red bars fell short of it.")
         _show(chart_bar_actual_vs_implied(impact), key=f"{asset}_bar_ai")
+
+    st.subheader(f"{event_label} move probability distribution")
+    st.caption("Bell curve fitted to the reaction moves of the events loaded above (same selection and "
+               "timeframe as the other charts). Shaded bands are +/-1 and 2 stdev; white ticks are the actual events.")
+    _show(chart_bell_curve(impact, timeframe), key=f"{asset}_bell")
+    ds = move_distribution_stats(impact)
+    if ds:
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("Mean / Stdev", f"{ds['mu']:+.2f}% / {ds['sd']:.2f}%")
+        b2.metric("P(up) normal | empirical", f"{ds['p_up_norm']*100:.0f}% | {ds['p_up_emp']*100:.0f}%")
+        b3.metric("P(beyond 1sd) normal | empirical", f"{ds['p_gt1sd_norm']*100:.0f}% | {ds['p_gt1sd_emp']*100:.0f}%")
+        b4.metric("68% / 95% range", f"{ds['mu']-ds['sd']:+.1f}..{ds['mu']+ds['sd']:+.1f}% / {ds['mu']-2*ds['sd']:+.1f}..{ds['mu']+2*ds['sd']:+.1f}%")
+        if ds["n"] < 15:
+            st.caption(f"Small sample (n={ds['n']}) - raise 'Number of recent events' for a more reliable curve.")
 
     st.subheader("DVOL Crush")
     st.caption("Mean % change in Deribit's DVOL index at each horizon after release, vs. a T−1h baseline. "

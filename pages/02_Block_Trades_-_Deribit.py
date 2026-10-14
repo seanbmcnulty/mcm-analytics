@@ -78,9 +78,6 @@ SECONDARY_COLOR = '#3790C7'
 MARKER_SIZE_CAP = 80        # linear region ends here (unchanged look for normal blocks)
 MARKER_SIZE_MAX = 180       # hard ceiling for outsized blocks
 MARKER_LOG_STEP = 28        # px added per doubling of size beyond the cap
-EXPIRY_MARKER_REF = 36      # Expiry/Strike chart: px diameter at the 85th-percentile premium
-EXPIRY_MARKER_MAX = 100     # Expiry/Strike chart: hard ceiling for outsized blocks
-EXPIRY_MARKER_LOG_STEP = 22 # px added per doubling of diameter beyond the reference
 
 
 def soft_cap_sizes(raw):
@@ -633,20 +630,9 @@ def plot_strike_vs_expiry(data, asset, size_multiplier=1.0):
     ).reset_index()
 
     agg['direction'] = np.where(agg['amount'] >= 0, 'Buy', 'Sell')
-    # Marker diameter ~ sqrt(premium) (area-proportional) against a reference
-    # premium = 85th percentile of the aggregated points, which sits at
-    # EXPIRY_MARKER_REF px. Beyond that, growth turns logarithmic up to
-    # EXPIRY_MARKER_MAX px, so outsized blocks keep separating instead of the
-    # biggest one pinning at a fixed size.
-    prem = agg['premium_usd'].astype(float).clip(lower=0)
-    ref = float(prem.quantile(0.85)) if len(prem) else 0.0
-    if ref <= 0:
-        ref = float(prem.max()) if len(prem) and prem.max() > 0 else 1.0
-    raw = EXPIRY_MARKER_REF * np.sqrt(prem / ref)
-    over = raw > EXPIRY_MARKER_REF
-    diam = raw.copy()
-    diam[over] = EXPIRY_MARKER_REF + EXPIRY_MARKER_LOG_STEP * np.log2(raw[over] / EXPIRY_MARKER_REF)
-    agg['scaled_size'] = diam.clip(lower=4, upper=EXPIRY_MARKER_MAX)
+    # Marker size by contract count (|net amount|), same scale and soft cap as
+    # the Block Trades Over Time scatter (size_multiplier = that chart's m_size).
+    agg['scaled_size'] = soft_cap_sizes(agg['amount'].abs() * size_multiplier).clip(lower=4)
 
     expiry_order = agg[['expiry_str', 'expiry']].drop_duplicates().sort_values('expiry')
     category_order = expiry_order['expiry_str'].tolist()
@@ -664,7 +650,7 @@ def plot_strike_vs_expiry(data, asset, size_multiplier=1.0):
                     f"Type: {opt}<br>"
                     f"Direction: {direction}<br>"
                     f"Premium: ${r.premium_usd:,.0f}<br>"
-                    f"Net Amount: {r.amount:.1f}"
+                    f"Net Amount: {r.amount:,.1f}"
                 )
 
             fig.add_trace(go.Scatter(
@@ -1466,7 +1452,7 @@ for idx, asset in enumerate(ASSETS):
         m_size, s_mult = get_asset_multipliers(asset)
 
         fig_scatter = plot_scatter_with_spot_and_dvol(df_asset, hist_spot, dvol_s, spot_px, clean_name, m_size)
-        fig_strike_expiry = plot_strike_vs_expiry(df_asset, clean_name, s_mult)
+        fig_strike_expiry = plot_strike_vs_expiry(df_asset, clean_name, m_size)
         fig_net_heatmap = plot_net_heatmap(df_asset, clean_name)
         fig_gross_volume = plot_gross_volume_heatmap(df_asset, clean_name)
         fig_cumulative = plot_cumulative_flow(df_asset, clean_name)
