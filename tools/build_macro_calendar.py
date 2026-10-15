@@ -130,6 +130,10 @@ def fetch(url: str, *, ua: str = WEB_UA, tries: int = 4, timeout: int = 45) -> O
             resp = _session.get(url, headers={"User-Agent": ua}, timeout=timeout)
             if resp.status_code == 404:
                 return None
+            if resp.status_code in (401, 403):
+                # Deterministic block (bls.gov does this) - retrying only burns minutes.
+                print(f"warning: {resp.status_code} from {url}", file=sys.stderr)
+                return None
             resp.raise_for_status()
             resp.encoding = "utf-8"
             return resp.text
@@ -208,10 +212,78 @@ _SCHED_TIME_RE = re.compile(r"^(\d{1,2}:\d{2} [AP]M)$")
 WANTED_RELEASES = {"Employment Situation", "Consumer Price Index"}
 
 
+# bls.gov answers 403 to scripted requests from many networks (including GitHub
+# runners and this dev machine), which silently starved this script of every
+# CPI/NFP row. Two fallbacks keep it working without bls.gov:
+#   * release dates: BLS_FALLBACK_SCHEDULE below (BLS publishes the full-year
+#     schedule in advance; re-check yearly at bls.gov/schedule/<year>/home.htm)
+#   * values: FRED's keyless CSV endpoint (CPIAUCNS -> YoY, PAYEMS -> m/m diff).
+#     FRED PAYEMS is the *current vintage*, so a release picked up weeks late
+#     carries revised rather than first-print payrolls; the weekly run normally
+#     catches each release within days, i.e. first print.
+FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}&cosd={start}"
+BLS_FALLBACK_SCHEDULE: List[Tuple[str, str]] = [
+    ("2026-09-04", "Employment Situation"),
+    ("2026-09-11", "Consumer Price Index"),
+    ("2026-10-02", "Employment Situation"),
+    ("2026-10-14", "Consumer Price Index"),
+    ("2026-11-06", "Employment Situation"),
+    ("2026-11-10", "Consumer Price Index"),
+    ("2026-12-04", "Employment Situation"),
+    ("2026-12-10", "Consumer Price Index"),
+]
+_fred_cache: Dict[str, Dict[str, float]] = {}
+
+
+def fred_series(sid: str) -> Dict[str, float]:
+    """{'YYYY-MM': value} from FRED's keyless CSV endpoint (empty on failure)."""
+    if sid in _fred_cache:
+        return _fred_cache[sid]
+    out: Dict[str, float] = {}
+    # FRED stalls requests that spoof a browser UA; an honest UA answers in <1s.
+    text = fetch(FRED_CSV.format(sid=sid, start="2023-01-01"), ua=BLS_UA, tries=3, timeout=20)
+    for line in (text or "").splitlines()[1:]:
+        parts = line.split(",")
+        if len(parts) == 2:
+            try:
+                out[parts[0][:7]] = float(parts[1])
+            except ValueError:
+                pass
+    _fred_cache[sid] = out
+    return out
+
+
+def _prev_month(d: date, back: int = 1) -> str:
+    y, m = d.year, d.month - back
+    while m < 1:
+        y, m = y - 1, m + 12
+    return f"{y:04d}-{m:02d}"
+
+
+def fred_actual(when: date, is_cpi: bool) -> Optional[float]:
+    """Reference month = the month before the release. CPI: headline NSA 12-month
+    % change (1dp, half-up, as BLS prints it). NFP: PAYEMS change, thousands."""
+    ref = _prev_month(when)
+    if is_cpi:
+        s = fred_series("CPIAUCNS")
+        base = f"{int(ref[:4]) - 1:04d}-{ref[5:]}"
+        if ref not in s or base not in s:
+            return None
+        yoy = (s[ref] / s[base] - 1.0) * 100.0
+        return float(Decimal(str(yoy)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+    s = fred_series("PAYEMS")
+    prev = _prev_month(when, 2)
+    if ref not in s or prev not in s:
+        return None
+    return float(round(s[ref] - s[prev]))
+
+
 def bls_schedule(year: int) -> List[Tuple[date, str]]:
     html = fetch(BLS_SCHEDULE.format(year=year), ua=BLS_UA)
     if not html:
-        return []
+        fb = sorted((datetime.strptime(d, "%Y-%m-%d").date(), n) for d, n in BLS_FALLBACK_SCHEDULE if d.startswith(str(year)))
+        print(f"warning: bls.gov schedule unreachable for {year}; using BLS_FALLBACK_SCHEDULE ({len(fb)} dates)", file=sys.stderr)
+        return fb
     packed = re.sub(r"<[^>]+>", "|", html)
     packed = re.sub(r"[|\s]*\|[|\s]*", "|", packed)
     cells = [c.strip() for c in packed.split("|")]
@@ -277,15 +349,18 @@ def collect_bls(start_year: int, end_year: int) -> List[dict]:
             stamp = when.strftime("%m%d%Y")
             url = (BLS_CPI_ARCHIVE if is_cpi else BLS_EMPSIT_ARCHIVE).format(stamp=stamp)
             html = fetch(url, ua=BLS_UA)
-            if not html:
-                # Not yet archived under this stamp (e.g. current release still
-                # lives at the non-archived cpi.nr0.htm / empsit.nr0.htm URL,
-                # or the release was delayed/skipped, e.g. the Oct 2025 CPI
-                # report BLS cancelled outright during the government
-                # shutdown). Skip rather than guess.
-                continue
-            text = visible_text(html)
-            actual = parse_cpi_yoy(text) if is_cpi else parse_nfp_actual(text)
+            if html:
+                text = visible_text(html)
+                actual = parse_cpi_yoy(text) if is_cpi else parse_nfp_actual(text)
+            else:
+                # Archive page unavailable: BLS blocks us (403), or the release
+                # is too recent to be archived (it lives at cpi.nr0.htm /
+                # empsit.nr0.htm until the next one), or it was never published
+                # (e.g. Oct 2025 CPI, cancelled in the shutdown). FRED has the
+                # figure iff the release really happened; otherwise skip.
+                actual = fred_actual(when, is_cpi)
+                if actual is not None:
+                    print(f"note: {event} {when} taken from FRED (bls.gov archive unavailable)", file=sys.stderr)
             if actual is None:
                 print(f"warning: no actual parsed for {event} {when}", file=sys.stderr)
                 continue
@@ -310,7 +385,7 @@ def collect_upcoming(start_year: int, end_year: int, max_per_event: int = 4) -> 
 
     for d in FOMC_UPCOMING:
         dt = datetime.strptime(d, "%Y-%m-%d").date()
-        if dt > today:
+        if dt >= today:
             rows.append({"date": d, "event": EVENT_FOMC})
 
     # bls_schedule() already returns the *full* published year schedule
@@ -318,7 +393,7 @@ def collect_upcoming(start_year: int, end_year: int, max_per_event: int = 4) -> 
     # rather than re-scraping.
     for year in range(start_year, end_year + 1):
         for when, name in bls_schedule(year):
-            if when <= today:
+            if when < today:
                 continue
             event = EVENT_CPI if name == "Consumer Price Index" else EVENT_NFP
             rows.append({"date": when.isoformat(), "event": event})
@@ -394,7 +469,13 @@ def main() -> int:
         print(f"error: {args.csv} has no rows with an actual value to anchor off", file=sys.stderr)
         return 1
 
-    last_date = max(r["date"] for r in actual_existing)
+    # Anchor per event type: a single global max let e.g. the Sep 16 FOMC row
+    # permanently block the Sep 11 CPI row from ever being appended.
+    last_date_by_event: Dict[str, str] = {}
+    for r in actual_existing:
+        if r["date"] > last_date_by_event.get(r["event"], ""):
+            last_date_by_event[r["event"]] = r["date"]
+    last_date = max(last_date_by_event.values())
     last_actual: Dict[str, float] = {}
     for r in sorted(actual_existing, key=lambda r: r["date"]):
         try:
@@ -409,14 +490,16 @@ def main() -> int:
     bls_rows = collect_bls(args.start, today_year)
 
     all_rows = fomc_rows + bls_rows
-    new_rows = [r for r in all_rows if r["date"] > last_date]
+    new_rows = [r for r in all_rows if r["date"] > last_date_by_event.get(r["event"], "")]
     attach_consensus_and_prior(new_rows, last_actual)
     new_rows_out = [{k: r.get(k, "") for k in FIELDS} for r in new_rows]
 
     upcoming_rows: List[dict] = []
     if not args.no_upcoming:
         upcoming_rows = collect_upcoming(args.start, today_year + 1, max_per_event=args.upcoming_per_event)
-    upcoming_rows_out = [{k: r.get(k, "") for k in FIELDS} for r in upcoming_rows]
+    have = {(r["date"], r["event"]) for r in new_rows}
+    upcoming_rows_out = [{k: r.get(k, "") for k in FIELDS} for r in upcoming_rows
+                         if (r["date"], r["event"]) not in have]
 
     if not new_rows and not upcoming_rows:
         print(f"no new rows after {last_date} and no upcoming rows to refresh; nothing to do")

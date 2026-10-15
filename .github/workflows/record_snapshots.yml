@@ -12,7 +12,12 @@ name: Record vol snapshots
 
 on:
   schedule:
-    - cron: '0 * * * *'   # hourly, on the hour (UTC)
+    # Two staggered triggers per hour, both OFF the top of the hour: GitHub drops/delays
+    # :00 schedules under load (observed: median 5.7h between rows instead of 1h). The
+    # recorder's --min-interval below makes the second trigger a no-op when the first
+    # succeeded, and a backup when it didn't.
+    - cron: '17 * * * *'
+    - cron: '47 * * * *'
   workflow_dispatch: {}    # allow manual "Run workflow" from the Actions tab
 
 permissions:
@@ -70,7 +75,7 @@ jobs:
           fi
 
       - name: Record snapshot
-        run: python scripts/record_snapshot.py
+        run: python scripts/record_snapshot.py --min-interval 3000   # ~50 min: one row/hour, backup trigger skips
 
       - name: Publish to snapshots branch
         run: |

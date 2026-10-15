@@ -22,11 +22,40 @@ import streamlit as st
 from lib import cache as cache_lib
 from lib import commands as cmdreg
 from lib import fx_style, history, surface, telegram
-from lib.constants import ASSETS
+from lib.constants import ASSETS, ASSET_COLORS
 from lib.telegram_caption import caption_from_title
 
 st.set_page_config(page_title="MCM Bot", page_icon="🤖", layout="wide",
                    initial_sidebar_state="expanded")
+
+# Theme-neutral polish (works in light and dark): rounded cards around tables
+# and charts, softer buttons, bolder tabs, asset-coloured tile labels and the
+# summary "pills" used for the SPOT / DVOL / RV header lines.
+_PAGE_CSS = """
+<style>
+.block-container{padding-top:2.2rem;max-width:1500px}
+h1{letter-spacing:-0.02em;font-weight:800}
+div[data-testid="stTabs"] button[role="tab"]{font-weight:600;padding:.55rem 1.05rem}
+div[data-testid="stButton"]>button{border-radius:10px;font-weight:600;transition:all .15s ease}
+div[data-testid="stButton"]>button:hover{transform:translateY(-1px);
+  box-shadow:0 3px 10px rgba(55,144,199,.28);border-color:#3790C7}
+div[data-testid="stDataFrame"]{border:1px solid rgba(128,128,128,.25);border-radius:12px;overflow:hidden}
+div[data-testid="stPlotlyChart"]{border:1px solid rgba(128,128,128,.2);border-radius:12px;padding:6px}
+div[data-testid="stExpander"]{border-radius:12px}
+.mcm-tile{display:flex;align-items:center;gap:.55rem;margin:1.1rem 0 .4rem}
+.mcm-tile .a{font-size:.68rem;font-weight:800;letter-spacing:.09em;padding:.14rem .5rem;
+  border-radius:6px;color:#fff}
+.mcm-tile .c{font-size:1rem;font-weight:700;letter-spacing:-0.01em}
+.mcm-pills{display:flex;flex-wrap:wrap;gap:.45rem;margin:.15rem 0 .75rem}
+.mcm-pill{border:1px solid rgba(128,128,128,.3);border-radius:999px;padding:.24rem .75rem;
+  font-size:.88rem;background:rgba(128,128,128,.08);white-space:nowrap}
+.mcm-pill b{opacity:.6;font-weight:700;margin-right:.4rem;font-size:.72rem;letter-spacing:.06em}
+.mcm-pill.lead{font-weight:700}
+.mcm-pill .pos{color:#22a35a;font-weight:700}
+.mcm-pill .neg{color:#e5574a;font-weight:700}
+</style>
+"""
+st.markdown(_PAGE_CSS, unsafe_allow_html=True)
 
 DASHBOARD_CACHE_TTL = 300        # seconds before results are called stale
 DASHBOARD_CACHE_MAX_AGE = 1800   # seconds before results are dropped entirely
@@ -91,6 +120,58 @@ def _expiry_label(dte: int) -> str:
         return f"{dte} days"
 
 
+def _tint(v, scale: float, max_a: float = 0.34) -> str:
+    """Soft green/red cell tint whose strength scales with |v|/scale."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if not _finite(v) or v == 0 or not scale:
+        return ""
+    a = min(abs(v) / float(scale), 1.0) * max_a + 0.05
+    rgb, fg = ("34,163,90", "#1f9d55") if v > 0 else ("229,87,74", "#e0483b")
+    return f"background-color: rgba({rgb},{a:.2f}); color: {fg}; font-weight: 600"
+
+
+_TILE_WORDS = {"atm": "ATM", "iv": "IV", "rv": "RV", "25d": "25Δ"}
+
+
+def _tile_label(asset: str, cn: str) -> None:
+    """Asset-coloured badge + readable report name above each tile."""
+    col = ASSET_COLORS.get(asset, "#3790C7")
+    name = " ".join(_TILE_WORDS.get(w, w.capitalize()) for w in cn.split("_"))
+    st.markdown(f'<div class="mcm-tile"><span class="a" style="background:{col}">'
+                f'{html.escape(asset)}</span><span class="c">{html.escape(name)}</span></div>',
+                unsafe_allow_html=True)
+
+
+def _render_header(text: str) -> None:
+    """Render a '**LABEL** value   |   **LABEL** value' header as pills."""
+    import re as _re
+    if not text or "**" not in text:
+        st.markdown(text or "")
+        return
+    pills = []
+    for group in _re.split(r"\s{6,}", text.strip()):
+        for seg in group.split("|"):
+            seg = seg.strip()
+            if not seg:
+                continue
+            m = _re.match(r"\*\*(.+?)\*\*\s*(.*)$", seg)
+            if not m:
+                pills.append(f'<span class="mcm-pill">{html.escape(seg)}</span>')
+                continue
+            label, val = m.group(1), m.group(2).strip()
+            if not val:
+                pills.append(f'<span class="mcm-pill lead">{html.escape(label)}</span>')
+                continue
+            cls = "pos" if val.startswith("+") else ("neg" if val[:1] in "-−" else "")
+            v = html.escape(val)
+            v = f'<span class="{cls}">{v}</span>' if cls else v
+            pills.append(f'<span class="mcm-pill"><b>{html.escape(label)}</b>{v}</span>')
+    st.markdown(f'<div class="mcm-pills">{"".join(pills)}</div>', unsafe_allow_html=True)
+
+
 def _table_height(n_rows: int) -> int:
     return 40 + 35 * max(0, n_rows)
 
@@ -111,15 +192,13 @@ def _style_table(df: pd.DataFrame):
                "DTE": "{:.0f}"}
         style = disp.style.format({k: v for k, v in fmt.items() if k in cols},
                                   na_rep="-")
-        style = style.apply(
-            lambda s: s.apply(
-                lambda v: "background-color: rgba(200,230,200,0.5)"
-                if pd.notna(v) and v >= 0 else
-                ("color: #c00;" if pd.notna(v) and v < 0 else "")),
-            subset=[basis_col])
+        style = style.apply(lambda s: [_tint(v, 12.0) for v in s],
+                            subset=[basis_col])
         return style
 
     if "ATM σ%" in cols and "RV%" in cols:
+        disp = disp.drop(columns=["Token"], errors="ignore")  # asset is in the tab/tile label
+        cols = set(disp.columns)
         fmt = {"DTE": "{:.0f}", "ATM σ%": "{:.1f}", "Daily Move %": "{:.2f}%",
                "BE Move %": "{:.2f}%", "ATM 3h": "{:+.1f}", "ATM Open": "{:+.1f}",
                "RV%": "{:.1f}", "IV−RV": "{:+.1f}", "25d σ Call": "{:.1f}",
@@ -130,15 +209,31 @@ def _style_table(df: pd.DataFrame):
             lambda row: ["background-color: rgba(0,0,0,0.04);"
                          if disp.index.get_loc(row.name) % 2 else ""] * len(row),
             axis=1)
-        for c in ("ATM 3h", "ATM Open", "IV−RV"):
+        for c, sc in (("ATM 3h", 3.0), ("ATM Open", 4.0), ("IV−RV", 10.0)):
             if c in cols:
-                style = style.apply(
-                    lambda s: s.apply(
-                        lambda v: "color: #c00;" if pd.notna(v) and _finite(v) and v < 0
-                        else ("color: #0a0;" if pd.notna(v) and _finite(v) and v > 0
-                              else "")), subset=[c])
+                style = style.apply(lambda s, sc=sc: [_tint(v, sc) for v in s],
+                                    subset=[c])
+        if "ATM σ%" in cols:
+            style = style.set_properties(subset=["ATM σ%"], **{"font-weight": "700"})
         return style
 
+    _g = [c for c in ("Delta", "Vega", "Gamma (1%)")
+          if c in cols and pd.api.types.is_numeric_dtype(disp[c])]
+    if _g:
+        body = disp[disp["Expiry"] != "Total"] if "Expiry" in cols else disp
+        fmt = {c: (lambda x: f"${x:,.0f}" if pd.notna(x) else "-") for c in _g}
+        for c in ("Net Puts", "Net Calls", "Gross Notional"):
+            if c in cols and pd.api.types.is_numeric_dtype(disp[c]):
+                fmt[c] = lambda x: f"{int(x):,}" if pd.notna(x) else "-"
+        style = disp.style.format(fmt, na_rep="-")
+        for c in _g:
+            sc = float(body[c].abs().max() or 1.0)
+            style = style.apply(lambda s, sc=sc: [_tint(v, sc) for v in s], subset=[c])
+        if "Expiry" in cols:
+            style = style.apply(
+                lambda r: ["font-weight: 700; border-top: 2px solid rgba(128,128,128,.5)"
+                           if r["Expiry"] == "Total" else ""] * len(r), axis=1)
+        return style
     for c in ("Delta", "Vega", "Gamma (1%)"):
         if c in cols and pd.api.types.is_numeric_dtype(disp[c]):
             disp[c] = disp[c].apply(lambda x: f"${x:,.0f}" if pd.notna(x) else "-")
@@ -156,7 +251,7 @@ def render_output(fig, df, text, key_prefix: str = "out",
     has_table = df is not None and not getattr(df, "empty", True)
 
     if text and has_table:
-        st.markdown(text)
+        _render_header(text)
 
     if has_table:
         try:
@@ -503,7 +598,7 @@ with _tb3:
                                      "replace the dashboard with the latest data.")
 with _tb4:
     st.write("")
-    core_btn = st.button("Run core BTC+ETH", key="mcm_run_core", **_stretch(),
+    core_btn = st.button("Run core BTC+ETH", key="mcm_run_core", type="primary", **_stretch(),
                          help=_core_help)
 
 # Send to Telegram — one button per asset, a BTC+ETH combo, plus "All",
@@ -673,7 +768,7 @@ for ia, a in enumerate(ASSETS):
         while i < n_a:
             cn0 = order_a[i][1]
             if _needs_full_row(a, cn0):
-                st.caption(f"**{a}** /{cn0}")
+                _tile_label(a, cn0)
                 if (a, cn0) in results:
                     f2, d2, t2 = results[(a, cn0)]
                     render_output(f2, d2, t2, key_prefix=f"{a}_{cn0}")
@@ -704,14 +799,14 @@ for ia, a in enumerate(ASSETS):
             if multi_idx is not None:
                 _, cn = row_items[multi_idx]
                 fig, df, text = results[(a, cn)]
-                st.caption(f"**{a}** /{cn}")
+                _tile_label(a, cn)
                 render_output(fig, df, text, key_prefix=f"{a}_{cn}", skip_figures=True)
                 others = [row_items[k] for k in range(len(row_items)) if k != multi_idx]
                 if others:
                     cols = st.columns(len(others))
                     for k, (_, cn2) in enumerate(others):
                         with cols[k]:
-                            st.caption(f"**{a}** /{cn2}")
+                            _tile_label(a, cn2)
                             if (a, cn2) in results:
                                 f2, d2, t2 = results[(a, cn2)]
                                 render_output(f2, d2, t2, key_prefix=f"{a}_{cn2}")
@@ -723,7 +818,7 @@ for ia, a in enumerate(ASSETS):
                 cols = st.columns(len(row_items))
                 for k, (_, cn) in enumerate(row_items):
                     with cols[k]:
-                        st.caption(f"**{a}** /{cn}")
+                        _tile_label(a, cn)
                         if (a, cn) in results:
                             f2, d2, t2 = results[(a, cn)]
                             render_output(f2, d2, t2, key_prefix=f"{a}_{cn}",
@@ -739,7 +834,7 @@ for ia, a in enumerate(ASSETS):
         if (a, "vol_run") in results:
             f_list, _, _ = results[(a, "vol_run")]
             if isinstance(f_list, list) and f_list:
-                st.caption(f"**{a}** Vol surface by expiry")
+                _tile_label(a, "vol_surface_by_expiry")
                 render_output(f_list, None, None,
                               key_prefix=f"{a}_vol_surface", full_width_charts=True)
 

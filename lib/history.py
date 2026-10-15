@@ -138,8 +138,8 @@ def _snapshot_path(asset: str) -> Path:
 # Hourly recording (the GitHub Actions recorder) would otherwise grow each
 # snapshot CSV without bound forever. Cap it: keep full hourly resolution for
 # the recent window, collapse anything older to one row per UTC calendar day.
-_THIN_AFTER_DAYS = 14
-_THIN_MIN_ROWS = 400   # skip the read/rewrite cost until there's something to gain
+_THIN_AFTER_DAYS = 60     # was 14: a 2-week hourly window threw away the history the 30/90d charts need
+_THIN_MIN_ROWS = 1600   # ~60d of hourly rows (~2.5 MB/asset); skip the rewrite cost until there's something to gain
 
 
 def _thin_snapshot_file(path: Path) -> None:
