@@ -618,7 +618,8 @@ def _compute_level_driver(asset: str, days: int) -> tuple[pd.Series | None, str]
 # ---------------------------------------------------------------------------
 
 def surface_history(asset: str, delta_key: str = "delta50",
-                    days: int = 90) -> tuple[pd.DataFrame | None, bool, str]:
+                    days: int = 90,
+                    recorded_only: bool = False) -> tuple[pd.DataFrame | None, bool, str]:
     """
     Historical IV surface: index = UTC timestamp, columns = DTE, values decimal IV.
 
@@ -628,6 +629,12 @@ def surface_history(asset: str, delta_key: str = "delta50",
     recorded = _surface_from_snapshots(asset, delta_key, days)
     if recorded is not None and len(recorded) >= 8:
         return recorded, False, "recorded snapshots"
+    if recorded_only:
+        # Intraday callers densify the (possibly sparse) recorded rows
+        # themselves, so don't splice an hourly reconstruction onto them.
+        if recorded is not None and len(recorded) >= 2:
+            return recorded, False, "recorded snapshots"
+        return None, True, "none"
 
     live = surface.iv_by_dte_for_delta(asset, delta_key)
     live = {float(k): float(v) for k, v in live.items() if surface.finite(v)}
@@ -718,9 +725,11 @@ def surface_row_near(frame: pd.DataFrame,
 
 
 def iv_series_at_dte(asset: str, dte: int, delta_key: str = "delta50",
-                     days: int = 30) -> tuple[pd.Series | None, bool, str]:
+                     days: int = 30,
+                     recorded_only: bool = False) -> tuple[pd.Series | None, bool, str]:
     """Historical IV (vol points) for one tenor of one delta bucket."""
-    frame, estimated, src = surface_history(asset, delta_key, days=days)
+    frame, estimated, src = surface_history(asset, delta_key, days=days,
+                                            recorded_only=recorded_only)
     if frame is None or frame.empty:
         return None, estimated, src
     cols = sorted(float(c) for c in frame.columns)

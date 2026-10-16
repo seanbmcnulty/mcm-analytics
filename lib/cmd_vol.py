@@ -988,11 +988,13 @@ def cmd_atm_iv_box_plot(asset: str, lookback_days: int = 90, **kwargs):
 # 9. Vol / skew time series and intraday variants
 # ===========================================================================
 
-def _time_series_frames(asset: str, dte: int, days: int, keys: list[str]):
+def _time_series_frames(asset: str, dte: int, days: int, keys: list[str],
+                        recorded_only: bool = False):
     out: dict[str, pd.Series] = {}
     estimated, src = True, "none"
     for key in keys:
-        s, est, sr = history.iv_series_at_dte(asset, dte, key, days=days)
+        s, est, sr = history.iv_series_at_dte(asset, dte, key, days=days,
+                                              recorded_only=recorded_only)
         if s is not None and len(s) >= 2:
             out[key] = s
             estimated, src = est, sr
@@ -1016,7 +1018,7 @@ def _align(a: pd.Series, b: pd.Series) -> tuple[pd.Series, pd.Series] | None:
     return a.reindex(b2.index), b2
 
 
-PERP_SMOOTH_WINDOW = "45min"  # rolling-mean window for the intraday Perp overlay (raw 15m closes are too jumpy to read against the sparser vol/skew points)
+PERP_SMOOTH_BARS = 5  # centred rolling mean over 15m bars (~75min) for the intraday Perp overlay -- raw closes are too jumpy next to the smooth vol/skew lines
 
 
 def _smoothed_perp(asset: str, since) -> pd.DataFrame | None:
@@ -1030,7 +1032,8 @@ def _smoothed_perp(asset: str, since) -> pd.DataFrame | None:
     if px.empty:
         return None
     px = px.copy()
-    px["close"] = px["close"].rolling(PERP_SMOOTH_WINDOW, min_periods=1).mean()
+    px["close"] = px["close"].rolling(PERP_SMOOTH_BARS, center=True,
+                                      min_periods=1).mean()
     return px
 
 
@@ -1068,7 +1071,10 @@ def _vol_series_chart(asset: str, dte: int, days: int, title: str,
     keys = ["delta50", "deltaCall25", "deltaPut25"]
     if not intraday:
         keys += ["deltaCall10", "deltaPut10"]
-    frames, estimated, src = _time_series_frames(asset, dte, days, keys)
+    frames, estimated, src = _time_series_frames(
+        asset, dte, days, keys, recorded_only=intraday)
+    if intraday and "delta50" not in frames:   # too few recorded rows
+        frames, estimated, src = _time_series_frames(asset, dte, days, keys)
     if "delta50" not in frames:
         return None, None, "No vol time series data."
     raw: dict[str, pd.Series] = {}
@@ -1144,7 +1150,10 @@ def _skew_series_chart(asset: str, dte: int, days: int, title: str,
                        intraday: bool = False):
     keys = ["deltaCall25", "deltaPut25"] + ([] if intraday else
                                             ["deltaCall10", "deltaPut10"])
-    frames, estimated, src = _time_series_frames(asset, dte, days, keys)
+    frames, estimated, src = _time_series_frames(
+        asset, dte, days, keys, recorded_only=intraday)
+    if intraday and ("deltaCall25" not in frames or "deltaPut25" not in frames):
+        frames, estimated, src = _time_series_frames(asset, dte, days, keys)
     if "deltaCall25" not in frames or "deltaPut25" not in frames:
         return None, None, "No skew time series data."
     raw25 = None
