@@ -1,10 +1,10 @@
-# External hourly trigger for the snapshot recorder
+# External 15-minute trigger for the snapshot recorder
 
 GitHub's own `schedule:` trigger is best-effort and in practice starts only a
 small fraction of runs (about 9% between Oct 2 and Oct 16 2026). The reliable
 fix is an outside timer that calls the workflow's `workflow_dispatch` API
-every hour. The crons in `record_snapshots.yml` stay as a backup, and
-`--min-interval 3000` means duplicate triggers do nothing.
+every 15 minutes. The crons in `record_snapshots.yml` stay as a backup, and
+`--min-interval 780` (13 min) means duplicate triggers do nothing.
 
 Nothing in this doc has been set up yet. You need to do both steps yourself.
 
@@ -26,7 +26,7 @@ Copy the token. Don't paste it into chat or commit it.
 Create cronjob:
 
 - **URL:** `https://api.github.com/repos/seanbmcnulty/mcm-analytics/actions/workflows/record_snapshots.yml/dispatches`
-- **Schedule:** every hour at minute **5** (custom: `5 * * * *`). Keep it away from :17 and :47.
+- **Schedule:** every 15 minutes (`*/15 * * * *`). The backup crons (:17/:47) are harmless: `--min-interval` makes them no-ops.
 - **Advanced → Request method:** `POST`
 - **Advanced → Headers:**
   - `Authorization: Bearer <your token>`

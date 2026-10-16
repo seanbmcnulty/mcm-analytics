@@ -82,10 +82,23 @@ def validate_asset(old: pd.DataFrame | None, new: pd.DataFrame | None,
         old_ts, new_ts = set(old["_ts"].dropna()), set(new["_ts"].dropna())
         dropped = sorted(old_ts - new_ts)
         if dropped:
-            # Only allowed via thinning: old rows, and their day must still have a row.
-            thin_cut = now - timedelta(days=history._THIN_AFTER_DAYS)
+            # With thinning disabled (history.THIN_AFTER_DAYS is None) every
+            # dropped row is a loss. Otherwise only allowed via thinning: rows
+            # older than the full-resolution window whose hour (or, past the
+            # daily cut, day) still has a row.
+            thin_days = history.THIN_AFTER_DAYS
+            day_cut = now - timedelta(days=thin_days if thin_days is not None else 0)
+            hour_cut = now - timedelta(days=history._FULL_RES_DAYS)
             new_days = {t.floor("D") for t in new_ts}
-            bad = [t for t in dropped if t >= thin_cut or t.floor("D") not in new_days]
+            new_hours = {t.floor("h") for t in new_ts}
+
+            def _lost(t):
+                if thin_days is None or t >= hour_cut:
+                    return True
+                if t >= day_cut:
+                    return t.floor("h") not in new_hours
+                return t.floor("D") not in new_days
+            bad = [t for t in dropped if _lost(t)]
             if bad:
                 errs.append(f"{len(bad)} published rows would be lost (e.g. {bad[0].isoformat()})")
         added_rows = new[~new["_ts"].isin(old_ts)]

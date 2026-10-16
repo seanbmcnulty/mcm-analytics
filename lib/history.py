@@ -190,12 +190,19 @@ def ensure_source_column(path: Path) -> bool:
         return False
 
 
-# Hourly recording (the GitHub Actions recorder) would otherwise grow each
-# snapshot CSV without bound forever. Cap it: keep full hourly resolution for
-# the recent window, collapse anything older to one row per UTC calendar day.
-_THIN_AFTER_DAYS = 60     # was 14: a 2-week hourly window threw away the history the 30/90d charts need
+# The recorder can run every ~15 min, which would grow each snapshot CSV
+# quickly. Tiered retention: full resolution for the last _FULL_RES_DAYS (the
+# intraday charts need it), one row per UTC hour out to _THIN_AFTER_DAYS, and
+# one row per UTC calendar day beyond that.
+_FULL_RES_DAYS = 7
+# THINNING IS DISABLED: full hourly history is kept forever (approved 2026-10-16).
+# Set THIN_AFTER_DAYS to a number of days (e.g. 60) to re-enable the tiered
+# retention above; scripts/snapshot_tools.py validation follows this constant
+# (with None, the workflow refuses to publish if ANY published row is missing).
+THIN_AFTER_DAYS: int | None = None
+_THIN_AFTER_DAYS = THIN_AFTER_DAYS  # legacy alias
 _BEYOND_EXPIRY_TOL_DAYS = 5.0  # leave a tenor blank if it's this far past the last listed expiry
-_THIN_MIN_ROWS = 1600   # ~60d of hourly rows (~2.5 MB/asset); skip the rewrite cost until there's something to gain
+_THIN_MIN_ROWS = 800    # skip the rewrite cost until there's something to gain
 
 
 def _thin_snapshot_file(path: Path) -> None:
@@ -204,6 +211,8 @@ def _thin_snapshot_file(path: Path) -> None:
     matter. Any failure here just leaves the file as-is -- this must never
     be the reason a recording run fails.
     """
+    if THIN_AFTER_DAYS is None:
+        return  # retention disabled: keep every row
     try:
         df = pd.read_csv(path)
         if len(df) < _THIN_MIN_ROWS or "timestamp" not in df:
@@ -211,16 +220,19 @@ def _thin_snapshot_file(path: Path) -> None:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True,
                                           format="ISO8601", errors="coerce")
         df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
-        cutoff = datetime.now(timezone.utc) - timedelta(days=_THIN_AFTER_DAYS)
-        recent = df[df.index >= cutoff]
-        old = df[df.index < cutoff]
-        if old.empty:
-            return
-        day_counts = old.index.floor("D")
-        if len(old) <= day_counts.nunique():
+        now = datetime.now(timezone.utc)
+        cut_day = now - timedelta(days=THIN_AFTER_DAYS)
+        cut_hour = now - timedelta(days=_FULL_RES_DAYS)
+        old = df[df.index < cut_day]
+        mid = df[(df.index >= cut_day) & (df.index < cut_hour)]
+        recent = df[df.index >= cut_hour]
+        if not old.empty:
+            old = old.groupby(old.index.floor("D")).first()
+        if not mid.empty:
+            mid = mid.groupby(mid.index.floor("h")).first()
+        out = pd.concat([old, mid, recent]).sort_index()
+        if len(out) >= len(df):
             return  # already thinned, nothing to save
-        old = old.groupby(day_counts).first()
-        out = pd.concat([old, recent]).sort_index()
         out = out[~out.index.duplicated(keep="last")]
         # Write timestamps in the exact same format record_snapshot() uses for
         # fresh appends (Python's datetime.isoformat(), "T" separator) -- NOT

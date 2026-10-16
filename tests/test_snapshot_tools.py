@@ -47,12 +47,70 @@ def test_validate_rejects_lost_rows_bad_iv_and_blank_core():
     assert any("outside" in e for e in errs) and any("blank atm_30" in e for e in errs)
 
 
+def _with_thinning(days=60):
+    import contextlib
+
+    @contextlib.contextmanager
+    def cm():
+        prev = history.THIN_AFTER_DAYS
+        history.THIN_AFTER_DAYS = days
+        try:
+            yield
+        finally:
+            history.THIN_AFTER_DAYS = prev
+    return cm()
+
+
+def test_thinning_disabled_by_default_and_no_row_may_be_lost():
+    assert history.THIN_AFTER_DAYS is None
+    now = datetime(2026, 12, 31, tzinfo=timezone.utc)
+    old = _df(_csv(["2026-09-01T01:00:00.1+00:00,0.5,0.5,0.5,live",
+                    "2026-09-01T02:00:00.1+00:00,0.5,0.5,0.5,live"]))
+    new = _df(_csv(["2026-09-01T01:00:00.1+00:00,0.5,0.5,0.5,live"]))
+    assert any("lost" in e for e in st.validate_asset(old, new, now=now))
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "X_surface.csv"
+        rows = [f"2026-08-{1 + i // 24:02d}T{i % 24:02d}:00:00.1+00:00,0.5,0.5,0.5,live"
+                for i in range(24 * 30)]
+        p.write_text(_csv(rows))
+        history._thin_snapshot_file(p)
+        assert len(pd.read_csv(p)) == len(rows)
+
+
 def test_validate_allows_thinning_of_old_rows():
+    with _with_thinning():
+        _validate_allows_thinning_of_old_rows()
+
+
+def _validate_allows_thinning_of_old_rows():
     now = datetime(2026, 12, 31, tzinfo=timezone.utc)
     old = _df(_csv(["2026-09-01T01:00:00.1+00:00,0.5,0.5,0.5,live",
                     "2026-09-01T02:00:00.1+00:00,0.5,0.5,0.5,live"]))
     new = _df(_csv(["2026-09-01T01:00:00.1+00:00,0.5,0.5,0.5,live"]))
     assert st.validate_asset(old, new, now=now) == []
+
+
+def test_validate_tiered_thinning():
+    with _with_thinning():
+        _validate_tiered_thinning()
+
+
+def _validate_tiered_thinning():
+    now = datetime(2026, 12, 31, 12, tzinfo=timezone.utc)
+    # 20 days old: one row per hour must survive, extra rows in the hour may go
+    old = _df(_csv(["2026-12-11T01:00:00.1+00:00,0.5,0.5,0.5,live",
+                    "2026-12-11T01:15:00.1+00:00,0.5,0.5,0.5,live"]))
+    ok = _df(_csv(["2026-12-11T01:00:00.1+00:00,0.5,0.5,0.5,live"]))
+    assert st.validate_asset(old, ok, now=now) == []
+    # but dropping a whole hour in that tier is a loss
+    two = _df(_csv(["2026-12-11T01:00:00.1+00:00,0.5,0.5,0.5,live",
+                    "2026-12-11T02:00:00.1+00:00,0.5,0.5,0.5,live"]))
+    assert any("lost" in e for e in st.validate_asset(two, ok, now=now))
+    # inside the 7-day full-resolution window nothing may be dropped
+    recent = _df(_csv(["2026-12-29T01:00:00.1+00:00,0.5,0.5,0.5,live",
+                       "2026-12-29T01:15:00.1+00:00,0.5,0.5,0.5,live"]))
+    rec_ok = _df(_csv(["2026-12-29T01:00:00.1+00:00,0.5,0.5,0.5,live"]))
+    assert any("lost" in e for e in st.validate_asset(recent, rec_ok, now=now))
 
 
 def test_merge_is_append_only_and_tags():
