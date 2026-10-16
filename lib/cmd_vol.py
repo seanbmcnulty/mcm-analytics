@@ -1031,9 +1031,7 @@ def _smoothed_perp(asset: str, since) -> pd.DataFrame | None:
     return px
 
 
-INTRADAY_DENSE_NOTE = ("Line: 15-min path following DVOL, anchored to recorded "
-                       "snapshots (\u25cf). Between snapshots it is interpolated, "
-                       "not observed.")
+INTRADAY_DENSE_NOTE = "15-min snaps"
 
 
 def _densify_frames(asset: str, frames: dict[str, pd.Series]):
