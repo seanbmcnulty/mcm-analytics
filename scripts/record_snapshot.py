@@ -22,12 +22,38 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lib import history
+from lib import history, surface
 from lib.constants import ASSETS
+
+
+# Waits between attempts for an asset whose surface came back empty or
+# errored (Deribit hiccup). 3 attempts total; the last entry is only used if
+# --attempts is raised.
+RETRY_BACKOFF_S = (2.0, 5.0, 15.0)
+
+
+def record_with_retry(asset: str, min_interval: float, attempts: int = 3,
+                      sleep=time.sleep) -> str:
+    status = "error"
+    for attempt in range(attempts):
+        try:
+            status = history.record_snapshot_status(asset, min_interval_s=min_interval)
+        except Exception as exc:  # defensive: record_snapshot_status shouldn't raise
+            print(f"[{asset}] attempt {attempt + 1}: {exc}", file=sys.stderr)
+            status = "error"
+        if status in ("recorded", "skipped"):
+            return status
+        if attempt < attempts - 1:
+            wait = RETRY_BACKOFF_S[min(attempt, len(RETRY_BACKOFF_S) - 1)]
+            print(f"[{asset}] {status} on attempt {attempt + 1}; retrying in {wait:.0f}s")
+            surface._VOLS_CACHE.pop(asset, None)  # don't get the cached empty result back
+            sleep(wait)
+    return status
 
 
 def main() -> int:
@@ -37,22 +63,25 @@ def main() -> int:
     parser.add_argument("--min-interval", type=float, default=1800.0,
                         help="Skip an asset if its last row is younger than "
                              "this many seconds (default: 1800 = 30 min)")
+    parser.add_argument("--attempts", type=int, default=3,
+                        help="Attempts per asset when Deribit returns nothing (default 3)")
     args = parser.parse_args()
 
+    failed = []
     wrote_any = False
     for asset in args.assets:
-        try:
-            wrote = history.record_snapshot(asset, min_interval_s=args.min_interval)
-        except Exception as exc:
-            print(f"[{asset}] ERROR: {exc}", file=sys.stderr)
-            continue
-        status = "recorded" if wrote else "skipped (too recent, or no live data)"
+        status = record_with_retry(asset, args.min_interval, args.attempts)
         print(f"[{asset}] {status}")
-        wrote_any = wrote_any or wrote
+        wrote_any = wrote_any or status == "recorded"
+        if status not in ("recorded", "skipped"):
+            failed.append(asset)
 
-    # Exit 0 either way — "nothing new to record" is not a failure, it just
-    # means the workflow's commit step will find no changes to push.
     print("Done." + (" New rows written." if wrote_any else " No new rows."))
+    if failed:
+        # Exit 2 = partial failure. The workflow still publishes the assets
+        # that did record, then fails the run so the Telegram alert fires.
+        print(f"FAILED assets after retries: {' '.join(failed)}", file=sys.stderr)
+        return 2
     return 0
 
 

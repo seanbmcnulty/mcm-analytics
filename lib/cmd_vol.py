@@ -1034,6 +1034,27 @@ def _smoothed_perp(asset: str, since) -> pd.DataFrame | None:
     return px
 
 
+INTRADAY_DENSE_NOTE = ("Line: 15-min path following DVOL, anchored to recorded "
+                       "snapshots (\u25cf). Between snapshots it is interpolated, "
+                       "not observed.")
+
+
+def _densify_frames(asset: str, frames: dict[str, pd.Series]):
+    """(dense_frames, raw_frames). Series DVOL can't densify stay as-is."""
+    dense, raw = {}, {}
+    for key, s in frames.items():
+        d = history.densify_intraday(asset, s)
+        if d is not None:
+            dense[key], raw[key] = d, s
+        else:
+            dense[key] = s
+    return dense, raw
+
+
+def _legend_count(fig) -> int:
+    return sum(1 for t in fig.data if t.showlegend is not False)
+
+
 def _est_note(estimated: bool, src: str) -> str | None:
     """Text for the reconstruction caveat, or None when the data is recorded."""
     if estimated and src != "none":
@@ -1050,6 +1071,9 @@ def _vol_series_chart(asset: str, dte: int, days: int, title: str,
     frames, estimated, src = _time_series_frames(asset, dte, days, keys)
     if "delta50" not in frames:
         return None, None, "No vol time series data."
+    raw: dict[str, pd.Series] = {}
+    if intraday and not estimated:
+        frames, raw = _densify_frames(asset, frames)
 
     spec = [("delta50", "ATM Vol", NAVY, "solid"),
             ("deltaCall25", "25Δ Call Vol", BLUE, "dot"),
@@ -1070,8 +1094,13 @@ def _vol_series_chart(asset: str, dte: int, days: int, title: str,
             continue
         fig.add_trace(go.Scatter(
             x=to_local(s.index), y=s.values, name=name,
-            mode="lines+markers" if intraday else "lines",
+            mode="lines+markers" if (intraday and key not in raw) else "lines",
             line=dict(color=color, dash=dash, shape=line_shape)))
+        if key in raw:
+            fig.add_trace(go.Scatter(
+                x=to_local(raw[key].index), y=raw[key].values, mode="markers",
+                marker=dict(color=color, size=6), showlegend=False,
+                hoverinfo="skip"))
 
     if intraday:
         px = _smoothed_perp(asset, frames["delta50"].index[0])
@@ -1091,8 +1120,8 @@ def _vol_series_chart(asset: str, dte: int, days: int, title: str,
         xaxis=dict(type="date", tickformat=TIME_TICKFORMAT, tickangle=-90))
     if not intraday:
         fig.update_layout(yaxis=dict(ticksuffix="%"))
-    n_series = len(fig.data)
-    finalize(fig, note=_est_note(estimated, src),
+    n_series = _legend_count(fig)
+    finalize(fig, note=INTRADAY_DENSE_NOTE if raw else _est_note(estimated, src),
              legend_rows=2 if n_series > 3 else 1)
     return fig, None, None
 
@@ -1118,6 +1147,13 @@ def _skew_series_chart(asset: str, dte: int, days: int, title: str,
     frames, estimated, src = _time_series_frames(asset, dte, days, keys)
     if "deltaCall25" not in frames or "deltaPut25" not in frames:
         return None, None, "No skew time series data."
+    raw25 = None
+    if intraday and not estimated:
+        frames, raw = _densify_frames(asset, frames)
+        if "deltaCall25" in raw and "deltaPut25" in raw:
+            rp = _align(raw["deltaCall25"], raw["deltaPut25"])
+            if rp is not None:
+                raw25 = (rp[0] - rp[1]).dropna()
 
     pair = _align(frames["deltaCall25"], frames["deltaPut25"])
     if pair is None:
@@ -1135,8 +1171,13 @@ def _skew_series_chart(asset: str, dte: int, days: int, title: str,
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=to_local(s25.index), y=s25.values, name="25Δ Skew (Call − Put)",
-        mode="lines+markers" if intraday else "lines",
+        mode="lines+markers" if (intraday and raw25 is None) else "lines",
         line=dict(color=NAVY, shape=line_shape)))
+    if raw25 is not None and len(raw25):
+        fig.add_trace(go.Scatter(
+            x=to_local(raw25.index), y=raw25.values, mode="markers",
+            marker=dict(color=NAVY, size=6), showlegend=False,
+            hoverinfo="skip"))
 
     if not intraday and "deltaCall10" in frames and "deltaPut10" in frames:
         pair10 = _align(frames["deltaCall10"], frames["deltaPut10"])
@@ -1171,8 +1212,8 @@ def _skew_series_chart(asset: str, dte: int, days: int, title: str,
         height=450, template=TEMPLATE,
         xaxis=dict(type="date", tickformat=TIME_TICKFORMAT, tickangle=-90),
         yaxis=dict(title="25Δ Skew (pp)", side="left"))
-    n_series = len(fig.data)
-    finalize(fig, note=_est_note(estimated, src),
+    n_series = _legend_count(fig)
+    finalize(fig, note=INTRADAY_DENSE_NOTE if raw25 is not None else _est_note(estimated, src),
              legend_rows=2 if n_series > 3 else 1)
     return fig, None, None
 

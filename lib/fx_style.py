@@ -159,6 +159,9 @@ def _title_text(fig) -> str:
         return ""
 
 
+_HEADER_EST_WIDTH = 560   # px assumed when a figure has no explicit width
+
+
 def finalize(fig: go.Figure, note: str = None, legend_rows: int = 1,
              extra_top: int = 0, keep_margin: bool = False, **kwargs) -> go.Figure:
     """
@@ -170,16 +173,48 @@ def finalize(fig: go.Figure, note: str = None, legend_rows: int = 1,
     if fig is None:
         return None
     try:
+        import math
+        import textwrap
+        width = getattr(fig.layout, "width", None) or _HEADER_EST_WIDTH
+        usable = max(width - 90, 200)          # minus side margins
+
+        base = _title_text(fig)
         if note:
-            base = _title_text(fig)
             marker = "<span style='font-size:11px"
             if marker not in base:
-                fig.update_layout(title=dict(
-                    text=f"{base}<br><span style='font-size:11px;color:#8a8a8a'>{note}</span>",
-                    x=0.0, xanchor="left", y=0.985, yanchor="top"))
-        rows = max(1, int(legend_rows))
+                # SVG titles never wrap on their own -- break the note by hand.
+                note_html = "<br>".join(textwrap.wrap(
+                    str(note), width=max(int(usable / 5.6), 24)))
+                base = (f"{base}<br><span style='font-size:11px;"
+                        f"color:#8a8a8a'>{note_html}</span>")
+        # Title is pinned to the top of the *container* (not the plot area),
+        # so it can never drift into the legend as the margin grows.
+        fig.update_layout(title=dict(
+            text=base, x=0.0, xanchor="left", yref="container",
+            y=1.0 - 14.0 / float(getattr(fig.layout, "height", None) or 450),
+            yanchor="top"))
+
+        plain = [ln for ln in re.sub(r"<[^>]+>", "\n", base).split("\n") if ln.strip()]
+        title_lines = 0
+        for k, ln in enumerate(plain):
+            per_line = usable / (5.6 if k > 0 else 9.5)
+            title_lines += max(1, math.ceil(len(ln) / per_line))
+        title_h = 18 + 24 + 15 * max(0, title_lines - 1)
+
+        # Legend rows: wrap estimate from entry text widths (plotly wraps a
+        # horizontal legend by chart width, so a fixed row count overlaps
+        # the title as soon as the chart gets narrow).
+        names = [t.name for t in fig.data
+                 if getattr(t, "showlegend", None) is not False and getattr(t, "name", None)]
+        est_rows, line_w = 1, 0.0
+        for nm in names:
+            w = 6.6 * len(str(nm)) + 46
+            if line_w and line_w + w > usable:
+                est_rows, line_w = est_rows + 1, 0.0
+            line_w += w
+        rows = max(1, int(legend_rows), est_rows if names else 1)
         if not keep_margin:
-            top = 52 + 24 * rows + (22 if note else 0) + int(extra_top)
+            top = title_h + 22 * rows + 14 + int(extra_top)
             fig.update_layout(margin=dict(t=top))
         fig.update_layout(legend=dict(
             orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0,

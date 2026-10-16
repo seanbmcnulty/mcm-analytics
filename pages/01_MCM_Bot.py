@@ -81,6 +81,10 @@ CORE_COMMANDS = (
 )
 CORE_ASSETS = ("BTC", "ETH")
 
+# Charts per row in the main dashboard grid (the "Vol surface by expiry"
+# section at the bottom of each tab keeps its own 3-wide layout).
+GRID_COLS = 2
+
 # Wide-table heuristic: known full-row commands OR any result whose dataframe
 # has more than this many columns (too many to read in a 1/3-width cell).
 FULL_ROW_MIN_COLS = 6
@@ -780,11 +784,11 @@ for ia, a in enumerate(ASSETS):
                     st.write("")
                 continue
 
-            # Next row: up to 3 items, stopping before a full-row command so
+            # Next row: up to GRID_COLS items, stopping before a full-row command so
             # that command starts its own row instead of being pulled in.
             row_items = []
             j = i
-            while j < n_a and len(row_items) < 3 and not _needs_full_row(a, order_a[j][1]):
+            while j < n_a and len(row_items) < GRID_COLS and not _needs_full_row(a, order_a[j][1]):
                 row_items.append(order_a[j])
                 j += 1
             i = j

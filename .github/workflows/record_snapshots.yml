@@ -3,22 +3,26 @@ name: Record vol snapshots
 # Runs independently of Streamlit Community Cloud so history keeps
 # accumulating even while the app is asleep, crashed, or mid-redeploy.
 #
-# Publishes to the "snapshots" branch, NOT main — Streamlit Cloud only
-# redeploys on pushes to the branch it's configured to watch (main), so an
-# hourly commit here never interrupts the live app. lib/history.py reads
-# this branch's CSVs over HTTPS (raw.githubusercontent.com) at request
-# time and merges them with whatever the running app has recorded locally
-# since its last redeploy.
+# Publishes to the "snapshots" branch, NOT main - Streamlit Cloud only
+# redeploys on pushes to main, so an hourly commit here never interrupts the
+# live app. lib/history.py reads this branch's CSVs over HTTPS
+# (raw.githubusercontent.com).
+#
+# APPEND-ONLY: the branch is checked out as-is, the new row is appended to its
+# CSVs, the result is validated against what was published, and pushed as a
+# normal commit (never --force). If the branch moved underneath us (e.g.
+# publish_snapshot_history.bat ran), the new row is merged onto the new tip
+# and the push retried. A bad file fails the run instead of being published.
+#
+# Triggers: GitHub's own schedule drops most runs, so the primary trigger is
+# an external hourly workflow_dispatch call (docs/EXTERNAL_TRIGGER.md). The
+# two crons stay as a backup; --min-interval makes duplicates no-ops.
 
 on:
   schedule:
-    # Two staggered triggers per hour, both OFF the top of the hour: GitHub drops/delays
-    # :00 schedules under load (observed: median 5.7h between rows instead of 1h). The
-    # recorder's --min-interval below makes the second trigger a no-op when the first
-    # succeeded, and a backup when it didn't.
     - cron: '17 * * * *'
     - cron: '47 * * * *'
-  workflow_dispatch: {}    # allow manual "Run workflow" from the Actions tab
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -30,6 +34,7 @@ concurrency:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout main
         uses: actions/checkout@v6
@@ -43,56 +48,110 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
+        timeout-minutes: 3
         run: pip install --disable-pip-version-check requests pandas numpy scipy
 
-      - name: Restore accumulated snapshot history
-        # Pull in whatever the branch has accumulated so far so this run
-        # appends to it instead of starting over from main's copy (which
-        # may be stale, empty, or not tracked at all).
-        #
-        # git ls-remote's exit code tells "branch doesn't exist" (2) apart
-        # from "couldn't even ask" (anything else, e.g. a transient network
-        # or auth failure). That distinction matters: if we treated every
-        # failure to reach the branch as "starting fresh," a flaky network
-        # blip would make this job silently force-push over and WIPE every
-        # row recorded so far. Only a confirmed-absent branch is safe to
-        # treat as a fresh start.
+      - name: Check out snapshots branch
+        timeout-minutes: 2
+        # ls-remote exit 2 = branch confirmed absent (fresh start). Anything
+        # else non-zero = couldn't ask; abort rather than risk a bad publish.
         run: |
+          # PUB = worktree of the snapshots branch; BASELINE = CSVs as published
+          echo "PUB=$RUNNER_TEMP/pub" >> "$GITHUB_ENV"
+          echo "BASELINE=$RUNNER_TEMP/published" >> "$GITHUB_ENV"
+          PUB="$RUNNER_TEMP/pub"; BASELINE="$RUNNER_TEMP/published"
+          git config --global user.name "mcm-snapshot-bot"
+          git config --global user.email "actions@users.noreply.github.com"
           set +e
           git ls-remote --exit-code --heads origin snapshots >/dev/null 2>&1
           rc=$?
           set -e
+          mkdir -p "$BASELINE" data/snapshots
           if [ "$rc" -eq 0 ]; then
             echo "HAVE_BRANCH=1" >> "$GITHUB_ENV"
-            git fetch origin snapshots
-            git checkout origin/snapshots -- data/snapshots
+            git fetch --depth=1 origin snapshots
+            git worktree add -B snapshots "$PUB" FETCH_HEAD
+            cp "$PUB"/data/snapshots/*_surface.csv "$BASELINE"/ 2>/dev/null || true
+            cp "$PUB"/data/snapshots/*_surface.csv data/snapshots/ 2>/dev/null || true
           elif [ "$rc" -eq 2 ]; then
             echo "HAVE_BRANCH=0" >> "$GITHUB_ENV"
-            echo "No existing snapshots branch yet — starting fresh."
+            git worktree add --orphan -b snapshots "$PUB"
+            echo "No snapshots branch yet - starting fresh."
           else
-            echo "::error::Could not reach the snapshots branch (exit $rc) — aborting rather than risk force-pushing over existing history."
+            echo "::error::Could not reach the snapshots branch (exit $rc)."
             exit 1
           fi
+          wc -l "$BASELINE"/*.csv || true
 
       - name: Record snapshot
-        run: python scripts/record_snapshot.py --min-interval 3000   # ~50 min: one row/hour, backup trigger skips
-
-      - name: Publish to snapshots branch
+        timeout-minutes: 5
+        # Exit 2 = some asset failed after retries. Publish what did record,
+        # then fail the run at the end so the alert fires.
         run: |
-          git config user.name "mcm-snapshot-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add -f data/snapshots
-          # Compare against what's already published (origin/snapshots), not
-          # against HEAD (main) — data/snapshots is gitignored on main, so it
-          # never appears in HEAD's tree and a HEAD-relative diff would look
-          # "changed" on every run even when record_snapshot.py wrote nothing
-          # new, causing a pointless commit+force-push every hour.
-          if [ "$HAVE_BRANCH" = "1" ] && git diff --cached --quiet origin/snapshots -- data/snapshots; then
-            echo "No new snapshot rows; nothing to publish."
-            exit 0
+          set +e
+          python scripts/record_snapshot.py --min-interval 3000
+          echo "REC_RC=$?" >> "$GITHUB_ENV"
+
+      - name: Validate before publishing
+        timeout-minutes: 1
+        run: python scripts/snapshot_tools.py validate --published "$BASELINE" --candidate data/snapshots
+
+      - name: Health summary
+        if: always()
+        timeout-minutes: 1
+        run: python scripts/snapshot_tools.py summary --published "$BASELINE" --candidate data/snapshots >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Publish to snapshots branch (append-only, no force)
+        timeout-minutes: 2
+        run: |
+          set -e
+          for attempt in 1 2 3; do
+            mkdir -p "$PUB/data/snapshots"
+            if [ "$attempt" -eq 1 ]; then
+              cp data/snapshots/*_surface.csv "$PUB/data/snapshots/"
+            else
+              # Branch moved: merge our rows onto the new tip, re-validate.
+              git -C "$PUB" fetch --depth=1 origin snapshots
+              git -C "$PUB" reset --hard FETCH_HEAD
+              rm -rf "$BASELINE" && mkdir -p "$BASELINE"
+              cp "$PUB"/data/snapshots/*_surface.csv "$BASELINE"/
+              python scripts/snapshot_tools.py merge --base "$PUB/data/snapshots" --incoming data/snapshots
+              python scripts/snapshot_tools.py validate --published "$BASELINE" --candidate "$PUB/data/snapshots" --max-added 2
+            fi
+            git -C "$PUB" add -f data/snapshots
+            if git -C "$PUB" diff --cached --quiet; then
+              echo "No new snapshot rows; nothing to publish."
+              exit 0
+            fi
+            git -C "$PUB" commit -q -m "snapshot: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            if git -C "$PUB" push origin HEAD:refs/heads/snapshots; then
+              echo "Published."
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt); retrying on the new tip..."
+            sleep $((attempt * 5))
+          done
+          echo "::error::Could not publish after 3 attempts."
+          exit 1
+
+      - name: Fail if recording had errors
+        if: env.REC_RC != '0'
+        run: |
+          echo "::error::record_snapshot.py exited $REC_RC (some assets failed after retries)"
+          exit 1
+
+      - name: Telegram alert on failure
+        if: failure()
+        timeout-minutes: 1
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+            echo "Telegram secrets not set; skipping alert."; exit 0
           fi
-          git commit -m "snapshot: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          # Force-push: this branch is a data mirror, not a code history —
-          # each run republishes main's current tree plus the latest
-          # accumulated CSVs, so a clean linear history isn't meaningful here.
-          git push --force origin HEAD:refs/heads/snapshots
+          curl -sS -m 20 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=⚠️ MCM snapshot recorder FAILED ($(date -u +'%Y-%m-%d %H:%M') UTC). ${RUN_URL}" >/dev/null \
+            || echo "Telegram send failed (ignored)."

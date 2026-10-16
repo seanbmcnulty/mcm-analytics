@@ -5,7 +5,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # --- lightweight unit regressions (no Deribit / no plotly needed) ---
 _unit_failures = []
-for _mod_name in ("tests.test_telegram_caption", "tests.test_requirements_pins"):
+for _mod_name in ("tests.test_telegram_caption", "tests.test_requirements_pins",
+                  "tests.test_snapshot_tools"):
     try:
         _mod = __import__(_mod_name, fromlist=["*"])
         for _attr in dir(_mod):

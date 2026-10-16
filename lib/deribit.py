@@ -33,6 +33,9 @@ _cache: dict[str, tuple[float, Any]] = {}
 _cache_lock = threading.Lock()
 
 DEFAULT_TIMEOUT = 15  # seconds
+# Backoff between attempts (3 attempts total -> waits 2s, then 5s; a third
+# entry is used if retries is raised above 3).
+RETRY_BACKOFF_S = (2.0, 5.0, 15.0)
 
 
 def _rate_limit():
@@ -83,6 +86,7 @@ def _request(endpoint: str, params: dict | None = None, ttl: float = 60.0,
     _rate_limit()
 
     for attempt in range(retries):
+        retryable = False
         try:
             resp = requests.get(url, params=params, timeout=DEFAULT_TIMEOUT)
             if resp.status_code == 200:
@@ -91,16 +95,14 @@ def _request(endpoint: str, params: dict | None = None, ttl: float = 60.0,
                     _cache_set(cache_key, data["result"])
                     return data["result"]
                 return data
-            elif resp.status_code == 429:
-                # Rate limited — back off
-                time.sleep(2 ** attempt)
-            else:
-                # Non-retryable HTTP error
-                return None
+            # 429 (rate limit) and 5xx (Deribit hiccup) are transient; other
+            # 4xx are our fault and won't get better on retry.
+            retryable = resp.status_code == 429 or resp.status_code >= 500
         except (requests.RequestException, ValueError):
-            if attempt < retries - 1:
-                time.sleep(1.0 * (attempt + 1))
-            continue
+            retryable = True
+        if not retryable or attempt >= retries - 1:
+            break
+        time.sleep(RETRY_BACKOFF_S[min(attempt, len(RETRY_BACKOFF_S) - 1)])
     return None
 
 

@@ -1,0 +1,72 @@
+name: Snapshot watchdog
+
+# 1) Every 2 hours: alert on Telegram if the newest published snapshot row is
+#    more than 2 hours old (catches dropped schedules, a dead external
+#    trigger, or a disabled workflow - none of which produce a failed run).
+# 2) Monthly: re-enable the scheduled workflows. GitHub auto-disables
+#    schedules in a public repo after 60 days without repository activity.
+
+on:
+  schedule:
+    - cron: '37 */2 * * *'   # stale check
+    - cron: '23 3 1 * *'     # keepalive, 1st of each month 03:23 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  stale-check:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '37 */2 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install --disable-pip-version-check requests pandas numpy scipy
+      - name: Check freshness
+        id: check
+        run: |
+          set +e
+          out=$(python scripts/snapshot_tools.py stale --max-age-hours 2 \
+                --url-base "https://raw.githubusercontent.com/${{ github.repository }}/snapshots/data/snapshots")
+          rc=$?
+          echo "$out"
+          { echo '```'; echo "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "msg=$(echo "$out" | grep '^STALE' | head -1)" >> "$GITHUB_OUTPUT"
+          exit $rc
+      - name: Telegram alert
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MSG: ${{ steps.check.outputs.msg }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+            echo "Telegram secrets not set; skipping alert."; exit 0
+          fi
+          curl -sS -m 20 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=⏰ MCM snapshots are stale. ${MSG:-check failed} ${RUN_URL}" >/dev/null \
+            || echo "Telegram send failed (ignored)."
+
+  keepalive:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '23 3 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Re-enable scheduled workflows
+        run: |
+          for wf in record_snapshots.yml snapshot_watchdog.yml update_macro_calendar.yml; do
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/$wf/enable" \
+              && echo "enabled $wf" || echo "::warning::could not enable $wf"
+          done

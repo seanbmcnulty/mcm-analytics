@@ -55,6 +55,8 @@ _REMOTE_SNAPSHOT_BASE = (
     f"https://raw.githubusercontent.com/{SNAPSHOT_REPO}/{SNAPSHOT_BRANCH}/data/snapshots"
 )
 _REMOTE_TIMEOUT = 6.0
+# Short waits: this runs inside a Streamlit request, so keep the worst case small.
+_REMOTE_BACKOFF_S = (1.0, 2.0, 0.0)  # 3 attempts
 _REMOTE_SNAPSHOT_CACHE: dict[str, tuple[float, "pd.DataFrame | None"]] = {}
 _REMOTE_SNAPSHOT_TTL = 300.0
 
@@ -135,10 +137,64 @@ def _snapshot_path(asset: str) -> Path:
     return SNAPSHOT_DIR / f"{asset}_surface.csv"
 
 
+# Provenance of each snapshot row. Older files have no ``source`` column; they
+# are upgraded in place the next time a row is appended (see
+# ``ensure_source_column``) and readers treat a missing value as "live".
+#   live     - recorded from the real Deribit surface by record_snapshot()
+#   seed     - synthetic one-per-day rows at exactly 00:00:00 UTC that were
+#              used to seed the store before live recording (Aug 18 - Sep 26 2026)
+#   backfill - reconstructed after the fact (tools/backfill_dvol.py)
+SOURCE_COL = "source"
+SOURCE_LIVE, SOURCE_SEED, SOURCE_BACKFILL = "live", "seed", "backfill"
+_SEED_CUTOFF = pd.Timestamp("2026-09-27", tz="UTC")
+
+
+def infer_source(ts_text: str) -> str:
+    """
+    Best guess for a legacy row with no ``source``: the seeded rows carry an
+    exact-midnight timestamp with no fractional seconds; live rows always have
+    microseconds from ``datetime.now().isoformat()``.
+    """
+    try:
+        t = pd.Timestamp(ts_text)
+        t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+    except Exception:
+        return SOURCE_LIVE
+    if "." not in str(ts_text) and t == t.floor("D") and t < _SEED_CUTOFF:
+        return SOURCE_SEED
+    return SOURCE_LIVE
+
+
+def ensure_source_column(path: Path) -> bool:
+    """
+    Add a ``source`` column to a legacy snapshot CSV (in place), inferring
+    seed vs live per row. Fills blanks in an existing column the same way.
+    Returns True if the file was rewritten. Never raises.
+    """
+    try:
+        if not path.exists():
+            return False
+        df = pd.read_csv(path, dtype={"timestamp": str})
+        if df.empty or "timestamp" not in df:
+            return False
+        if SOURCE_COL in df.columns and df[SOURCE_COL].notna().all():
+            return False
+        inferred = df["timestamp"].map(infer_source)
+        if SOURCE_COL in df.columns:
+            df[SOURCE_COL] = df[SOURCE_COL].where(df[SOURCE_COL].notna(), inferred)
+        else:
+            df[SOURCE_COL] = inferred
+        df.to_csv(path, index=False)
+        return True
+    except Exception:
+        return False
+
+
 # Hourly recording (the GitHub Actions recorder) would otherwise grow each
 # snapshot CSV without bound forever. Cap it: keep full hourly resolution for
 # the recent window, collapse anything older to one row per UTC calendar day.
 _THIN_AFTER_DAYS = 60     # was 14: a 2-week hourly window threw away the history the 30/90d charts need
+_BEYOND_EXPIRY_TOL_DAYS = 5.0  # leave a tenor blank if it's this far past the last listed expiry
 _THIN_MIN_ROWS = 1600   # ~60d of hourly rows (~2.5 MB/asset); skip the rewrite cost until there's something to gain
 
 
@@ -179,16 +235,20 @@ def _thin_snapshot_file(path: Path) -> None:
         pass
 
 
-def record_snapshot(asset: str, min_interval_s: float = 1800.0) -> bool:
+def record_snapshot_status(asset: str, min_interval_s: float = 1800.0) -> str:
     """
-    Append the current surface to the snapshot store.
+    Append the current surface to the snapshot store and say what happened:
 
-    No-ops when the last row is younger than ``min_interval_s``.  Returns True
-    when a row was written.  Best-effort: on a read-only or ephemeral
-    filesystem (Streamlit Community Cloud) this silently does nothing.
+      "recorded"  a row was written
+      "skipped"   the last row is younger than ``min_interval_s``
+      "no_data"   Deribit returned no usable surface (worth retrying)
+      "error"     anything else went wrong (e.g. read-only filesystem)
 
-    Also runs ``_thin_snapshot_file`` after a successful write, so the file
-    stays bounded in size no matter how long recording runs for.
+    Tenors beyond the longest listed expiry are written blank rather than
+    held flat (SOL/HYPE list nothing past ~3 months, so a flat-held 180d/365d
+    value is just a copy of the last expiry and carries no information).
+    Upgrades a legacy file to include the ``source`` column before appending,
+    then runs ``_thin_snapshot_file``.
     """
     try:
         SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -201,26 +261,43 @@ def record_snapshot(asset: str, min_interval_s: float = 1800.0) -> bool:
                     last = pd.to_datetime(tail["timestamp"].iloc[0], utc=True,
                                           format="ISO8601")
                     if (now - last).total_seconds() < min_interval_s:
-                        return False
+                        return "skipped"
             except Exception:
                 pass
 
         vols = surface.option_vols_by_dte(asset)
         if not vols.get("atm"):
-            return False
+            return "no_data"
+        listed = [float(k) for k, v in vols.get("atm", {}).items() if surface.finite(v)]
+        max_listed = max(listed) if listed else 0.0
         row: dict[str, object] = {"timestamp": now.isoformat()}
         for field in _FIELDS:
             series = {float(k): float(v) for k, v in vols.get(field, {}).items()
                       if surface.finite(v)}
             for dte in SNAPSHOT_DTES:
-                v = surface.interp_at_dte(series, float(dte)) if series else np.nan
+                if dte > max_listed + _BEYOND_EXPIRY_TOL_DAYS:
+                    v = np.nan
+                else:
+                    v = surface.interp_at_dte(series, float(dte)) if series else np.nan
                 row[f"{field}_{dte}"] = round(float(v), 6) if surface.finite(v) else ""
-        header = not path.exists()
-        pd.DataFrame([row]).to_csv(path, mode="a", header=header, index=False)
+        row[SOURCE_COL] = SOURCE_LIVE
+        ensure_source_column(path)
+        if path.exists():
+            # Match the existing header exactly so an append can never shift columns.
+            cols = list(pd.read_csv(path, nrows=0).columns)
+            frame = pd.DataFrame([row]).reindex(columns=cols)
+            frame.to_csv(path, mode="a", header=False, index=False)
+        else:
+            pd.DataFrame([row]).to_csv(path, index=False)
         _thin_snapshot_file(path)
-        return True
+        return "recorded"
     except Exception:
-        return False
+        return "error"
+
+
+def record_snapshot(asset: str, min_interval_s: float = 1800.0) -> bool:
+    """Back-compat wrapper: True when a row was written."""
+    return record_snapshot_status(asset, min_interval_s) == "recorded"
 
 
 def _parse_snapshot_csv(text: str) -> pd.DataFrame | None:
@@ -231,6 +308,9 @@ def _parse_snapshot_csv(text: str) -> pd.DataFrame | None:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True,
                                           format="ISO8601", errors="coerce")
         df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+        if SOURCE_COL not in df.columns:
+            df[SOURCE_COL] = SOURCE_LIVE
+        df[SOURCE_COL] = df[SOURCE_COL].fillna(SOURCE_LIVE).astype(str)
         return df if not df.empty else None
     except Exception:
         return None
@@ -257,13 +337,19 @@ def _fetch_remote_snapshots(asset: str) -> pd.DataFrame | None:
     if hit is not None and (time.time() - hit[0]) < _REMOTE_SNAPSHOT_TTL:
         return hit[1]
     frame = None
-    try:
-        url = f"{_REMOTE_SNAPSHOT_BASE}/{asset}_surface.csv"
-        resp = requests.get(url, timeout=_REMOTE_TIMEOUT)
-        if resp.status_code == 200 and resp.text.strip():
-            frame = _parse_snapshot_csv(resp.text)
-    except Exception:
-        frame = None
+    url = f"{_REMOTE_SNAPSHOT_BASE}/{asset}_surface.csv"
+    for attempt, wait in enumerate(_REMOTE_BACKOFF_S):
+        try:
+            resp = requests.get(url, timeout=_REMOTE_TIMEOUT)
+            if resp.status_code == 200 and resp.text.strip():
+                frame = _parse_snapshot_csv(resp.text)
+                break
+            if resp.status_code < 500 and resp.status_code != 429:
+                break  # 404 etc.: retrying won't help
+        except Exception:
+            frame = None
+        if attempt < len(_REMOTE_BACKOFF_S) - 1:
+            time.sleep(wait)
     _REMOTE_SNAPSHOT_CACHE[asset] = (time.time(), frame)
     return frame
 
@@ -370,6 +456,112 @@ def dvol_history(asset: str, days: int = 90,
         s = s * 100.0
     s.index = s.index.floor("min")           # kill sub-minute drift between calls
     return s[~s.index.duplicated(keep="last")].sort_index()
+
+
+# ---------------------------------------------------------------------------
+# Intraday densification: 15-minute path anchored to recorded snapshots
+# ---------------------------------------------------------------------------
+
+INTRADAY_STEP = "15min"
+_DVOL_FINE_CACHE: dict[tuple[str, int], tuple[float, pd.Series | None]] = {}
+_DVOL_FINE_TTL = 120.0
+
+
+def dvol_fine(asset: str, hours: int = 24) -> pd.Series | None:
+    """
+    DVOL on a regular ``INTRADAY_STEP`` grid (UTC) covering the last ``hours``.
+
+    Built from Deribit's 1-minute bars (resolution "60" = 60 *seconds*),
+    fetched in 12h chunks so each request stays under the ~1000-candle cap,
+    then averaged into 15-minute buckets. Request boundaries are floored to
+    the minute so the HTTP cache can actually hit.
+    """
+    cfg = ASSET_CONFIG.get(asset, ASSET_CONFIG["BTC"])
+    if not cfg.get("has_dvol"):
+        return None
+    key = (asset, int(hours))
+    hit = _DVOL_FINE_CACHE.get(key)
+    if hit is not None and (time.time() - hit[0]) < _DVOL_FINE_TTL:
+        return hit[1]
+
+    end_ms = (int(time.time() * 1000) // 60000) * 60000
+    start_ms = end_ms - int(hours) * 3600 * 1000
+    chunk = 12 * 3600 * 1000
+    parts = []
+    t = start_ms
+    while t < end_ms:
+        e = min(t + chunk, end_ms)
+        df = deribit.get_dvol(cfg["deribit_ccy"], resolution="60",
+                              start_ms=t, end_ms=e)
+        if df is not None and not df.empty:
+            parts.append(df)
+        t = e
+    out = None
+    if parts:
+        df = pd.concat(parts)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        s = pd.to_numeric(df.set_index("timestamp")["close"],
+                          errors="coerce").dropna()
+        s = s[~s.index.duplicated(keep="last")].sort_index()
+        if not s.empty:
+            if s.median() < 5:
+                s = s * 100.0
+            s = s.resample(INTRADAY_STEP).mean().dropna()
+            out = s if len(s) >= 4 else None
+    _DVOL_FINE_CACHE[key] = (time.time(), out)
+    return out
+
+
+def _secs(idx: pd.DatetimeIndex) -> np.ndarray:
+    """Seconds since epoch as floats -- immune to ns/us index-unit differences."""
+    idx = pd.DatetimeIndex(idx)
+    idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+    return np.asarray((idx - pd.Timestamp("1970-01-01", tz="UTC"))
+                      / pd.Timedelta(seconds=1), dtype=float)
+
+
+def densify_intraday(asset: str, recorded: pd.Series,
+                     hours: int = 24) -> pd.Series | None:
+    """
+    Dense 15-minute version of a sparse recorded series (vol points).
+
+    The recorded snapshots are ground truth but arrive every few hours, so
+    plotting them alone is jumpy. DVOL is a real 1-minute series, so between
+    snapshots the path follows DVOL's shape:
+
+        dense(t) = DVOL(t) * r(t)
+
+    where ``r`` is the recorded/DVOL ratio at each snapshot, linearly
+    interpolated in time (held flat outside the first/last snapshot). The
+    result passes exactly through every recorded point. Returns None when
+    DVOL is unavailable (SOL/HYPE) so callers keep the raw series.
+    """
+    if recorded is None:
+        return None
+    rec = recorded.dropna()
+    rec = rec[~rec.index.duplicated(keep="last")].sort_index()
+    if len(rec) < 2:
+        return None
+    dv = dvol_fine(asset, hours=hours)
+    if dv is None:
+        return None
+
+    t_dv, t_rec = _secs(dv.index), _secs(rec.index)
+    dv_at = np.interp(t_rec, t_dv, dv.values)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r_pts = rec.values / dv_at
+    ok = np.isfinite(r_pts) & (dv_at > 0)
+    if ok.sum() < 2:
+        return None
+    r_grid = np.interp(t_dv, t_rec[ok], r_pts[ok])
+    dense = pd.Series(dv.values * r_grid, index=dv.index)
+
+    # Drop grid points that sit within half a step of a real snapshot so the
+    # recorded value isn't shadowed by a near-duplicate model value.
+    half = pd.Timedelta(INTRADAY_STEP) / 2
+    gaps = np.abs(t_dv[:, None] - t_rec[None, :]).min(axis=1)
+    dense = dense[gaps > half.total_seconds()]
+    return pd.concat([dense, rec]).sort_index()
 
 
 def _rv_level_series(asset: str, days: int) -> pd.Series | None:
@@ -553,4 +745,5 @@ def iv_series_at_dte(asset: str, dte: int, delta_key: str = "delta50",
 def clear_cache() -> None:
     """Drop the in-memory level-driver and remote-snapshot caches."""
     _DRIVER_CACHE.clear()
+    _DVOL_FINE_CACHE.clear()
     _REMOTE_SNAPSHOT_CACHE.clear()
