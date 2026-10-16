@@ -17,12 +17,12 @@ if not exist "%TMPD%\data\snapshots" mkdir "%TMPD%\data\snapshots"
 set BASE=%TEMP%\mcm_snap_baseline
 if exist "%BASE%" rmdir /s /q "%BASE%"
 mkdir "%BASE%"
-copy /y "%TMPD%\data\snapshots\*_surface.csv" "%BASE%\" >nul 2>&1
+copy /y "%TMPD%\data\snapshots\*_surface.*" "%BASE%\" >nul 2>&1
 python scripts\snapshot_tools.py tag-sources --dir data\snapshots || goto :err
 python scripts\snapshot_tools.py merge --base "%TMPD%\data\snapshots" --incoming data\snapshots || goto :err
 python scripts\snapshot_tools.py validate --published "%BASE%" --candidate "%TMPD%\data\snapshots" --allow-insert || goto :err
 pushd "%TMPD%"
-git add -f data/snapshots
+git add -f -A data/snapshots
 git commit -m "restore merged snapshot history (append-only merge)" || (popd & echo Nothing to commit & goto :end)
 git push origin HEAD:snapshots || (popd & goto :err)
 popd

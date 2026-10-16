@@ -382,6 +382,72 @@ def interp_at_dte(vals: dict[float, float], target: float,
     return float(vals[max(left)]) if left else float(vals[min(right)])
 
 
+def interp_frame_at_dte(frame: pd.DataFrame, target: float,
+                        flat_outside: bool = True) -> np.ndarray:
+    """
+    Vectorised ``interp_at_dte`` over every row of ``frame`` (columns = DTE).
+    Returns one value per row, identical to calling ``interp_at_dte`` on each
+    row's finite {dte: iv} map, without a Python-level per-row loop.
+    """
+    if frame is None or len(frame) == 0:
+        return np.array([], dtype=float)
+    pairs = []
+    for c in frame.columns:
+        try:
+            pairs.append((float(c), c))
+        except (TypeError, ValueError):
+            continue
+    pairs.sort(key=lambda x: x[0])
+    n = len(frame)
+    if not pairs:
+        return np.full(n, np.nan)
+    cols = np.array([p[0] for p in pairs])
+    V = frame[[p[1] for p in pairs]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    M = np.isfinite(V)
+    t = float(target)
+    out = np.full(n, np.nan)
+    done = np.zeros(n, dtype=bool)
+
+    # 1) exact hit (first finite column within 0.01 DTE, in sorted order)
+    for j in np.where(np.abs(cols - t) < 0.01)[0]:
+        hit = M[:, j] & ~done
+        out[hit] = V[hit, j]
+        done |= hit
+
+    def _last_true(mask):   # index of last True per row, -1 if none
+        rev = mask[:, ::-1]
+        any_ = rev.any(axis=1)
+        idx = mask.shape[1] - 1 - rev.argmax(axis=1)
+        return np.where(any_, idx, -1)
+
+    def _first_true(mask):
+        any_ = mask.any(axis=1)
+        return np.where(any_, mask.argmax(axis=1), -1)
+
+    rows = np.arange(n)
+    left_m = M & (cols < t)[None, :]
+    right_m = M & (cols > t)[None, :]
+    li, ri = _last_true(left_m), _first_true(right_m)
+    has_l, has_r = li >= 0, ri >= 0
+    li0, ri0 = np.maximum(li, 0), np.maximum(ri, 0)
+    vl, vr = V[rows, li0], V[rows, ri0]
+    cl, cr = cols[li0], cols[ri0]
+
+    both = has_l & has_r & ~done
+    with np.errstate(invalid="ignore", divide="ignore"):
+        w = (t - cl) / (cr - cl)
+        interp = np.where(cr == cl, vl, vl + (vr - vl) * w)
+    out[both] = interp[both]
+    done |= both
+    if flat_outside:
+        only_l = has_l & ~done
+        out[only_l] = vl[only_l]
+        done |= only_l
+        only_r = has_r & ~done
+        out[only_r] = vr[only_r]
+    return out
+
+
 def forward_vol(v_short: float, t_short: float,
                 v_long: float, t_long: float) -> float:
     """

@@ -8,6 +8,8 @@ numpy>=1.26.0
 pandas>=2.1.0
 matplotlib>=3.7.0
 scipy>=1.11.0
+# Snapshot store switches from CSV to parquet past ~20 MB (lib/history.py).
+pyarrow>=14.0.0
 # plotly is capped below 6.1 on purpose, to match the kaleido pin below.
 # Plotly 6.1.1+ requires kaleido>=1.0 for fig.to_image()/write_image() (the
 # legacy 0.x "bundled Chromium" engine is dropped) — an unbounded plotly pin

@@ -134,6 +134,7 @@ def latest_rv(asset: str) -> dict[str, float]:
 # ---------------------------------------------------------------------------
 
 def _snapshot_path(asset: str) -> Path:
+    """Legacy helper: the CSV path (see ``store_path`` for parquet-aware lookup)."""
     return SNAPSHOT_DIR / f"{asset}_surface.csv"
 
 
@@ -190,61 +191,137 @@ def ensure_source_column(path: Path) -> bool:
         return False
 
 
-# The recorder can run every ~15 min, which would grow each snapshot CSV
-# quickly. Tiered retention: full resolution for the last _FULL_RES_DAYS (the
-# intraday charts need it), one row per UTC hour out to _THIN_AFTER_DAYS, and
-# one row per UTC calendar day beyond that.
-_FULL_RES_DAYS = 7
-# THINNING IS DISABLED: full hourly history is kept forever (approved 2026-10-16).
-# Set THIN_AFTER_DAYS to a number of days (e.g. 60) to re-enable the tiered
-# retention above; scripts/snapshot_tools.py validation follows this constant
-# (with None, the workflow refuses to publish if ANY published row is missing).
-THIN_AFTER_DAYS: int | None = None
-_THIN_AFTER_DAYS = THIN_AFTER_DAYS  # legacy alias
+# ---------------------------------------------------------------------------
+# Retention + storage format
+# ---------------------------------------------------------------------------
+# The recorder runs every ~15 min. Retention (approved 2026-10-16):
+#   * rows younger than FULL_RES_DAYS are kept at full (15-min) resolution;
+#   * older rows are downsampled to one row per OLD_RES bin (UTC hour), keeping
+#     the row closest to the top of the hour (earliest in the bin), with its
+#     ``source`` tag untouched;
+#   * nothing is ever deleted beyond that.
+# Set FULL_RES_DAYS = None to keep every row forever.
+# scripts/snapshot_tools.py validation applies exactly the same rule: the only
+# published rows allowed to disappear are the non-kept rows of >FULL_RES_DAYS bins.
+FULL_RES_DAYS: int | None = 90
+OLD_RES = "1h"
 _BEYOND_EXPIRY_TOL_DAYS = 5.0  # leave a tenor blank if it's this far past the last listed expiry
-_THIN_MIN_ROWS = 800    # skip the rewrite cost until there's something to gain
+
+# Storage format: CSV until a file passes PARQUET_THRESHOLD_BYTES, then it is
+# converted (once) to ``{asset}_surface.parquet`` and the CSV is removed.
+# Readers prefer parquet when present, so old CSV-only stores keep working.
+PARQUET_THRESHOLD_BYTES = 20 * 1024 * 1024
+
+
+def _parquet_path(asset: str, base: Path | None = None) -> Path:
+    return (base or SNAPSHOT_DIR) / f"{asset}_surface.parquet"
+
+
+def _csv_path(asset: str, base: Path | None = None) -> Path:
+    return (base or SNAPSHOT_DIR) / f"{asset}_surface.csv"
+
+
+def store_path(asset: str, base: Path | None = None) -> Path | None:
+    """The file that currently holds ``asset``'s history (parquet wins), or None."""
+    for p in (_parquet_path(asset, base), _csv_path(asset, base)):
+        if p.exists():
+            return p
+    return None
+
+
+def read_store(asset: str, base: Path | None = None) -> pd.DataFrame | None:
+    """Raw rows (timestamp kept as ISO text) from parquet or CSV."""
+    p = store_path(asset, base)
+    if p is None:
+        return None
+    if p.suffix == ".parquet":
+        df = pd.read_parquet(p)
+    else:
+        df = pd.read_csv(p, dtype={"timestamp": str, SOURCE_COL: str})
+    return df
+
+
+def write_store(asset: str, df: pd.DataFrame, base: Path | None = None) -> Path:
+    """
+    Write ``df`` (timestamp as ISO text) in the right format: parquet if a
+    parquet store already exists or the CSV would pass the threshold.
+    """
+    base = base or SNAPSHOT_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    pq, csv = _parquet_path(asset, base), _csv_path(asset, base)
+    df = df.copy()
+    df["timestamp"] = df["timestamp"].astype(str)
+    if SOURCE_COL in df:
+        df[SOURCE_COL] = df[SOURCE_COL].astype(object).where(df[SOURCE_COL].notna(), None)
+    if not pq.exists():
+        text = df.to_csv(index=False)
+        if len(text.encode()) < PARQUET_THRESHOLD_BYTES:
+            csv.write_text(text)
+            return csv
+    num = [c for c in df.columns if c not in ("timestamp", SOURCE_COL)]
+    df[num] = df[num].apply(pd.to_numeric, errors="coerce")
+    df.to_parquet(pq, index=False)
+    if csv.exists():
+        csv.unlink()
+    return pq
+
+
+def downsample_keep_mask(ts: pd.Series, now: datetime | None = None,
+                         full_res_days: int | None = None,
+                         old_res: str | None = None) -> pd.Series:
+    """
+    Boolean mask (aligned to ``ts``) of rows the retention rule keeps.
+    Rows in a bin wholly older than the cutoff keep only the earliest row of
+    the bin (closest to the top of the hour). Deterministic + idempotent.
+    """
+    full_res_days = FULL_RES_DAYS if full_res_days is None else full_res_days
+    old_res = old_res or OLD_RES
+    t = pd.to_datetime(ts, utc=True, format="ISO8601", errors="coerce")
+    keep = pd.Series(True, index=ts.index)
+    if full_res_days is None:
+        return keep
+    now = now or datetime.now(timezone.utc)
+    cutoff = pd.Timestamp(now - timedelta(days=full_res_days)).floor(old_res)
+    old = t.notna() & (t < cutoff)
+    if not old.any():
+        return keep
+    bins = t[old].dt.floor(old_res)
+    first = t[old].groupby(bins).transform("min")
+    keep[old] = (t[old] == first) & ~t[old].duplicated()
+    return keep
+
+
+def apply_retention(asset: str, base: Path | None = None,
+                    now: datetime | None = None) -> int:
+    """Downsample >FULL_RES_DAYS rows in place; return rows removed. Never raises."""
+    try:
+        df = read_store(asset, base)
+        if df is None or df.empty or "timestamp" not in df:
+            return 0
+        keep = downsample_keep_mask(df["timestamp"], now=now)
+        removed = int((~keep).sum())
+        if removed:
+            write_store(asset, df[keep.values], base)
+        return removed
+    except Exception:
+        return 0
+
+
+def maybe_convert_to_parquet(asset: str, base: Path | None = None) -> bool:
+    """Convert a CSV store to parquet once it passes the size threshold."""
+    csv = _csv_path(asset, base)
+    if _parquet_path(asset, base).exists() or not csv.exists():
+        return False
+    if csv.stat().st_size < PARQUET_THRESHOLD_BYTES:
+        return False
+    write_store(asset, pd.read_csv(csv, dtype={"timestamp": str, SOURCE_COL: str}), base)
+    return True
 
 
 def _thin_snapshot_file(path: Path) -> None:
-    """
-    Best-effort compaction so ``path`` stops growing once it's old enough to
-    matter. Any failure here just leaves the file as-is -- this must never
-    be the reason a recording run fails.
-    """
-    if THIN_AFTER_DAYS is None:
-        return  # retention disabled: keep every row
-    try:
-        df = pd.read_csv(path)
-        if len(df) < _THIN_MIN_ROWS or "timestamp" not in df:
-            return
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True,
-                                          format="ISO8601", errors="coerce")
-        df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
-        now = datetime.now(timezone.utc)
-        cut_day = now - timedelta(days=THIN_AFTER_DAYS)
-        cut_hour = now - timedelta(days=_FULL_RES_DAYS)
-        old = df[df.index < cut_day]
-        mid = df[(df.index >= cut_day) & (df.index < cut_hour)]
-        recent = df[df.index >= cut_hour]
-        if not old.empty:
-            old = old.groupby(old.index.floor("D")).first()
-        if not mid.empty:
-            mid = mid.groupby(mid.index.floor("h")).first()
-        out = pd.concat([old, mid, recent]).sort_index()
-        if len(out) >= len(df):
-            return  # already thinned, nothing to save
-        out = out[~out.index.duplicated(keep="last")]
-        # Write timestamps in the exact same format record_snapshot() uses for
-        # fresh appends (Python's datetime.isoformat(), "T" separator) -- NOT
-        # pandas' default CSV serialization ("YYYY-MM-DD HH:MM:SS..."), which
-        # differs just enough that mixing the two in one file can make pandas'
-        # fast-path CSV datetime parser silently drop rows as unparseable on
-        # a later read.
-        out = out.reset_index()
-        out["timestamp"] = out["timestamp"].map(lambda t: t.isoformat())
-        out.to_csv(path, index=False)
-    except Exception:
-        pass
+    """Back-compat shim: apply retention to the store ``path`` belongs to."""
+    asset = path.name.split("_surface")[0]
+    apply_retention(asset, path.parent)
 
 
 def record_snapshot_status(asset: str, min_interval_s: float = 1800.0) -> str:
@@ -260,20 +337,21 @@ def record_snapshot_status(asset: str, min_interval_s: float = 1800.0) -> str:
     held flat (SOL/HYPE list nothing past ~3 months, so a flat-held 180d/365d
     value is just a copy of the last expiry and carries no information).
     Upgrades a legacy file to include the ``source`` column before appending,
-    then runs ``_thin_snapshot_file``.
+    then applies retention and converts to parquet past the size threshold.
     """
     try:
         SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        path = _snapshot_path(asset)
+        path = store_path(asset) or _csv_path(asset)
         now = datetime.now(timezone.utc)
         if path.exists():
             try:
-                tail = pd.read_csv(path).tail(1)
-                if not tail.empty:
-                    last = pd.to_datetime(tail["timestamp"].iloc[0], utc=True,
-                                          format="ISO8601")
-                    if (now - last).total_seconds() < min_interval_s:
-                        return "skipped"
+                if path.suffix == ".parquet":
+                    last_txt = pd.read_parquet(path, columns=["timestamp"])["timestamp"].iloc[-1]
+                else:
+                    last_txt = pd.read_csv(path, usecols=["timestamp"])["timestamp"].iloc[-1]
+                last = pd.to_datetime(last_txt, utc=True, format="ISO8601")
+                if (now - last).total_seconds() < min_interval_s:
+                    return "skipped"
             except Exception:
                 pass
 
@@ -293,15 +371,21 @@ def record_snapshot_status(asset: str, min_interval_s: float = 1800.0) -> str:
                     v = surface.interp_at_dte(series, float(dte)) if series else np.nan
                 row[f"{field}_{dte}"] = round(float(v), 6) if surface.finite(v) else ""
         row[SOURCE_COL] = SOURCE_LIVE
-        ensure_source_column(path)
-        if path.exists():
-            # Match the existing header exactly so an append can never shift columns.
-            cols = list(pd.read_csv(path, nrows=0).columns)
-            frame = pd.DataFrame([row]).reindex(columns=cols)
-            frame.to_csv(path, mode="a", header=False, index=False)
+        if path.suffix == ".parquet":
+            df = pd.read_parquet(path)
+            new = pd.DataFrame([row]).reindex(columns=list(df.columns))
+            write_store(asset, pd.concat([df, new], ignore_index=True))
         else:
-            pd.DataFrame([row]).to_csv(path, index=False)
-        _thin_snapshot_file(path)
+            ensure_source_column(path)
+            if path.exists():
+                # Match the existing header exactly so an append can never shift columns.
+                cols = list(pd.read_csv(path, nrows=0).columns)
+                frame = pd.DataFrame([row]).reindex(columns=cols)
+                frame.to_csv(path, mode="a", header=False, index=False)
+            else:
+                pd.DataFrame([row]).to_csv(path, index=False)
+        apply_retention(asset)
+        maybe_convert_to_parquet(asset)
         return "recorded"
     except Exception:
         return "error"
@@ -312,9 +396,10 @@ def record_snapshot(asset: str, min_interval_s: float = 1800.0) -> bool:
     return record_snapshot_status(asset, min_interval_s) == "recorded"
 
 
-def _parse_snapshot_csv(text: str) -> pd.DataFrame | None:
+def _parse_snapshot_csv(text) -> pd.DataFrame | None:
+    """Parse CSV text, or an already-loaded raw frame (parquet), into the indexed form."""
     try:
-        df = pd.read_csv(io.StringIO(text))
+        df = text.copy() if isinstance(text, pd.DataFrame) else pd.read_csv(io.StringIO(text))
         if df.empty or "timestamp" not in df:
             return None
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True,
@@ -329,11 +414,9 @@ def _parse_snapshot_csv(text: str) -> pd.DataFrame | None:
 
 
 def _load_local_snapshots_raw(asset: str) -> pd.DataFrame | None:
-    path = _snapshot_path(asset)
-    if not path.exists():
-        return None
     try:
-        return _parse_snapshot_csv(path.read_text())
+        raw = read_store(asset)
+        return None if raw is None else _parse_snapshot_csv(raw)
     except Exception:
         return None
 
@@ -349,19 +432,29 @@ def _fetch_remote_snapshots(asset: str) -> pd.DataFrame | None:
     if hit is not None and (time.time() - hit[0]) < _REMOTE_SNAPSHOT_TTL:
         return hit[1]
     frame = None
-    url = f"{_REMOTE_SNAPSHOT_BASE}/{asset}_surface.csv"
-    for attempt, wait in enumerate(_REMOTE_BACKOFF_S):
-        try:
-            resp = requests.get(url, timeout=_REMOTE_TIMEOUT)
-            if resp.status_code == 200 and resp.text.strip():
-                frame = _parse_snapshot_csv(resp.text)
-                break
-            if resp.status_code < 500 and resp.status_code != 429:
-                break  # 404 etc.: retrying won't help
-        except Exception:
-            frame = None
-        if attempt < len(_REMOTE_BACKOFF_S) - 1:
-            time.sleep(wait)
+    # Prefer parquet (written once a store passes the size threshold); a 404
+    # there just means the store is still CSV.
+    for ext in ("parquet", "csv"):
+        url = f"{_REMOTE_SNAPSHOT_BASE}/{asset}_surface.{ext}"
+        missing = False
+        for attempt, wait in enumerate(_REMOTE_BACKOFF_S):
+            try:
+                resp = requests.get(url, timeout=_REMOTE_TIMEOUT)
+                if resp.status_code == 200 and resp.content:
+                    if ext == "parquet":
+                        frame = _parse_snapshot_csv(pd.read_parquet(io.BytesIO(resp.content)))
+                    else:
+                        frame = _parse_snapshot_csv(resp.text)
+                    break
+                if resp.status_code < 500 and resp.status_code != 429:
+                    missing = True
+                    break  # 404 etc.: retrying won't help
+            except Exception:
+                frame = None
+            if attempt < len(_REMOTE_BACKOFF_S) - 1:
+                time.sleep(wait)
+        if frame is not None or not missing:
+            break
     _REMOTE_SNAPSHOT_CACHE[asset] = (time.time(), frame)
     return frame
 

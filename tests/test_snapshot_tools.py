@@ -47,70 +47,94 @@ def test_validate_rejects_lost_rows_bad_iv_and_blank_core():
     assert any("outside" in e for e in errs) and any("blank atm_30" in e for e in errs)
 
 
-def _with_thinning(days=60):
-    import contextlib
-
-    @contextlib.contextmanager
-    def cm():
-        prev = history.THIN_AFTER_DAYS
-        history.THIN_AFTER_DAYS = days
-        try:
-            yield
-        finally:
-            history.THIN_AFTER_DAYS = prev
-    return cm()
+def _rows(start, n, step_min=15, val="0.5"):
+    t0 = pd.Timestamp(start)
+    return [f"{(t0 + pd.Timedelta(minutes=step_min * i)).isoformat()},{val},{val},{val},live"
+            for i in range(n)]
 
 
-def test_thinning_disabled_by_default_and_no_row_may_be_lost():
-    assert history.THIN_AFTER_DAYS is None
-    now = datetime(2026, 12, 31, tzinfo=timezone.utc)
-    old = _df(_csv(["2026-09-01T01:00:00.1+00:00,0.5,0.5,0.5,live",
-                    "2026-09-01T02:00:00.1+00:00,0.5,0.5,0.5,live"]))
-    new = _df(_csv(["2026-09-01T01:00:00.1+00:00,0.5,0.5,0.5,live"]))
-    assert any("lost" in e for e in st.validate_asset(old, new, now=now))
+NOW = datetime(2027, 3, 1, 12, tzinfo=timezone.utc)   # 2026-11-01 is ~120d old here
+
+
+def test_retention_defaults():
+    assert history.FULL_RES_DAYS == 90 and history.OLD_RES == "1h"
+
+
+def test_downsample_keeps_first_row_per_old_hour_and_all_recent_rows():
+    old = _rows("2026-11-01T00:07:00.1+00:00", 8)            # 2 old hours x 4 rows
+    recent = _rows("2027-02-28T00:07:00.1+00:00", 8)          # inside 90d
+    df = _df(_csv(old + recent))
+    keep = history.downsample_keep_mask(df["timestamp"], now=NOW)
+    kept = df[keep.values]["timestamp"].tolist()
+    assert kept[:2] == ["2026-11-01T00:07:00.100000+00:00", "2026-11-01T01:07:00.100000+00:00"]
+    assert len(kept) == 2 + 8
+    # idempotent
+    again = history.downsample_keep_mask(df[keep.values]["timestamp"], now=NOW)
+    assert again.all()
+
+
+def test_apply_retention_preserves_source_and_validation_accepts_it():
     with tempfile.TemporaryDirectory() as d:
+        rows = _rows("2026-11-01T00:00:00.1+00:00", 8) + _rows("2027-02-28T00:00:00.1+00:00", 4)
+        rows[0] = rows[0].replace(",live", ",seed")
         p = Path(d) / "X_surface.csv"
-        rows = [f"2026-08-{1 + i // 24:02d}T{i % 24:02d}:00:00.1+00:00,0.5,0.5,0.5,live"
-                for i in range(24 * 30)]
         p.write_text(_csv(rows))
-        history._thin_snapshot_file(p)
-        assert len(pd.read_csv(p)) == len(rows)
+        before = st.read_asset(d, "X")
+        removed = history.apply_retention("X", Path(d), now=NOW)
+        after = st.read_asset(d, "X")
+        assert removed == 6 and len(after) == 6
+        assert after["source"].iloc[0] == "seed"
+        assert st.validate_asset(before, after, now=NOW, max_added=None) == []
 
 
-def test_validate_allows_thinning_of_old_rows():
-    with _with_thinning():
-        _validate_allows_thinning_of_old_rows()
+def test_validation_rejects_any_other_loss():
+    old_rows = _rows("2026-11-01T00:00:00.1+00:00", 4) + _rows("2027-02-28T00:00:00.1+00:00", 4)
+    old = _df(_csv(old_rows))
+    # dropping the KEPT (first) row of an old hour is a loss
+    wrong = _df(_csv(old_rows[1:2] + old_rows[4:]))
+    assert any("lost" in e for e in st.validate_asset(old, wrong, now=NOW, max_added=None))
+    # dropping a recent (<90d) row is a loss
+    recent_gap = _df(_csv(old_rows[:1] + old_rows[4:7]))
+    assert any("lost" in e for e in st.validate_asset(old, recent_gap, now=NOW, max_added=None))
+    # the exact downsample is fine
+    ok = _df(_csv(old_rows[:1] + old_rows[4:]))
+    assert st.validate_asset(old, ok, now=NOW, max_added=None) == []
 
 
-def _validate_allows_thinning_of_old_rows():
-    now = datetime(2026, 12, 31, tzinfo=timezone.utc)
-    old = _df(_csv(["2026-09-01T01:00:00.1+00:00,0.5,0.5,0.5,live",
-                    "2026-09-01T02:00:00.1+00:00,0.5,0.5,0.5,live"]))
-    new = _df(_csv(["2026-09-01T01:00:00.1+00:00,0.5,0.5,0.5,live"]))
-    assert st.validate_asset(old, new, now=now) == []
+def test_parquet_switch_is_dormant_below_threshold_and_round_trips():
+    with tempfile.TemporaryDirectory() as d:
+        df = _df(_csv(_rows("2027-02-28T00:00:00.1+00:00", 10))).drop(columns="_ts")
+        p = history.write_store("X", df, Path(d))
+        assert p.suffix == ".csv" and not history._parquet_path("X", Path(d)).exists()
+        prev = history.PARQUET_THRESHOLD_BYTES
+        history.PARQUET_THRESHOLD_BYTES = 10
+        try:
+            assert history.maybe_convert_to_parquet("X", Path(d))
+        finally:
+            history.PARQUET_THRESHOLD_BYTES = prev
+        assert history.store_path("X", Path(d)).suffix == ".parquet"
+        assert not (Path(d) / "X_surface.csv").exists()
+        back = st.read_asset(d, "X")
+        assert back["timestamp"].tolist() == df["timestamp"].tolist()
+        assert back["source"].tolist() == ["live"] * 10
+        parsed = history._parse_snapshot_csv(history.read_store("X", Path(d)))
+        assert len(parsed) == 10 and float(parsed["atm_7"].iloc[0]) == 0.5
+        # once parquet, further writes stay parquet even when small
+        assert history.write_store("X", df, Path(d)).suffix == ".parquet"
 
 
-def test_validate_tiered_thinning():
-    with _with_thinning():
-        _validate_tiered_thinning()
-
-
-def _validate_tiered_thinning():
-    now = datetime(2026, 12, 31, 12, tzinfo=timezone.utc)
-    # 20 days old: one row per hour must survive, extra rows in the hour may go
-    old = _df(_csv(["2026-12-11T01:00:00.1+00:00,0.5,0.5,0.5,live",
-                    "2026-12-11T01:15:00.1+00:00,0.5,0.5,0.5,live"]))
-    ok = _df(_csv(["2026-12-11T01:00:00.1+00:00,0.5,0.5,0.5,live"]))
-    assert st.validate_asset(old, ok, now=now) == []
-    # but dropping a whole hour in that tier is a loss
-    two = _df(_csv(["2026-12-11T01:00:00.1+00:00,0.5,0.5,0.5,live",
-                    "2026-12-11T02:00:00.1+00:00,0.5,0.5,0.5,live"]))
-    assert any("lost" in e for e in st.validate_asset(two, ok, now=now))
-    # inside the 7-day full-resolution window nothing may be dropped
-    recent = _df(_csv(["2026-12-29T01:00:00.1+00:00,0.5,0.5,0.5,live",
-                       "2026-12-29T01:15:00.1+00:00,0.5,0.5,0.5,live"]))
-    rec_ok = _df(_csv(["2026-12-29T01:00:00.1+00:00,0.5,0.5,0.5,live"]))
-    assert any("lost" in e for e in st.validate_asset(recent, rec_ok, now=now))
+def test_interp_frame_matches_scalar():
+    import numpy as np
+    from lib import surface
+    rng = np.random.default_rng(0)
+    f = pd.DataFrame(rng.uniform(.2, .9, (300, 8)), columns=[1, 7, 14, 30, 60, 90, 180, 365])
+    f[f > 0.75] = np.nan
+    for t in (0.5, 7, 7.005, 45, 365, 500):
+        for fo in (True, False):
+            vec = surface.interp_frame_at_dte(f, t, fo)
+            ref = [surface.interp_at_dte({float(c): float(r[c]) for c in r.index
+                                          if surface.finite(r[c])}, t, fo) for _, r in f.iterrows()]
+            assert np.allclose(vec, ref, equal_nan=True)
 
 
 def test_merge_is_append_only_and_tags():

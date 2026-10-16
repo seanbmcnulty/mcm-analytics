@@ -38,18 +38,37 @@ def _name(asset: str) -> str:
     return f"{asset}_surface.csv"
 
 
-def read_csv(path_or_text, is_text: bool = False) -> pd.DataFrame | None:
-    try:
-        src = io.StringIO(path_or_text) if is_text else path_or_text
-        if not is_text and not Path(src).exists():
-            return None
-        df = pd.read_csv(src, dtype={"timestamp": str, history.SOURCE_COL: str})
-    except Exception:
+def _with_ts(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df is None or "timestamp" not in df:
         return None
-    if "timestamp" not in df:
-        return None
+    df = df.copy()
+    df["timestamp"] = df["timestamp"].astype(str)
     df["_ts"] = pd.to_datetime(df["timestamp"], utc=True, format="ISO8601", errors="coerce")
     return df
+
+
+def read_csv(path_or_text, is_text: bool = False) -> pd.DataFrame | None:
+    """Read CSV text, or a store file path (``.csv`` or ``.parquet``)."""
+    try:
+        if is_text:
+            return _with_ts(pd.read_csv(io.StringIO(path_or_text),
+                                        dtype={"timestamp": str, history.SOURCE_COL: str}))
+        p = Path(path_or_text)
+        if not p.exists():
+            return None
+        if p.suffix == ".parquet":
+            return _with_ts(pd.read_parquet(p))
+        return _with_ts(pd.read_csv(p, dtype={"timestamp": str, history.SOURCE_COL: str}))
+    except Exception:
+        return None
+
+
+def read_asset(directory, asset: str) -> pd.DataFrame | None:
+    """Parquet-or-CSV store for ``asset`` in ``directory`` (parquet wins)."""
+    try:
+        return _with_ts(history.read_store(asset, Path(directory)))
+    except Exception:
+        return None
 
 
 def _iv_cols(df: pd.DataFrame) -> list[str]:
@@ -82,22 +101,14 @@ def validate_asset(old: pd.DataFrame | None, new: pd.DataFrame | None,
         old_ts, new_ts = set(old["_ts"].dropna()), set(new["_ts"].dropna())
         dropped = sorted(old_ts - new_ts)
         if dropped:
-            # With thinning disabled (history.THIN_AFTER_DAYS is None) every
-            # dropped row is a loss. Otherwise only allowed via thinning: rows
-            # older than the full-resolution window whose hour (or, past the
-            # daily cut, day) still has a row.
-            thin_days = history.THIN_AFTER_DAYS
-            day_cut = now - timedelta(days=thin_days if thin_days is not None else 0)
-            hour_cut = now - timedelta(days=history._FULL_RES_DAYS)
-            new_days = {t.floor("D") for t in new_ts}
-            new_hours = {t.floor("h") for t in new_ts}
+            # The ONLY allowed loss is the retention rule itself
+            # (history.downsample_keep_mask): non-kept rows of bins wholly
+            # older than FULL_RES_DAYS. Anything else is a lost row.
+            keep = history.downsample_keep_mask(old["timestamp"], now=now)
+            allowed = set(old.loc[~keep.values, "_ts"].dropna())
 
             def _lost(t):
-                if thin_days is None or t >= hour_cut:
-                    return True
-                if t >= day_cut:
-                    return t.floor("h") not in new_hours
-                return t.floor("D") not in new_days
+                return t not in allowed
             bad = [t for t in dropped if _lost(t)]
             if bad:
                 errs.append(f"{len(bad)} published rows would be lost (e.g. {bad[0].isoformat()})")
@@ -122,8 +133,8 @@ def validate_asset(old: pd.DataFrame | None, new: pd.DataFrame | None,
 def cmd_validate(a) -> int:
     ok = True
     for asset in a.assets:
-        old = read_csv(Path(a.published) / _name(asset))
-        new = read_csv(Path(a.candidate) / _name(asset))
+        old = read_asset(a.published, asset)
+        new = read_asset(a.candidate, asset)
         errs = validate_asset(old, new, max_added=None if a.allow_insert else a.max_added,
                               allow_insert=a.allow_insert)
         n_old = 0 if old is None else len(old)
@@ -158,8 +169,8 @@ def cmd_summary(a) -> int:
              "| Asset | Rows | Added | Newest (UTC) | Age | Gaps >2h (24h) | Rows 24h |",
              "|---|---|---|---|---|---|---|"]
     for asset in a.assets:
-        old = read_csv(Path(a.published) / _name(asset)) if a.published else None
-        new = read_csv(Path(a.candidate) / _name(asset))
+        old = read_asset(a.published, asset) if a.published else None
+        new = read_asset(a.candidate, asset)
         if new is None or new.empty:
             lines.append(f"| {asset} | - | - | missing | - | - | - |")
             continue
@@ -180,18 +191,24 @@ def newest_rows(a) -> dict[str, pd.Timestamp | None]:
     out = {}
     for asset in a.assets:
         if a.dir:
-            df = read_csv(Path(a.dir) / _name(asset))
+            df = read_asset(a.dir, asset)
         else:
             import requests
             df = None
-            for _ in range(3):
-                try:
-                    r = requests.get(f"{a.url_base.rstrip('/')}/{_name(asset)}", timeout=15)
-                    if r.status_code == 200:
-                        df = read_csv(r.text, is_text=True)
-                        break
-                except Exception:
-                    pass
+            for ext in ("parquet", "csv"):
+                for _ in range(3):
+                    try:
+                        r = requests.get(f"{a.url_base.rstrip('/')}/{asset}_surface.{ext}", timeout=15)
+                        if r.status_code == 200:
+                            df = (_with_ts(pd.read_parquet(io.BytesIO(r.content))) if ext == "parquet"
+                                  else read_csv(r.text, is_text=True))
+                            break
+                        if r.status_code == 404:
+                            break
+                    except Exception:
+                        pass
+                if df is not None:
+                    break
         out[asset] = None if df is None or df.empty else df["_ts"].max()
     return out
 
@@ -239,15 +256,13 @@ def merge_frames(base: pd.DataFrame | None, incoming: pd.DataFrame | None) -> pd
 
 def cmd_merge(a) -> int:
     for asset in a.assets:
-        bp, ip = Path(a.base) / _name(asset), Path(a.incoming) / _name(asset)
-        base, inc = read_csv(bp), read_csv(ip)
+        base, inc = read_asset(a.base, asset), read_asset(a.incoming, asset)
         if base is None and inc is None:
             continue
         out = merge_frames(base, inc)
         if base is not None and len(out) < len(base):
             print(f"::error::{asset}: merge would shrink the file"); return 1
-        bp.parent.mkdir(parents=True, exist_ok=True)
-        out.drop(columns="_ts").to_csv(bp, index=False)
+        history.write_store(asset, out.drop(columns="_ts"), Path(a.base))
         print(f"[{asset}] base={0 if base is None else len(base)} "
               f"incoming={0 if inc is None else len(inc)} merged={len(out)} "
               f"{out['_ts'].min():%Y-%m-%d} .. {out['_ts'].max():%Y-%m-%d %H:%M}")
@@ -257,8 +272,8 @@ def cmd_merge(a) -> int:
 def cmd_tag(a) -> int:
     for asset in a.assets:
         p = Path(a.dir) / _name(asset)
-        changed = history.ensure_source_column(p)
-        df = read_csv(p)
+        changed = history.ensure_source_column(p)  # CSV only; parquet always has it
+        df = read_asset(a.dir, asset)
         counts = df[history.SOURCE_COL].value_counts().to_dict() if df is not None else {}
         print(f"[{asset}] {'updated' if changed else 'unchanged'} {counts}")
     return 0

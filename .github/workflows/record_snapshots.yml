@@ -50,7 +50,7 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: 3
-        run: pip install --disable-pip-version-check requests pandas numpy scipy
+        run: pip install --disable-pip-version-check requests pandas numpy scipy pyarrow
 
       - name: Check out snapshots branch
         timeout-minutes: 2
@@ -72,8 +72,8 @@ jobs:
             echo "HAVE_BRANCH=1" >> "$GITHUB_ENV"
             git fetch --depth=1 origin snapshots
             git worktree add -B snapshots "$PUB" FETCH_HEAD
-            cp "$PUB"/data/snapshots/*_surface.csv "$BASELINE"/ 2>/dev/null || true
-            cp "$PUB"/data/snapshots/*_surface.csv data/snapshots/ 2>/dev/null || true
+            cp "$PUB"/data/snapshots/*_surface.* "$BASELINE"/ 2>/dev/null || true
+            cp "$PUB"/data/snapshots/*_surface.* data/snapshots/ 2>/dev/null || true
           elif [ "$rc" -eq 2 ]; then
             echo "HAVE_BRANCH=0" >> "$GITHUB_ENV"
             git worktree add --orphan -b snapshots "$PUB"
@@ -109,17 +109,18 @@ jobs:
           for attempt in 1 2 3; do
             mkdir -p "$PUB/data/snapshots"
             if [ "$attempt" -eq 1 ]; then
-              cp data/snapshots/*_surface.csv "$PUB/data/snapshots/"
+              rm -f "$PUB"/data/snapshots/*_surface.*   # mirror candidate exactly (csv->parquet switch)
+              cp data/snapshots/*_surface.* "$PUB/data/snapshots/"
             else
               # Branch moved: merge our rows onto the new tip, re-validate.
               git -C "$PUB" fetch --depth=1 origin snapshots
               git -C "$PUB" reset --hard FETCH_HEAD
               rm -rf "$BASELINE" && mkdir -p "$BASELINE"
-              cp "$PUB"/data/snapshots/*_surface.csv "$BASELINE"/
+              cp "$PUB"/data/snapshots/*_surface.* "$BASELINE"/
               python scripts/snapshot_tools.py merge --base "$PUB/data/snapshots" --incoming data/snapshots
               python scripts/snapshot_tools.py validate --published "$BASELINE" --candidate "$PUB/data/snapshots" --max-added 2
             fi
-            git -C "$PUB" add -f data/snapshots
+            git -C "$PUB" add -f -A data/snapshots
             if git -C "$PUB" diff --cached --quiet; then
               echo "No new snapshot rows; nothing to publish."
               exit 0

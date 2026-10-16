@@ -344,11 +344,9 @@ def build_vol_surface_figure(asset: str, dte: int) -> go.Figure | None:
         # High/low band across the whole window.
         for key, frame in hist_maps.items():
             x = surface.DELTA_X_MAP[key]
-            vals = []
-            for _, row in frame.iterrows():
-                v = surface.interp_at_dte(_row_to_map(row), float(dte))
-                if _finite(v) and v > 0:
-                    vals.append(_pct(v))
+            arr = surface.interp_frame_at_dte(frame, float(dte))
+            arr = arr[np.isfinite(arr) & (arr > 0)]
+            vals = [_pct(v) for v in arr]
             if len(vals) >= 2:
                 cloud[x] = (float(np.min(vals)), float(np.max(vals)))
             any_frame = frame
@@ -850,15 +848,11 @@ def cmd_atm_iv_box_plot(asset: str, lookback_days: int = 90, **kwargs):
     if not tenors:
         return None, None, "No standard tenors fall within the available DTE range."
 
-    dist: dict[str, list[float]] = {l: [] for l, _ in tenors}
-    for _, row in frame.iterrows():
-        vals = _row_to_map(row)
-        if not vals:
-            continue
-        for lbl, d in tenors:
-            v = surface.interp_at_dte(vals, float(d), flat_outside=False)
-            if _finite(v) and v > 0:
-                dist[lbl].append(_pct(v))
+    dist: dict[str, list[float]] = {}
+    for lbl, d in tenors:
+        arr = surface.interp_frame_at_dte(frame, float(d), flat_outside=False)
+        arr = arr[np.isfinite(arr) & (arr > 0)]
+        dist[lbl] = [_pct(v) for v in arr]
 
     live = surface.iv_by_dte_for_delta(asset, "delta50")
     live = {float(k): float(v) for k, v in live.items() if _finite(v)}
