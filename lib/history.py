@@ -287,8 +287,10 @@ def downsample_keep_mask(ts: pd.Series, now: datetime | None = None,
         return keep
     bins = t[old].dt.floor(old_res)
     first = t[old].groupby(bins).transform("min")
-    keep[old] = (t[old] == first) & ~t[old].duplicated()
-    return keep
+    # numpy assignment: a boolean-Series setitem upcasts to object on pandas 2.1
+    vals = keep.to_numpy(dtype=bool).copy()
+    vals[old.to_numpy()] = ((t[old] == first) & ~t[old].duplicated()).to_numpy(dtype=bool)
+    return pd.Series(vals, index=ts.index)
 
 
 def apply_retention(asset: str, base: Path | None = None,
