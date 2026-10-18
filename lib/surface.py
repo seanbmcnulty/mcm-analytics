@@ -55,7 +55,7 @@ _MONTHS = {m: i + 1 for i, m in enumerate(
      "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])}
 
 # option_vols_by_dte() re-parses the whole chain and re-runs the BS delta
-# search for every bucket/DTE. Every one of atm_iv_by_dte, iv_by_dte_for_delta
+# search for every bucket/DTE. Every one of iv_by_dte_for_delta
 # and current_smile funnels through it, and a single "Load all" pass calls
 # those a dozen-plus times per asset in the space of a couple of seconds —
 # same underlying chain, same answer, recomputed from scratch each time.
@@ -256,10 +256,6 @@ def _option_vols_by_dte_uncached(asset: str) -> dict[str, dict[int, float]]:
                 bs_delta(spot, x[0], t_years, x[1], is_call) - target))
             out[field][dte] = best[1]
     return out
-
-
-def atm_iv_by_dte(asset: str) -> dict[int, float]:
-    return option_vols_by_dte(asset).get("atm", {})
 
 
 def iv_by_dte_for_delta(asset: str, delta_key: str) -> dict[int, float]:

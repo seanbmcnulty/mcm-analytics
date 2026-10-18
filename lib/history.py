@@ -32,8 +32,6 @@ app always sees the fuller of the two.
 from __future__ import annotations
 
 import io
-import json
-import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -133,18 +131,6 @@ def latest_rv(asset: str) -> dict[str, float]:
 # Snapshot store
 # ---------------------------------------------------------------------------
 
-def _snapshot_path(asset: str) -> Path:
-    """Legacy helper: the CSV path (see ``store_path`` for parquet-aware lookup)."""
-    return SNAPSHOT_DIR / f"{asset}_surface.csv"
-
-
-# Provenance of each snapshot row. Older files have no ``source`` column; they
-# are upgraded in place the next time a row is appended (see
-# ``ensure_source_column``) and readers treat a missing value as "live".
-#   live     - recorded from the real Deribit surface by record_snapshot()
-#   seed     - synthetic one-per-day rows at exactly 00:00:00 UTC that were
-#              used to seed the store before live recording (Aug 18 - Sep 26 2026)
-#   backfill - reconstructed after the fact (tools/backfill_dvol.py)
 SOURCE_COL = "source"
 SOURCE_LIVE, SOURCE_SEED, SOURCE_BACKFILL = "live", "seed", "backfill"
 _SEED_CUTOFF = pd.Timestamp("2026-09-27", tz="UTC")
@@ -318,12 +304,6 @@ def maybe_convert_to_parquet(asset: str, base: Path | None = None) -> bool:
         return False
     write_store(asset, pd.read_csv(csv, dtype={"timestamp": str, SOURCE_COL: str}), base)
     return True
-
-
-def _thin_snapshot_file(path: Path) -> None:
-    """Back-compat shim: apply retention to the store ``path`` belongs to."""
-    asset = path.name.split("_surface")[0]
-    apply_retention(asset, path.parent)
 
 
 def record_snapshot_status(asset: str, min_interval_s: float = 1800.0,

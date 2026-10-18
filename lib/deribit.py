@@ -10,15 +10,13 @@ All endpoints are public (no authentication required). Provides:
 
 import time
 import threading
-from functools import lru_cache
 from typing import Any
 
 import requests
 import pandas as pd
-import numpy as np
 
 from lib.constants import (
-    TTL_FAST, TTL_QUICK, TTL_SHORT, TTL_MEDIUM, TTL_LONG, TTL_SLOW,
+    TTL_FAST, TTL_QUICK, TTL_MEDIUM, TTL_LONG, TTL_SLOW,
 )
 
 BASE_URL = "https://www.deribit.com/api/v2/public"
@@ -69,6 +67,36 @@ def _cache_set(key: str, value: Any):
                 del _cache[k]
 
 
+# Time-window endpoints whose callers pass ``end_timestamp=now`` (ms). With the
+# raw millisecond value in the cache key, no two calls ever shared a cache
+# entry (basis_run re-fetched the same perp candles once per future). Widen the
+# window to whole ``ttl`` buckets instead -- start floored, end ceiled -- so
+# every call within one bucket gets one key and one fetch, and no candle that
+# the caller asked for is ever dropped. Not applied to paginated endpoints
+# (e.g. get_last_trades_by_currency_and_time), whose start is a cursor.
+_WINDOW_ENDPOINTS = {
+    "get_tradingview_chart_data",
+    "get_volatility_index_data",
+    "get_funding_rate_history",
+}
+_MIN_BUCKET_MS = 60_000
+
+
+def _bucket_window(endpoint: str, params: dict | None, ttl: float) -> dict | None:
+    if (not params or endpoint not in _WINDOW_ENDPOINTS
+            or "end_timestamp" not in params or "start_timestamp" not in params):
+        return params
+    try:
+        b = max(int(float(ttl) * 1000), _MIN_BUCKET_MS)
+        start, end = int(params["start_timestamp"]), int(params["end_timestamp"])
+    except (TypeError, ValueError):
+        return params
+    out = dict(params)
+    out["start_timestamp"] = (start // b) * b
+    out["end_timestamp"] = -(-end // b) * b
+    return out
+
+
 def _request(endpoint: str, params: dict | None = None, ttl: float = 60.0,
              retries: int = 3) -> dict | None:
     """
@@ -76,6 +104,7 @@ def _request(endpoint: str, params: dict | None = None, ttl: float = 60.0,
     Returns the JSON response dict, or None on failure.
     """
     url = f"{BASE_URL}/{endpoint}"
+    params = _bucket_window(endpoint, params, ttl)
     cache_key = f"{endpoint}|{sorted(params.items()) if params else ''}"
 
     # Check cache
@@ -199,32 +228,6 @@ def get_dvol(currency: str, resolution: str | int = "1D",
     return df
 
 
-def get_trades(currency: str, kind: str = "option",
-               start_ms: int | None = None, end_ms: int | None = None,
-               count: int = 1000) -> list[dict] | None:
-    """
-    Get recent trades for a currency/kind.
-    Returns list of trade dicts with: instrument_name, price, amount, direction, timestamp, etc.
-    """
-    if end_ms is None:
-        end_ms = int(time.time() * 1000)
-    if start_ms is None:
-        start_ms = end_ms - 24 * 3600 * 1000  # 24h default
-
-    result = _request("get_last_trades_by_currency_and_time", {
-        "currency": currency,
-        "kind": kind,
-        "start_timestamp": start_ms,
-        "end_timestamp": end_ms,
-        "count": count,
-        "sorting": "desc",
-    }, ttl=TTL_MEDIUM)
-
-    if result and "trades" in result:
-        return result["trades"]
-    return result if isinstance(result, list) else None
-
-
 def get_last_trades_by_currency_and_time(
     currency: str,
     kind: str = "option",
@@ -316,72 +319,9 @@ def get_expirations(currency: str, kind: str = "option") -> list[int] | None:
     return expirations
 
 
-def get_book_summary_by_instrument(instrument_name: str) -> dict | None:
-    """Get book summary for a single instrument."""
-    result = _request("get_book_summary_by_instrument",
-                      {"instrument_name": instrument_name}, ttl=TTL_SHORT)
-    if isinstance(result, list) and len(result) > 0:
-        return result[0]
-    return result if isinstance(result, dict) else None
-
-
 # ---------------------------------------------------------------------------
 # Higher-level helpers
 # ---------------------------------------------------------------------------
-
-def get_atm_iv_by_dte(currency: str, spot: float | None = None) -> pd.DataFrame | None:
-    """
-    Compute ATM implied volatility for each listed expiry from the option chain.
-    Returns DataFrame with columns: dte, atm_iv, expiry_ts
-    """
-    chain = get_option_chain(currency, "option")
-    if not chain:
-        return None
-
-    if spot is None:
-        index_name = {"BTC": "btc_usd", "ETH": "eth_usd", "USDC": "sol_usdc"}.get(currency)
-        if index_name:
-            spot = get_index_price(index_name)
-    if not spot:
-        return None
-
-    now_ms = int(time.time() * 1000)
-    rows = []
-    for inst in chain:
-        if inst.get("mark_iv") is None or inst["mark_iv"] == 0:
-            continue
-        name = inst["instrument_name"]
-        # Parse strike from instrument name: BTC-27JUN26-120000-C
-        parts = name.split("-")
-        if len(parts) < 4:
-            continue
-        try:
-            strike = float(parts[2].replace("d", "."))
-        except ValueError:
-            continue
-
-        expiry_ts = inst.get("expiration_timestamp", 0)
-        dte = max((expiry_ts - now_ms) / (1000 * 86400), 0.01)
-
-        # ATM = strike closest to spot
-        moneyness = abs(np.log(strike / spot))
-        if moneyness < 0.05:  # within 5% of spot = near-ATM
-            rows.append({
-                "dte": dte,
-                "atm_iv": inst["mark_iv"],
-                "expiry_ts": expiry_ts,
-                "instrument": name,
-            })
-
-    if not rows:
-        return None
-
-    df = pd.DataFrame(rows)
-    # Average multiple near-ATM options per expiry
-    df = df.groupby("expiry_ts").agg({"dte": "first", "atm_iv": "mean"}).reset_index()
-    df = df.sort_values("dte").reset_index(drop=True)
-    return df
-
 
 def clear_cache():
     """Clear the entire request cache."""

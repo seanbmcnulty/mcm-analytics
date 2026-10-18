@@ -283,6 +283,11 @@ def render_output(fig, df, text, key_prefix: str = "out",
 
 
 
+def _theme_result(fig):
+    """Hook for per-result post-processing (theming is added separately)."""
+    return fig
+
+
 def _send_photo(png: bytes | None, caption: str) -> bool:
     """Send one PNG to Telegram. telegram.send_photo already retries a
     429 (rate limit) with Telegram's own retry_after, and separately
@@ -428,16 +433,34 @@ def _send_to_telegram(assets: list[str], label: str) -> None:
                 st.markdown(f"- {r}")
 
 
+# Commands per asset run concurrently. Safe because lib.deribit serialises
+# requests through its own rate limiter (10 req/s) and lock-protected TTL
+# cache, and no command touches Streamlit -- every st.* call (progress bar,
+# session_state, captions) stays on this script thread. 4 workers overlaps
+# network latency without bursting past the limiter.
+RUN_WORKERS = 4
+
+
+def _run_one(asset: str, cn: str, target_days: int):
+    return cmdreg.run_command(
+        asset, "/" + cn,
+        expiry_target_days=target_days if cn in cmdreg.EXPIRY_COMMANDS else None)
+
+
 def run_reports(assets: list[str], cmd_names: list[str], target_days: int,
                 merge_into: dict | None = None) -> dict:
     """Run commands with per-asset progress (``BTC 5/22``).
 
-    When ``merge_into`` is provided (typically ``st.session_state.mcm_all_results``),
+    The first command of each asset runs alone (it warms the shared option
+    chain / index caches), the rest run on a small thread pool. When
+    ``merge_into`` is provided (typically ``st.session_state.mcm_all_results``),
     each finished command is written back immediately so a mid-run failure
     still leaves partial results in session_state. Errors from
     ``run_command`` are returned as text on the tile (not swallowed); any
     that look like hard failures are listed after the sweep.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     results = merge_into if merge_into is not None else {}
     n_cmds = max(1, len(cmd_names))
     total = max(1, len(assets) * n_cmds)
@@ -445,22 +468,38 @@ def run_reports(assets: list[str], cmd_names: list[str], target_days: int,
     status = st.empty()
     done = 0
     hard_errors: list[str] = []
+
+    def _record(a, cn, out, i_cmd):
+        nonlocal done
+        fig, df, text = out
+        results[(a, cn)] = (_theme_result(fig), df, text)
+        if merge_into is not None:
+            st.session_state.mcm_all_results = results
+            st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
+        has_table = df is not None and not getattr(df, "empty", True)
+        nfigs = len(fig) if isinstance(fig, list) else (1 if fig is not None else 0)
+        if text and nfigs == 0 and not has_table:
+            hard_errors.append(f"{a} /{cn}: {text}")
+        done += 1
+        status.caption(f"**{a}** {i_cmd}/{n_cmds} — /{cn}")
+        bar.progress(done / total, text=f"{a} {i_cmd}/{n_cmds}")
+
     for a in assets:
-        for i_cmd, cn in enumerate(cmd_names, start=1):
-            status.caption(f"**{a}** {i_cmd}/{n_cmds} — /{cn}")
-            fig, df, text = cmdreg.run_command(
-                a, "/" + cn,
-                expiry_target_days=target_days if cn in cmdreg.EXPIRY_COMMANDS else None)
-            results[(a, cn)] = (fig, df, text)
-            if merge_into is not None:
-                st.session_state.mcm_all_results = results
-                st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
-            has_table = df is not None and not getattr(df, "empty", True)
-            nfigs = len(fig) if isinstance(fig, list) else (1 if fig is not None else 0)
-            if text and nfigs == 0 and not has_table:
-                hard_errors.append(f"{a} /{cn}: {text}")
-            done += 1
-            bar.progress(done / total, text=f"{a} {i_cmd}/{n_cmds}")
+        if not cmd_names:
+            continue
+        first, rest = cmd_names[0], list(cmd_names[1:])
+        status.caption(f"**{a}** 1/{n_cmds} — /{first}")
+        _record(a, first, _run_one(a, first, target_days), 1)
+        if rest:
+            with ThreadPoolExecutor(max_workers=RUN_WORKERS) as pool:
+                futs = {pool.submit(_run_one, a, cn, target_days): cn for cn in rest}
+                for k, fut in enumerate(as_completed(futs), start=2):
+                    cn = futs[fut]
+                    try:
+                        out = fut.result()
+                    except Exception as exc:  # run_command already catches; belt and braces
+                        out = (None, None, f"/{cn} failed: {cmdreg.short_error(exc)}")
+                    _record(a, cn, out, k)
     bar.empty()
     status.empty()
     if hard_errors:

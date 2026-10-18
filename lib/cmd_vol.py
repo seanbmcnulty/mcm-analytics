@@ -17,7 +17,9 @@ import plotly.graph_objects as go
 from lib import history, surface
 
 # Import EVERYTHING from fx_style (Colors, TEMPLATE, Styles, Timezone helpers, etc.)
-from lib.fx_style import *
+from lib.fx_style import (AMBER, BLUE, GREEN, GREY, NAVY, ORANGE, RED,
+                          SMILE_SNAPSHOT_STYLE, TEMPLATE, TERM_STRUCTURE_SERIES_STYLE,
+                          TIME_TICKFORMAT, XAXIS_TIME, finalize, to_local)
 
 _finite = surface.finite
 
@@ -304,12 +306,11 @@ def build_vol_surface_figure(asset: str, dte: int) -> go.Figure | None:
     # Historical smiles, re-levelled per delta bucket.
     hist_maps: dict[str, pd.DataFrame] = {}
     estimated = True
-    src = "none"
     for key in surface.DELTA_KEYS:
-        f, est, s = history.surface_history(asset, key, days=35)
+        f, est, _src = history.surface_history(asset, key, days=35)
         if f is not None and not f.empty:
             hist_maps[key] = f
-            estimated, src = est, s
+            estimated = est
 
     cloud: dict[int, tuple[float, float]] = {}
     cloud_days = 0

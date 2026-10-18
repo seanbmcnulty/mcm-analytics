@@ -3,7 +3,6 @@ Plotly styling, color palettes, timezone utilities, and table image generation f
 """
 
 import re
-from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -19,7 +18,6 @@ RED = "#C0392B"
 GREY = "#888888"
 ORANGE = "#E65100"
 AMBER = "#EF8A00"
-PURPLE = "#7B1FA2"
 
 TEMPLATE = "plotly_white"
 TIME_TICKFORMAT = "%d-%b %H:%M"
@@ -27,7 +25,6 @@ TIME_TICKFORMAT = "%d-%b %H:%M"
 DISPLAY_TZ = "Asia/Singapore"
 DISPLAY_TZ_LABEL = "SGT"
 XAXIS_TIME = "Time (SGT)"
-EXPIRY_LABEL_FONT_SIZE = 12
 
 # ---------------------------------------------------------------------------
 # Chart Styling Dictionaries

@@ -14,8 +14,6 @@ EXPIRY_COMMANDS = {
     "intraday_vol", "intraday_skew", "vol_smile",
 }
 
-DTE_PRESETS = {"1 week": 7, "1 month": 30, "3 month": 90}
-
 COMMANDS = [
     "/vol_run",
     "/vol_term_structure",

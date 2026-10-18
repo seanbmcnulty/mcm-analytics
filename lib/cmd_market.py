@@ -19,7 +19,7 @@ from scipy.stats import norm
 
 from lib import deribit, history, surface
 from lib.fx_style import (BLUE, GREEN, GREY, NAVY, ORANGE, RED, TEMPLATE,
-                          TIME_TICKFORMAT, XAXIS_TIME, add_watermark,
+                          TIME_TICKFORMAT, XAXIS_TIME,
                           finalize, to_local, to_local_ts)
 
 _finite = surface.finite
@@ -36,15 +36,15 @@ def _now() -> datetime:
 # Basis
 # ===========================================================================
 
-def _future_instrument(asset: str, dte: int) -> str | None:
-    """Deribit instrument name for the dated future expiring in ``dte`` days."""
+def _future_candidates(asset: str, dte: int) -> list[tuple]:
+    """Live dated futures for ``asset``, nearest expiry to ``dte`` first."""
     cfg = surface.acfg(asset)
     chain = deribit.get_option_chain(cfg["deribit_ccy"], "future")
     if not chain:
-        return None
+        return []
     today = _now().date()
     prefix = cfg["deribit_prefix"] + "-"
-    best, best_gap = None, None
+    out = []
     for row in chain:
         instr = row.get("instrument_name") or ""
         up = instr.upper()
@@ -58,13 +58,19 @@ def _future_instrument(asset: str, dte: int) -> str | None:
         exp = surface.parse_expiry_date(parts[1])
         if exp is None or exp < today:
             continue
-        gap = abs((exp - today).days - int(dte))
-        if best_gap is None or gap < best_gap:
-            best, best_gap = instr, gap
-    return best
+        out.append((abs((exp - today).days - int(dte)), instr, exp))
+    out.sort(key=lambda x: (x[0], x[2]))
+    return [(instr, exp) for _, instr, exp in out]
 
 
-def _basis_apr_history(asset: str, dte: int, days: int) -> pd.Series | None:
+def _future_instrument(asset: str, dte: int) -> str | None:
+    """Deribit instrument name for the dated future expiring in ``dte`` days."""
+    cands = _future_candidates(asset, dte)
+    return cands[0][0] if cands else None
+
+
+def _basis_apr_history(asset: str, dte: int, days: int,
+                       perp_daily: pd.DataFrame | None = None) -> pd.Series | None:
     """
     Annualised basis history for the dated future nearest ``dte``.
 
@@ -79,7 +85,8 @@ def _basis_apr_history(asset: str, dte: int, days: int) -> pd.Series | None:
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - int(days * 24 * 3600 * 1000)
     fut = deribit.get_tradingview_ohlc(instr, "1D", start_ms, end_ms)
-    perp = deribit.get_tradingview_ohlc(cfg["perp"], "1D", start_ms, end_ms)
+    perp = (perp_daily if perp_daily is not None
+            else deribit.get_tradingview_ohlc(cfg["perp"], "1D", start_ms, end_ms))
     if fut is None or perp is None or fut.empty or perp.empty:
         return None
 
@@ -120,6 +127,10 @@ def cmd_basis_run(asset: str, lookback_days: int = 90, **kwargs):
     futures = surface.future_prices_by_dte(asset)
 
     today = _now().date()
+    # One perp daily-candle fetch shared by every future's basis history.
+    _end = int(time.time() * 1000)
+    perp_daily = deribit.get_tradingview_ohlc(
+        cfg["perp"], "1D", _end - int(int(lookback_days) * 86400 * 1000), _end)
     rows = []
     if perp is not None:
         rows.append({
@@ -136,7 +147,7 @@ def cmd_basis_run(asset: str, lookback_days: int = 90, **kwargs):
         fut = futures[dte]
         basis_dec = (fut - spot) / spot
         apr = ((1.0 + basis_dec) ** (365.0 / dte) - 1.0) * 100.0
-        hist = _basis_apr_history(asset, dte, int(lookback_days))
+        hist = _basis_apr_history(asset, dte, int(lookback_days), perp_daily=perp_daily)
         lo = hi = pct = np.nan
         if hist is not None and len(hist) >= 2:
             lo, hi = float(hist.min()), float(hist.max())
@@ -188,26 +199,43 @@ def cmd_intraday_basis(asset: str, dte: int | None = None, **kwargs):
     """Today's USD basis for one dated future, with the perp overlaid."""
     target = int(dte) if dte is not None else 30
     resolved = surface.resolve_dte(asset, target)
-    instr = _future_instrument(asset, resolved)
-    if not instr:
+    cands = _future_candidates(asset, resolved)
+    if not cands:
         return None, None, "No basis data for this expiry."
 
     cfg = surface.acfg(asset)
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - 24 * 3600 * 1000
-    fut = deribit.get_tradingview_ohlc(instr, "15", start_ms, end_ms)
     perp = deribit.get_tradingview_ohlc(cfg["perp"], "15", start_ms, end_ms)
-    if fut is None or perp is None or fut.empty or perp.empty:
+    if perp is None or perp.empty:
         return None, None, "No intraday basis data."
-
-    fut = fut.set_index(pd.to_datetime(fut["timestamp"], utc=True))["close"]
     perp_s = perp.set_index(pd.to_datetime(perp["timestamp"], utc=True))["close"]
-    idx = fut.index.intersection(perp_s.index)
-    if len(idx) < 2:
-        return None, None, "No intraday basis data."
-    basis = (fut.reindex(idx) - perp_s.reindex(idx)).dropna()
-    if basis.empty:
-        return None, None, "No basis."
+
+    # Thin USDC-linear futures (SOL/HYPE) often have no trades -- hence no
+    # candles -- in 24h. Fall back to the next-nearest expiry that traded,
+    # and say so in the title, rather than showing an empty tile.
+    basis = idx = None
+    used_exp = None
+    for instr, exp in cands[:4]:
+        fut = deribit.get_tradingview_ohlc(instr, "15", start_ms, end_ms)
+        if fut is None or fut.empty:
+            continue
+        fut = fut.set_index(pd.to_datetime(fut["timestamp"], utc=True))["close"]
+        _idx = fut.index.intersection(perp_s.index)
+        if len(_idx) < 2:
+            continue
+        _basis = (fut.reindex(_idx) - perp_s.reindex(_idx)).dropna()
+        if len(_basis) >= 2:
+            basis, idx, used_exp = _basis, _idx, exp
+            break
+    if basis is None:
+        return None, None, (f"No intraday basis data: no {asset} dated future "
+                            "traded in the last 24h.")
+    fallback_note = None
+    if used_exp != cands[0][1]:
+        fallback_note = (f"{cands[0][1]:%d-%b-%Y} future had no trades in 24h; "
+                         f"showing nearest traded expiry.")
+    resolved = (used_exp - _now().date()).days
 
     expiry_str = (_now().date() + timedelta(days=resolved)).strftime("%d-%b-%Y")
     fig = go.Figure()
@@ -226,7 +254,7 @@ def cmd_intraday_basis(asset: str, dte: int | None = None, **kwargs):
         height=450, template=TEMPLATE,
         xaxis=dict(type="date", tickformat=TIME_TICKFORMAT, tickangle=-90),
     )
-    finalize(fig, legend_rows=1)
+    finalize(fig, note=fallback_note, legend_rows=1)
     return fig, None, None
 
 
