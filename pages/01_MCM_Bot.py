@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -66,8 +67,8 @@ _TODAY = datetime.now(timezone.utc).date()
 MCM_ORDER = [(a, cn) for a in ASSETS for cn in cmdreg.COMMAND_NAMES]
 
 # These render wide tables (not charts) that get cut off when squeezed into a
-# 1/3-width grid column, so each gets a dedicated full-width row instead of
-# sharing a row of 3 with neighboring commands — same treatment vol_run's
+# half-width grid column, so each gets a dedicated full-width row instead of
+# sharing a row of GRID_COLS with neighboring commands — same treatment vol_run's
 # table already gets (see the dashboard grid loop below).
 FULL_ROW_COMMANDS = {"basis_run", "block_trades_summary"}
 
@@ -86,12 +87,38 @@ CORE_ASSETS = ("BTC", "ETH")
 GRID_COLS = 2
 
 # Wide-table heuristic: known full-row commands OR any result whose dataframe
-# has more than this many columns (too many to read in a 1/3-width cell).
+# has more than this many columns (too many to read in a half-width cell).
 FULL_ROW_MIN_COLS = 6
 
 for _k, _v in (("mcm_all_results", None), ("mcm_all_results_ts", None),
                ("mcm_fig", None), ("mcm_df", None), ("mcm_text", None)):
     st.session_state.setdefault(_k, _v)
+
+# Widgets on the "Run single command" view aren't rendered while an asset is
+# selected, and Streamlit drops an unrendered widget's state; re-assigning
+# keeps the user's choices across view switches.
+for _k in ("mcm_asset", "mcm_cmd", "mcm_help"):
+    if _k in st.session_state:
+        st.session_state[_k] = st.session_state[_k]
+
+
+def _chart_theme() -> str:
+    """Current sidebar chart theme: 'auto' | 'light' | 'dark'."""
+    t = str(st.session_state.get("mcm_chart_theme") or "Auto").lower()
+    return t if t in fx_style.CHART_THEMES else "auto"
+
+
+def _themed(fig, theme: str):
+    """Theme a stored figure (or list) once per theme. The theme applied is
+    remembered on the figure, so reruns don't re-run plotly's expensive
+    update_layout on ~100 charts; switching theme re-themes each chart once,
+    lazily, when it is next shown."""
+    figs = fig if isinstance(fig, list) else [fig]
+    for f in figs:
+        if f is not None and getattr(f, "_mcm_theme", None) != theme:
+            fx_style.apply_chart_theme(f, theme)
+            f._mcm_theme = theme
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +237,11 @@ def _style_table(df: pd.DataFrame):
         style = disp.style.format({k: v for k, v in fmt.items() if k in cols},
                                   na_rep="-")
         style = style.apply(
-            lambda row: ["background-color: rgba(0,0,0,0.04);"
-                         if disp.index.get_loc(row.name) % 2 else ""] * len(row),
-            axis=1)
+            lambda d: pd.DataFrame(
+                np.where((np.arange(len(d)) % 2 == 1)[:, None],
+                         "background-color: rgba(0,0,0,0.04);", ""),
+                index=d.index, columns=d.columns),
+            axis=None)
         for c, sc in (("ATM 3h", 3.0), ("ATM Open", 4.0), ("IV−RV", 10.0)):
             if c in cols:
                 style = style.apply(lambda s, sc=sc: [_tint(v, sc) for v in s],
@@ -265,27 +294,25 @@ def render_output(fig, df, text, key_prefix: str = "out",
             st.dataframe(df, hide_index=True, **_stretch())
 
     valid = [(i, f) for i, f in enumerate(figs) if f is not None]
+    theme = _chart_theme()
+    st_theme = fx_style.streamlit_chart_theme(theme)
+    _themed([f for _, f in valid], theme)
     if full_width_charts and valid:
         for start in range(0, len(valid), 3):
             chunk = valid[start:start + 3]
             cols = st.columns(3)
             for j, (i, f) in enumerate(chunk):
                 with cols[j]:
-                    st.plotly_chart(fx_style.apply_theme(f),
+                    st.plotly_chart(f, theme=st_theme,
                                     key=f"plotly_{key_prefix}_{i}", **_stretch())
     else:
         for i, f in valid:
-            st.plotly_chart(fx_style.apply_theme(f),
+            st.plotly_chart(f, theme=st_theme,
                             key=f"plotly_{key_prefix}_{i}", **_stretch())
 
     if text and not figs and not has_table:
         st.markdown(text)
 
-
-
-def _theme_result(fig):
-    """Hook for per-result post-processing (theming is added separately)."""
-    return fig
 
 
 def _send_photo(png: bytes | None, caption: str) -> bool:
@@ -335,7 +362,8 @@ def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> tuple[b
         caption = caption_from_title(title_text, caption_base)
         label = f"{caption_base} chart {idx}/{len(figs)}"
 
-        png = fx_style.fig_to_png(fx_style.apply_theme(f, "light"), width=1200, height=800)
+        # fig_to_png themes a *copy* light; the on-screen figure is untouched.
+        png = fx_style.fig_to_png(f, width=1200, height=800)
         if png is None:
             reasons.append(f"{label}: failed to **render**")
         elif _send_photo(png, caption):
@@ -398,10 +426,13 @@ def _send_to_telegram(assets: list[str], label: str) -> None:
     to_send = _telegram_queue(assets, results)
     sent = failed = 0
     all_reasons: list[str] = []
-    n_send = max(1, len(to_send))
+    n_total = max(1, len(to_send))
     bar = st.progress(0.0, text=f"Sending 0/{len(to_send)}…")
     for i, (a, cn, fig, df, text) in enumerate(to_send, start=1):
-        bar.progress(i / n_send, text=f"Sending {i}/{len(to_send)}…")
+        bar.progress(i / n_total, text=f"Sending {i}/{len(to_send)}…")
+        _has_tbl = df is not None and not getattr(df, "empty", True)
+        if fig is None and not _has_tbl and not text:
+            continue  # nothing to send (e.g. no block trades for this asset) — not a failure
         ok, reasons = send_result_to_telegram(a, cn, fig, df, text)
         if ok:
             sent += 1
@@ -417,10 +448,10 @@ def _send_to_telegram(assets: list[str], label: str) -> None:
         st.error("Failed to send reports to Telegram.")
 
     if all_reasons:
-        n_render = sum(1 for r in all_reasons if "render" in r)
-        n_send = sum(1 for r in all_reasons if "send" in r)
+        n_render_fail = sum(1 for r in all_reasons if "render" in r)
+        n_send_fail = sum(1 for r in all_reasons if "send" in r)
         with st.expander(f"⚠️ {len(all_reasons)} image(s)/message(s) had "
-                         f"trouble — {n_render} failed to render, {n_send} "
+                         f"trouble — {n_render_fail} failed to render, {n_send_fail} "
                          "failed to send. Click for detail."):
             st.caption(
                 "**Render** failures happen before Telegram is ever "
@@ -441,10 +472,13 @@ def _send_to_telegram(assets: list[str], label: str) -> None:
 RUN_WORKERS = 4
 
 
-def _run_one(asset: str, cn: str, target_days: int):
-    return cmdreg.run_command(
+def _run_one(asset: str, cn: str, target_days: int, theme: str):
+    """Run one command and theme its figure(s) once, at completion. Runs in a
+    worker thread: no Streamlit calls here."""
+    fig, df, text = cmdreg.run_command(
         asset, "/" + cn,
         expiry_target_days=target_days if cn in cmdreg.EXPIRY_COMMANDS else None)
+    return _themed(fig, theme), df, text
 
 
 def run_reports(assets: list[str], cmd_names: list[str], target_days: int,
@@ -468,11 +502,12 @@ def run_reports(assets: list[str], cmd_names: list[str], target_days: int,
     status = st.empty()
     done = 0
     hard_errors: list[str] = []
+    theme = _chart_theme()
 
     def _record(a, cn, out, i_cmd):
         nonlocal done
         fig, df, text = out
-        results[(a, cn)] = (_theme_result(fig), df, text)
+        results[(a, cn)] = (fig, df, text)
         if merge_into is not None:
             st.session_state.mcm_all_results = results
             st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
@@ -489,10 +524,10 @@ def run_reports(assets: list[str], cmd_names: list[str], target_days: int,
             continue
         first, rest = cmd_names[0], list(cmd_names[1:])
         status.caption(f"**{a}** 1/{n_cmds} — /{first}")
-        _record(a, first, _run_one(a, first, target_days), 1)
+        _record(a, first, _run_one(a, first, target_days, theme), 1)
         if rest:
             with ThreadPoolExecutor(max_workers=RUN_WORKERS) as pool:
-                futs = {pool.submit(_run_one, a, cn, target_days): cn for cn in rest}
+                futs = {pool.submit(_run_one, a, cn, target_days, theme): cn for cn in rest}
                 for k, fut in enumerate(as_completed(futs), start=2):
                     cn = futs[fut]
                     try:
@@ -728,7 +763,7 @@ _ts = st.session_state.get("mcm_all_results_ts")
 def _needs_full_row(asset: str, cn: str) -> bool:
     """Full-width row if the command is in FULL_ROW_COMMANDS, or its loaded
     dataframe has more than FULL_ROW_MIN_COLS columns (wide tables are
-    unreadable in a 1/3-width grid cell).
+    unreadable in a half-width grid cell).
 
     vol_run is exempt from the wide-table heuristic even though its table
     is wide (10+ columns): it's handled specially via the multi_idx path
@@ -775,15 +810,22 @@ if _ts is not None and results:
         st.info(f"Data is {age_min} min old. Click **Refresh all** above for "
                 "the latest.")
 elif not results:
-    st.info("No reports loaded yet. Use **Load all** above, or open an "
-            "asset's tab below and click its **Run <asset>** button to "
+    st.info("No reports loaded yet. Use **Load all** above, or pick an "
+            "asset below and click its **Run <asset>** button to "
             "load just that one.")
 
-_tab_labels = [f"📊 {a}" for a in ASSETS] + ["🔎 Run single command"]
-asset_tabs = st.tabs(_tab_labels)
+# Only the selected view is rendered. st.tabs builds every tab's content on
+# every rerun (~115 charts, ~1.8 MB of specs, for 4 loaded assets); a
+# selector renders one asset's ~29 charts.
+_VIEW_SINGLE = "🔎 Run single command"
+_view_opts = [f"📊 {a}" for a in ASSETS] + [_VIEW_SINGLE]
+_view = st.radio("View", _view_opts, key="mcm_view", horizontal=True,
+                 label_visibility="collapsed")
 
 for ia, a in enumerate(ASSETS):
-    with asset_tabs[ia]:
+    if _view != _view_opts[ia]:
+        continue
+    with st.container():
         _run_a_col, _ = st.columns([1, 4])
         with _run_a_col:
             run_asset_btn = st.button(
@@ -884,7 +926,7 @@ for ia, a in enumerate(ASSETS):
 # Run single command
 # ---------------------------------------------------------------------------
 
-with asset_tabs[-1]:
+if _view == _VIEW_SINGLE:
     st.caption("Run one command for one asset and view or send the result. Useful "
                "for quick checks or sending a single chart/table to Telegram.")
 

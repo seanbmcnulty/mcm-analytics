@@ -116,6 +116,17 @@ def add_watermark(fig: go.Figure, text: str = "MCM Analytics") -> None:
         pass
 
 
+# Dark-mode chart palette (matches Streamlit's dark background).
+_DARK_BG = "#0E1117"
+_DARK_TEXT = "#E6EAF0"
+CHART_THEMES = ("auto", "light", "dark")
+
+
+def _is_light_box(color) -> bool:
+    c = str(color or "").replace(" ", "").lower()
+    return c in ("white", "#fff", "#ffffff") or c.startswith("rgba(255,255,255")
+
+
 def apply_theme(fig: go.Figure, theme: str = "auto") -> go.Figure:
     """Apply standard clean styling and template to a Plotly figure.
 
@@ -140,6 +151,56 @@ def apply_theme(fig: go.Figure, theme: str = "auto") -> go.Figure:
         fig.update_xaxes(tickfont=axis_font, title_font=axis_font, color=_TBL_TEXT)
         fig.update_yaxes(tickfont=axis_font, title_font=axis_font, color=_TBL_TEXT)
     return fig
+
+
+def apply_chart_theme(fig: go.Figure, theme: str = "auto") -> go.Figure:
+    """Apply a selectable chart theme to a Plotly figure **in place** and return it.
+
+    Used by the MCM Bot page's Auto/Light/Dark selector. (``apply_theme``
+    above keeps its original behaviour for the other pages.)
+
+    Every theme sets (or clears) the same properties, so a figure can be
+    switched between themes repeatedly without one theme's colours leaking
+    into the next:
+
+    - ``light``: dark text on white. Required for Telegram/kaleido PNG
+      exports (``fig_to_png`` applies it to a copy).
+    - ``dark``: light text on Streamlit's dark background.
+    - ``auto``: text/background colours cleared so ``st.plotly_chart``
+      (``theme="streamlit"``) takes them from the app's current theme.
+
+    Annotations drawn on a white box keep dark text in every theme so they
+    stay readable on a dark page.
+    """
+    if fig is None:
+        return None
+    t = (theme or "auto").lower()
+    if t == "light":
+        template, text, bg = TEMPLATE, _TBL_TEXT, "white"
+    elif t == "dark":
+        template, text, bg = "plotly_dark", _DARK_TEXT, _DARK_BG
+    else:
+        template, text, bg = TEMPLATE, None, None
+    fig.update_layout(
+        template=template,
+        font=dict(family=_TBL_FONT_FAMILY, color=text),
+        paper_bgcolor=bg,
+        plot_bgcolor=bg,
+    )
+    # Cover primary + secondary axes (dual-y charts, subplots).
+    axis_font = dict(color=text)
+    fig.update_xaxes(tickfont=axis_font, title_font=axis_font, color=text)
+    fig.update_yaxes(tickfont=axis_font, title_font=axis_font, color=text)
+    for ann in fig.layout.annotations or ():
+        if _is_light_box(getattr(ann, "bgcolor", None)) and not (ann.font and ann.font.color):
+            ann.font.color = _TBL_TEXT
+    return fig
+
+
+def streamlit_chart_theme(theme: str):
+    """``theme=`` argument for ``st.plotly_chart``: let Streamlit style
+    'auto' charts, and leave explicit light/dark colours untouched."""
+    return "streamlit" if (theme or "auto").lower() == "auto" else None
 
 
 def _title_text(fig) -> str:
