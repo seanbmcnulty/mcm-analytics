@@ -170,3 +170,12 @@ def test_gaps():
                    "2026-10-15T08:00:00.1+00:00,0.5,0.5,0.5,live"]))
     g = st.gaps(df, now=now)
     assert [round(h) for _, h in g] == [6, 4]
+
+
+def test_slot_based_skip():
+    a = pd.Timestamp("2026-10-18T10:14:59+00:00")
+    assert history.in_same_slot(a, pd.Timestamp("2026-10-18T10:00:00+00:00"), 15)
+    assert not history.in_same_slot(a, pd.Timestamp("2026-10-18T10:15:00+00:00"), 15)
+    # SGT-aware inputs are compared in UTC
+    assert history.in_same_slot(pd.Timestamp("2026-10-18T18:31:00+08:00"),
+                                pd.Timestamp("2026-10-18T10:44:00+00:00"), 15)

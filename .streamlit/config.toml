@@ -7,14 +7,12 @@ primaryColor = "#3790C7"
 font = "sans serif"
 
 [theme.light]
-base = "light"
 primaryColor = "#1E4D7A"
 backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F4F7FB"
 textColor = "#13314F"
 
 [theme.dark]
-base = "dark"
 primaryColor = "#4da6ff"
 backgroundColor = "#0e1117"
 secondaryBackgroundColor = "#1a1f2e"

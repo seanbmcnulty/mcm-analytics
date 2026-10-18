@@ -16,8 +16,11 @@ name: Record vol snapshots
 #
 # Triggers: GitHub's own schedule drops most runs, so the primary trigger is
 # an external workflow_dispatch call every 15 minutes (docs/EXTERNAL_TRIGGER.md).
-# The two hourly crons stay as a backup; --min-interval 780 (13 min) makes
-# duplicates no-ops.
+# The two hourly crons stay as a backup. Slot-based skip (--slot-minutes 15)
+# records at most one row per :00/:15/:30/:45 UTC slot, so GitHub's jittery
+# dispatch timing (runs arrive 9-19 min apart) no longer drops whole slots the
+# way a fixed 13-min --min-interval did; --min-interval 120 just guards against
+# two rows seconds apart across a slot boundary.
 
 on:
   schedule:
@@ -90,7 +93,7 @@ jobs:
         # then fail the run at the end so the alert fires.
         run: |
           set +e
-          python scripts/record_snapshot.py --min-interval 780
+          python scripts/record_snapshot.py --slot-minutes 15 --min-interval 120
           echo "REC_RC=$?" >> "$GITHUB_ENV"
 
       - name: Validate before publishing

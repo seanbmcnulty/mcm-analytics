@@ -326,12 +326,15 @@ def _thin_snapshot_file(path: Path) -> None:
     apply_retention(asset, path.parent)
 
 
-def record_snapshot_status(asset: str, min_interval_s: float = 1800.0) -> str:
+def record_snapshot_status(asset: str, min_interval_s: float = 1800.0,
+                           slot_minutes: int | None = None) -> str:
     """
     Append the current surface to the snapshot store and say what happened:
 
       "recorded"  a row was written
-      "skipped"   the last row is younger than ``min_interval_s``
+      "skipped"   the last row is younger than ``min_interval_s``, or (when
+                  ``slot_minutes`` is set) already falls in the current UTC
+                  slot (e.g. :00/:15/:30/:45 for 15)
       "no_data"   Deribit returned no usable surface (worth retrying)
       "error"     anything else went wrong (e.g. read-only filesystem)
 
@@ -353,6 +356,8 @@ def record_snapshot_status(asset: str, min_interval_s: float = 1800.0) -> str:
                     last_txt = pd.read_csv(path, usecols=["timestamp"])["timestamp"].iloc[-1]
                 last = pd.to_datetime(last_txt, utc=True, format="ISO8601")
                 if (now - last).total_seconds() < min_interval_s:
+                    return "skipped"
+                if slot_minutes and in_same_slot(last, now, slot_minutes):
                     return "skipped"
             except Exception:
                 pass
@@ -391,6 +396,13 @@ def record_snapshot_status(asset: str, min_interval_s: float = 1800.0) -> str:
         return "recorded"
     except Exception:
         return "error"
+
+
+def in_same_slot(a, b, slot_minutes: int) -> bool:
+    """True when UTC timestamps ``a`` and ``b`` fall in the same ``slot_minutes`` bucket."""
+    fa = pd.Timestamp(a).tz_convert("UTC").floor(f"{int(slot_minutes)}min")
+    fb = pd.Timestamp(b).tz_convert("UTC").floor(f"{int(slot_minutes)}min")
+    return fa == fb
 
 
 def record_snapshot(asset: str, min_interval_s: float = 1800.0) -> bool:

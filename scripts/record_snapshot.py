@@ -16,6 +16,7 @@ Usage:
     python scripts/record_snapshot.py
     python scripts/record_snapshot.py --assets BTC ETH
     python scripts/record_snapshot.py --min-interval 0   # force a row even if recent
+    python scripts/record_snapshot.py --slot-minutes 15 --min-interval 120   # one row per 15-min UTC slot
 """
 
 from __future__ import annotations
@@ -38,11 +39,13 @@ RETRY_BACKOFF_S = (2.0, 5.0, 15.0)
 
 
 def record_with_retry(asset: str, min_interval: float, attempts: int = 3,
+                      slot_minutes: int | None = None,
                       sleep=time.sleep) -> str:
     status = "error"
     for attempt in range(attempts):
         try:
-            status = history.record_snapshot_status(asset, min_interval_s=min_interval)
+            status = history.record_snapshot_status(asset, min_interval_s=min_interval,
+                                                    slot_minutes=slot_minutes)
         except Exception as exc:  # defensive: record_snapshot_status shouldn't raise
             print(f"[{asset}] attempt {attempt + 1}: {exc}", file=sys.stderr)
             status = "error"
@@ -63,6 +66,9 @@ def main() -> int:
     parser.add_argument("--min-interval", type=float, default=1800.0,
                         help="Skip an asset if its last row is younger than "
                              "this many seconds (default: 1800 = 30 min)")
+    parser.add_argument("--slot-minutes", type=int, default=None,
+                        help="Slot-based skip: record at most one row per UTC slot of this "
+                             "many minutes (15 -> :00/:15/:30/:45). Combined with --min-interval.")
     parser.add_argument("--attempts", type=int, default=3,
                         help="Attempts per asset when Deribit returns nothing (default 3)")
     args = parser.parse_args()
@@ -70,7 +76,8 @@ def main() -> int:
     failed = []
     wrote_any = False
     for asset in args.assets:
-        status = record_with_retry(asset, args.min_interval, args.attempts)
+        status = record_with_retry(asset, args.min_interval, args.attempts,
+                                   slot_minutes=args.slot_minutes)
         print(f"[{asset}] {status}")
         wrote_any = wrote_any or status == "recorded"
         if status not in ("recorded", "skipped"):

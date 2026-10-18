@@ -21,7 +21,7 @@ import streamlit as st
 
 from lib import cache as cache_lib
 from lib import commands as cmdreg
-from lib import fx_style, history, surface, telegram
+from lib import fx_style, surface, telegram
 from lib.constants import ASSETS, ASSET_COLORS
 from lib.telegram_caption import caption_from_title
 
@@ -492,11 +492,10 @@ with st.sidebar:
         cache_lib.clear_all_caches()
         st.rerun()
 
-for _asset in ASSETS:
-    try:
-        history.record_snapshot(_asset)
-    except Exception:
-        pass
+# Snapshot recording is done by the GitHub Actions recorder every 15 min
+# (.github/workflows/record_snapshots.yml), validated before publishing; the
+# page no longer records on every rerun (it cost ~3 s on cold loads and wrote
+# unvalidated local rows).
 
 st.title("🤖 MCM Bot")
 st.caption("Crypto derivatives analytics · Deribit public API · "
