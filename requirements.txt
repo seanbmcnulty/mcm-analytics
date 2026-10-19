@@ -3,6 +3,10 @@
 # Requires Python 3.10+
 
 streamlit>=1.35.0
+# pandas' DataFrame.style (MCM Bot table colouring/formatting) needs
+# jinja2>=3.1.2. It only arrives transitively today (via altair); pin it so a
+# dependency change can't silently drop the page back to unstyled tables.
+jinja2>=3.1.2
 requests>=2.31.0
 numpy>=1.26.0
 pandas>=2.1.0

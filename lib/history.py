@@ -407,10 +407,28 @@ def _parse_snapshot_csv(text) -> pd.DataFrame | None:
         return None
 
 
+# Parsed local store, keyed by (path, mtime, size): surface_history() runs
+# ~80 times per /vol_run (11 expiries x 7 delta buckets), and re-reading and
+# re-parsing the CSV on every call made a cold /vol_run ~3x slower locally.
+_LOCAL_SNAPSHOT_CACHE: dict[str, tuple[tuple, "pd.DataFrame | None"]] = {}
+# Last merged local+remote frame per asset (reused while neither input changes).
+_MERGED_SNAPSHOT_CACHE: dict[str, tuple[object, object, "pd.DataFrame"]] = {}
+
+
 def _load_local_snapshots_raw(asset: str) -> pd.DataFrame | None:
     try:
+        p = store_path(asset)
+        if p is None:
+            return None
+        st = p.stat()
+        sig = (str(p), st.st_mtime_ns, st.st_size)
+        hit = _LOCAL_SNAPSHOT_CACHE.get(asset)
+        if hit is not None and hit[0] == sig:
+            return hit[1]
         raw = read_store(asset)
-        return None if raw is None else _parse_snapshot_csv(raw)
+        df = None if raw is None else _parse_snapshot_csv(raw)
+        _LOCAL_SNAPSHOT_CACHE[asset] = (sig, df)
+        return df
     except Exception:
         return None
 
@@ -472,8 +490,15 @@ def load_snapshots(asset: str, days: int) -> pd.DataFrame | None:
     elif remote is None:
         df = local
     else:
-        combined = pd.concat([remote, local])
-        df = combined[~combined.index.duplicated(keep="last")].sort_index()
+        hit = _MERGED_SNAPSHOT_CACHE.get(asset)
+        if hit is not None and hit[0] is local and hit[1] is remote:
+            df = hit[2]
+        else:
+            combined = pd.concat([remote, local])
+            df = combined[~combined.index.duplicated(keep="last")].sort_index()
+            _MERGED_SNAPSHOT_CACHE[asset] = (local, remote, df)
+    # Boolean indexing below always returns a new frame, so callers never
+    # share (or mutate) the cached ones.
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     df = df[df.index >= cutoff]
     return df if len(df) >= 2 else None
@@ -855,3 +880,5 @@ def clear_cache() -> None:
     _DRIVER_CACHE.clear()
     _DVOL_FINE_CACHE.clear()
     _REMOTE_SNAPSHOT_CACHE.clear()
+    _LOCAL_SNAPSHOT_CACHE.clear()
+    _MERGED_SNAPSHOT_CACHE.clear()

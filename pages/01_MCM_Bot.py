@@ -10,6 +10,7 @@ main-area expander under the title.
 
 import sys
 import html
+import logging
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -29,9 +30,14 @@ from lib.telegram_caption import caption_from_title
 st.set_page_config(page_title="MCM Bot", page_icon="🤖", layout="wide",
                    initial_sidebar_state="expanded")
 
+_log = logging.getLogger("mcm_bot")
+
 # Theme-neutral polish (works in light and dark): rounded cards around tables
 # and charts, softer buttons, bolder tabs, asset-coloured tile labels and the
 # summary "pills" used for the SPOT / DVOL / RV header lines.
+# No inner padding on the plotly card: plotly sizes itself to the container's
+# width, so a 6px padding pushed the chart 6px right and clipped its right edge
+# (secondary-axis titles, heatmap colorbar ticks read "4 3 3 2", modebar).
 _PAGE_CSS = """
 <style>
 .block-container{padding-top:2.2rem;max-width:1500px}
@@ -41,7 +47,7 @@ div[data-testid="stButton"]>button{border-radius:10px;font-weight:600;transition
 div[data-testid="stButton"]>button:hover{transform:translateY(-1px);
   box-shadow:0 3px 10px rgba(55,144,199,.28);border-color:#3790C7}
 div[data-testid="stDataFrame"]{border:1px solid rgba(128,128,128,.25);border-radius:12px;overflow:hidden}
-div[data-testid="stPlotlyChart"]{border:1px solid rgba(128,128,128,.2);border-radius:12px;padding:6px}
+div[data-testid="stPlotlyChart"]{border:1px solid rgba(128,128,128,.2);border-radius:12px}
 div[data-testid="stExpander"]{border-radius:12px}
 .mcm-tile{display:flex;align-items:center;gap:.55rem;margin:1.1rem 0 .4rem}
 .mcm-tile .a{font-size:.68rem;font-weight:800;letter-spacing:.09em;padding:.14rem .5rem;
@@ -91,7 +97,8 @@ GRID_COLS = 2
 FULL_ROW_MIN_COLS = 6
 
 for _k, _v in (("mcm_all_results", None), ("mcm_all_results_ts", None),
-               ("mcm_fig", None), ("mcm_df", None), ("mcm_text", None)):
+               ("mcm_fig", None), ("mcm_df", None), ("mcm_text", None),
+               ("mcm_single_meta", None), ("mcm_results_dte", {})):
     st.session_state.setdefault(_k, _v)
 
 # Widgets on the "Run single command" view aren't rendered while an asset is
@@ -149,6 +156,14 @@ def _expiry_label(dte: int) -> str:
         return f"{dte} DTE → {(_TODAY + timedelta(days=int(dte))):%d-%b-%Y}"
     except Exception:
         return f"{dte} days"
+
+
+def _usd(x, dp: int = 0) -> str:
+    """$1,234 / -$1,234 (not "$-1,234"); "-" for missing."""
+    if not _finite(x):
+        return "-"
+    x = float(x)
+    return f"{'-' if x < 0 else ''}${abs(x):,.{dp}f}"
 
 
 def _tint(v, scale: float, max_a: float = 0.34) -> str:
@@ -215,10 +230,12 @@ def _style_table(df: pd.DataFrame):
     basis_col = ("Basis % (1Y APR)" if "Basis % (1Y APR)" in cols
                  else ("Basis %" if "Basis %" in cols else None))
     if basis_col and "Expiry" in cols:
+        disp = disp.drop(columns=["Token"], errors="ignore")
+        cols = set(disp.columns)
         fmt = {basis_col: "{:+.3f}%", "Basis Low %": "{:+.3f}%",
                "Basis High %": "{:+.3f}%",
                "P": lambda x: f"P{int(x)}" if _finite(x) else "-",
-               "Basis $": lambda x: f"${x:,.0f}" if pd.notna(x) else "",
+               "Basis $": _usd,
                "Mid Price": lambda x: f"${float(x):,.2f}" if _finite(x) else "",
                "DTE": "{:.0f}"}
         style = disp.style.format({k: v for k, v in fmt.items() if k in cols},
@@ -236,9 +253,13 @@ def _style_table(df: pd.DataFrame):
                "25d σ Put": "{:.1f}", "Fwd IV": "{:.1f}"}
         style = disp.style.format({k: v for k, v in fmt.items() if k in cols},
                                   na_rep="-")
+        # The (n, 1) row mask must be broadcast to the frame's full shape:
+        # np.where on it alone returns (n, 1), pandas raised "Shape of passed
+        # values is (11, 1), indices imply (11, 12)", and render_output fell
+        # back to the raw unstyled table (Token column, "None" cells, no tints).
         style = style.apply(
             lambda d: pd.DataFrame(
-                np.where((np.arange(len(d)) % 2 == 1)[:, None],
+                np.where(np.broadcast_to((np.arange(len(d)) % 2 == 1)[:, None], d.shape),
                          "background-color: rgba(0,0,0,0.04);", ""),
                 index=d.index, columns=d.columns),
             axis=None)
@@ -254,7 +275,7 @@ def _style_table(df: pd.DataFrame):
           if c in cols and pd.api.types.is_numeric_dtype(disp[c])]
     if _g:
         body = disp[disp["Expiry"] != "Total"] if "Expiry" in cols else disp
-        fmt = {c: (lambda x: f"${x:,.0f}" if pd.notna(x) else "-") for c in _g}
+        fmt = {c: _usd for c in _g}
         for c in ("Net Puts", "Net Calls", "Gross Notional"):
             if c in cols and pd.api.types.is_numeric_dtype(disp[c]):
                 fmt[c] = lambda x: f"{int(x):,}" if pd.notna(x) else "-"
@@ -291,6 +312,9 @@ def render_output(fig, df, text, key_prefix: str = "out",
             st.dataframe(_style_table(df), hide_index=True,
                          height=_table_height(len(df)), **_stretch())
         except Exception:
+            # Don't hide this silently: a styler bug otherwise just looks
+            # like an unformatted table on the live app.
+            _log.exception("MCM Bot table styling failed (%s)", key_prefix)
             st.dataframe(df, hide_index=True, **_stretch())
 
     valid = [(i, f) for i, f in enumerate(figs) if f is not None]
@@ -312,6 +336,10 @@ def render_output(fig, df, text, key_prefix: str = "out",
 
     if text and not figs and not has_table:
         st.markdown(text)
+    elif not text and not has_table and not valid and not skip_figures:
+        # e.g. /block_trades_summary with no trade above the block threshold
+        # returns an empty table and no text -- say so instead of a blank tile.
+        st.caption("Nothing to show — no qualifying data in the window.")
 
 
 
@@ -406,6 +434,16 @@ def _telegram_queue(assets: list[str], results: dict) -> list[tuple]:
     return to_send
 
 
+def _stale_expiry_commands(asset: str, results: dict) -> list[str]:
+    """Loaded expiry-driven tiles for ``asset`` that were built for a different
+    Default expiry than the one now selected (in dashboard order)."""
+    cur = int(st.session_state.get("mcm_dte_days", 30))
+    built = st.session_state.get("mcm_results_dte") or {}
+    return [cn for cn in cmdreg.COMMAND_NAMES
+            if cn in cmdreg.EXPIRY_COMMANDS and (asset, cn) in results
+            and built.get((asset, cn)) != cur]
+
+
 def _send_to_telegram(assets: list[str], label: str) -> None:
     """Ensure every command is loaded for `assets` (running only what's
     missing — a single-asset button doesn't force-load the other 3), then
@@ -422,6 +460,14 @@ def _send_to_telegram(assets: list[str], label: str) -> None:
                         merge_into=results)
             st.session_state.mcm_all_results = results
             st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
+    # Don't send expiry charts built for a previously selected Default expiry.
+    for a in assets:
+        stale = _stale_expiry_commands(a, results)
+        if stale:
+            with st.spinner(f"Updating {a} expiry charts for the selected expiry…"):
+                run_reports([a], stale, st.session_state.get("mcm_dte_days", 30),
+                            merge_into=results)
+                st.session_state.mcm_all_results = results
 
     to_send = _telegram_queue(assets, results)
     sent = failed = 0
@@ -483,31 +529,38 @@ def _run_one(asset: str, cn: str, target_days: int, theme: str):
 
 def run_reports(assets: list[str], cmd_names: list[str], target_days: int,
                 merge_into: dict | None = None) -> dict:
-    """Run commands with per-asset progress (``BTC 5/22``).
+    """Run commands for one or more assets with a progress bar.
 
-    The first command of each asset runs alone (it warms the shared option
-    chain / index caches), the rest run on a small thread pool. When
-    ``merge_into`` is provided (typically ``st.session_state.mcm_all_results``),
-    each finished command is written back immediately so a mid-run failure
-    still leaves partial results in session_state. Errors from
-    ``run_command`` are returned as text on the tile (not swallowed); any
-    that look like hard failures are listed after the sweep.
+    Phase 1 runs each asset's first command (vol_run: it warms that asset's
+    option chain / index / vol-surface caches) -- one per asset, in parallel.
+    Phase 2 runs every remaining (asset, command) on one shared pool. The old
+    loop ran assets one after another and drained the pool after each, so
+    Load all sat behind each asset's slowest tile (block trades / funding)
+    four times over. When ``merge_into`` is provided (typically
+    ``st.session_state.mcm_all_results``), each finished command is written
+    back immediately so a mid-run failure still leaves partial results in
+    session_state. Errors from ``run_command`` are returned as text on the
+    tile (not swallowed); any that look like hard failures are listed after
+    the sweep.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     results = merge_into if merge_into is not None else {}
-    n_cmds = max(1, len(cmd_names))
-    total = max(1, len(assets) * n_cmds)
+    cmd_names = list(cmd_names)
+    total = max(1, len(assets) * len(cmd_names))
     bar = st.progress(0.0, text="Starting…")
     status = st.empty()
     done = 0
     hard_errors: list[str] = []
     theme = _chart_theme()
+    dte_map = st.session_state.setdefault("mcm_results_dte", {})
 
-    def _record(a, cn, out, i_cmd):
+    def _record(a, cn, out):
         nonlocal done
         fig, df, text = out
         results[(a, cn)] = (fig, df, text)
+        if cn in cmdreg.EXPIRY_COMMANDS:
+            dte_map[(a, cn)] = int(target_days)
         if merge_into is not None:
             st.session_state.mcm_all_results = results
             st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
@@ -516,25 +569,27 @@ def run_reports(assets: list[str], cmd_names: list[str], target_days: int,
         if text and nfigs == 0 and not has_table:
             hard_errors.append(f"{a} /{cn}: {text}")
         done += 1
-        status.caption(f"**{a}** {i_cmd}/{n_cmds} — /{cn}")
-        bar.progress(done / total, text=f"{a} {i_cmd}/{n_cmds}")
+        status.caption(f"**{a}** /{cn} — {done}/{total}")
+        bar.progress(done / total, text=f"{done}/{total}")
 
-    for a in assets:
-        if not cmd_names:
-            continue
-        first, rest = cmd_names[0], list(cmd_names[1:])
-        status.caption(f"**{a}** 1/{n_cmds} — /{first}")
-        _record(a, first, _run_one(a, first, target_days, theme), 1)
-        if rest:
-            with ThreadPoolExecutor(max_workers=RUN_WORKERS) as pool:
-                futs = {pool.submit(_run_one, a, cn, target_days, theme): cn for cn in rest}
-                for k, fut in enumerate(as_completed(futs), start=2):
-                    cn = futs[fut]
-                    try:
-                        out = fut.result()
-                    except Exception as exc:  # run_command already catches; belt and braces
-                        out = (None, None, f"/{cn} failed: {cmdreg.short_error(exc)}")
-                    _record(a, cn, out, k)
+    def _drain(jobs):
+        if not jobs:
+            return
+        with ThreadPoolExecutor(max_workers=RUN_WORKERS) as pool:
+            futs = {pool.submit(_run_one, a, cn, target_days, theme): (a, cn)
+                    for a, cn in jobs}
+            for fut in as_completed(futs):
+                a, cn = futs[fut]
+                try:
+                    out = fut.result()
+                except Exception as exc:  # run_command already catches; belt and braces
+                    out = (None, None, f"/{cn} failed: {cmdreg.short_error(exc)}")
+                _record(a, cn, out)
+
+    if cmd_names:
+        status.caption(f"Warming caches: /{cmd_names[0]} for {', '.join(assets)}…")
+        _drain([(a, cmd_names[0]) for a in assets])
+        _drain([(a, cn) for a in assets for cn in cmd_names[1:]])
     bar.empty()
     status.empty()
     if hard_errors:
@@ -846,6 +901,17 @@ for ia, a in enumerate(ASSETS):
                 st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
             st.rerun()
 
+        # Default expiry changed since these tiles were built: rebuild just the
+        # 6 expiry-driven ones for the asset on screen (previously they kept
+        # showing the old expiry until a full re-run).
+        _stale = _stale_expiry_commands(a, results)
+        if _stale:
+            with st.spinner(f"Updating {a} expiry charts for "
+                            f"{st.session_state.get('mcm_dte_days', 30)} DTE…"):
+                run_reports([a], _stale, st.session_state.get("mcm_dte_days", 30),
+                            merge_into=results)
+                st.session_state.mcm_all_results = results
+
         order_a = [(x, cn) for x, cn in MCM_ORDER if x == a]
         n_a = len(order_a)
         i = 0
@@ -960,6 +1026,7 @@ if _view == _VIEW_SINGLE:
         st.session_state.mcm_fig = fig
         st.session_state.mcm_df = df
         st.session_state.mcm_text = text
+        st.session_state.mcm_single_meta = (asset, cmd_name)
         if text and fig is None and (df is None or getattr(df, "empty", True)):
             st.warning(text)
 
@@ -975,7 +1042,10 @@ if _view == _VIEW_SINGLE:
     send_tg_btn = st.button("Send to Telegram", key="mcm_send_tg",
                             disabled=not (_has_output and telegram.is_configured()))
     if send_tg_btn and _has_output:
-        _ok, _reasons = send_result_to_telegram(asset, cmd_name, _fig, _df, _text)
+        # Caption with the asset/command that produced the result, not
+        # whatever the selectboxes were changed to after clicking Run.
+        _sa, _sc = st.session_state.mcm_single_meta or (asset, cmd_name)
+        _ok, _reasons = send_result_to_telegram(_sa, _sc, _fig, _df, _text)
         if _ok:
             st.success("Sent to Telegram."
                        + (f" ({len(_reasons)} piece(s) had trouble — see below.)"

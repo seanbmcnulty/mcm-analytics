@@ -30,6 +30,25 @@ _MIN_INTERVAL = 0.1  # 10 req/s
 _cache: dict[str, tuple[float, Any]] = {}
 _cache_lock = threading.Lock()
 
+# Single-flight: when several worker threads miss the cache on the same key at
+# once (the MCM Bot page runs commands 4-wide), only the first one hits the
+# network; the rest wait for its result instead of firing duplicate requests.
+_inflight: dict[str, threading.Event] = {}
+_inflight_lock = threading.Lock()
+
+# One keep-alive HTTPS session per thread. A bare requests.get() opens a new
+# TCP + TLS connection (and rebuilds the SSL context) on every call, which
+# measured ~340 ms/call to Deribit vs ~175 ms on a reused connection.
+_tls = threading.local()
+
+
+def _session() -> requests.Session:
+    s = getattr(_tls, "session", None)
+    if s is None:
+        s = requests.Session()
+        _tls.session = s
+    return s
+
 DEFAULT_TIMEOUT = 15  # seconds
 # Backoff between attempts (3 attempts total -> waits 2s, then 5s; a third
 # entry is used if retries is raised above 3).
@@ -112,12 +131,36 @@ def _request(endpoint: str, params: dict | None = None, ttl: float = 60.0,
     if cached is not None:
         return cached
 
+    with _inflight_lock:
+        event = _inflight.get(cache_key)
+        leader = event is None
+        if leader:
+            event = threading.Event()
+            _inflight[cache_key] = event
+    if not leader:
+        # Another thread is already fetching this exact request.
+        event.wait(timeout=DEFAULT_TIMEOUT * retries + sum(RETRY_BACKOFF_S))
+        cached = _cache_get(cache_key, ttl)
+        if cached is not None:
+            return cached
+        # Leader failed or returned an uncacheable body: fetch ourselves.
+        return _fetch(url, params, cache_key, retries)
+    try:
+        return _fetch(url, params, cache_key, retries)
+    finally:
+        with _inflight_lock:
+            _inflight.pop(cache_key, None)
+        event.set()
+
+
+def _fetch(url: str, params: dict | None, cache_key: str, retries: int):
+    """Network part of ``_request``: rate limit, GET with retry, cache."""
     _rate_limit()
 
     for attempt in range(retries):
         retryable = False
         try:
-            resp = requests.get(url, params=params, timeout=DEFAULT_TIMEOUT)
+            resp = _session().get(url, params=params, timeout=DEFAULT_TIMEOUT)
             if resp.status_code == 200:
                 data = resp.json()
                 if "result" in data:
@@ -304,8 +347,14 @@ def get_funding_history(instrument_name: str,
 
 
 def get_ticker(instrument_name: str) -> dict | None:
-    """Get ticker data for an instrument (mark price, funding, OI, etc.)."""
-    return _request("get_ticker", {"instrument_name": instrument_name}, ttl=TTL_QUICK)
+    """Get ticker data for an instrument (mark price, funding, OI, etc.).
+
+    The public endpoint is ``public/ticker`` -- there is no ``get_ticker``
+    (Deribit answers HTTP 400 "Method not found"), which silently made every
+    caller see None: no PERPETUAL row in /basis_run, no PERP pill in the
+    /vol_run header, no funding delta on the Home page.
+    """
+    return _request("ticker", {"instrument_name": instrument_name}, ttl=TTL_QUICK)
 
 
 def get_expirations(currency: str, kind: str = "option") -> list[int] | None:
@@ -323,7 +372,18 @@ def get_expirations(currency: str, kind: str = "option") -> list[int] | None:
 # Higher-level helpers
 # ---------------------------------------------------------------------------
 
+_cache_gen = 0
+
+
+def cache_generation() -> int:
+    """Bumped by ``clear_cache`` so derived memos elsewhere can tell that a
+    "Clear data cache" / refresh happened and drop their own copies."""
+    return _cache_gen
+
+
 def clear_cache():
     """Clear the entire request cache."""
+    global _cache_gen
     with _cache_lock:
         _cache.clear()
+        _cache_gen += 1

@@ -269,6 +269,23 @@ def iv_by_dte_for_delta(asset: str, delta_key: str) -> dict[int, float]:
     return dict(vols.get(field, {})) if field else {}
 
 
+EXPIRY_HOUR_UTC = 8  # every Deribit expiry settles at 08:00 UTC
+
+
+def days_to_expiry(exp_date, now=None) -> float:
+    """Fractional days from ``now`` to 08:00 UTC on ``exp_date`` (may be <= 0)."""
+    now = now or datetime.now(timezone.utc)
+    exp = datetime(exp_date.year, exp_date.month, exp_date.day,
+                   EXPIRY_HOUR_UTC, tzinfo=timezone.utc)
+    return (exp - now).total_seconds() / 86400.0
+
+
+def frac_dte(dte: int, now=None) -> float:
+    """Fractional days left for a whole-day ``dte`` (calendar days to expiry date)."""
+    now = now or datetime.now(timezone.utc)
+    return days_to_expiry(now.date() + timedelta(days=int(dte)), now)
+
+
 def future_prices_by_dte(asset: str) -> dict[int, float]:
     """Mark price of each DATED future keyed by DTE (perpetual excluded)."""
     cfg = acfg(asset)

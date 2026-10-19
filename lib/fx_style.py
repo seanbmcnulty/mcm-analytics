@@ -247,8 +247,11 @@ def finalize(fig: go.Figure, note: str = None, legend_rows: int = 1,
                         f"color:#8a8a8a'>{note_html}</span>")
         # Title is pinned to the top of the *container* (not the plot area),
         # so it can never drift into the legend as the margin grows.
+        # pad.l: the page's chart card has no inner padding (padding there
+        # shifted the plot right and clipped its right edge), so inset the
+        # title slightly from the card border instead.
         fig.update_layout(title=dict(
-            text=base, x=0.0, xanchor="left", yref="container",
+            text=base, x=0.0, xanchor="left", yref="container", pad=dict(l=8),
             y=1.0 - 14.0 / float(getattr(fig.layout, "height", None) or 450),
             yanchor="top"))
 

@@ -9,6 +9,7 @@ own perpetual candles and funding history.
 from __future__ import annotations
 
 import math
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -69,25 +70,51 @@ def _future_instrument(asset: str, dte: int) -> str | None:
     return cands[0][0] if cands else None
 
 
+def _annualise(basis_dec: float, days_left: float) -> float:
+    """Compounded annualised basis in %, or NaN when it is undefined."""
+    base = 1.0 + float(basis_dec)
+    if days_left <= 0 or base <= 0:
+        return float("nan")
+    return (base ** (365.0 / days_left) - 1.0) * 100.0
+
+
+def _hourly_index(asset: str, days: int) -> pd.Series | None:
+    """Hourly index price (UTC, tz-aware) from the perp's funding history.
+
+    The funding feed carries the *index* at every hour, which is what the live
+    basis is measured against -- using the perp's candle close instead mixes in
+    the perp's own basis and makes history and current value incomparable.
+    """
+    cfg = surface.acfg(asset)
+    end_ms = int(time.time() * 1000)
+    fh = deribit.get_funding_history(cfg["perp"], end_ms - int(days) * 86400 * 1000, end_ms)
+    if fh is None or fh.empty or "index_price" not in fh:
+        return None
+    ser = fh.set_index(pd.to_datetime(fh["timestamp"], utc=True))["index_price"].astype(float)
+    ser = ser[~ser.index.duplicated()].sort_index()
+    return ser if len(ser) >= 2 else None
+
+
 def _basis_apr_history(asset: str, dte: int, days: int,
-                       perp_daily: pd.DataFrame | None = None) -> pd.Series | None:
+                       index_hourly: pd.Series | None = None,
+                       min_days_left: float = 1.0) -> pd.Series | None:
     """
     Annualised basis history for the dated future nearest ``dte``.
 
-    Computed as ``((1 + (F - S)/S) ** (365 / dte_at_bar) - 1) * 100`` from
-    Deribit candles, so the DTE decays through the series exactly as the real
-    instrument does.
+    Hourly future closes against the hourly index, annualised with the exact
+    fractional time left to the 08:00 UTC expiry -- the same definition as the
+    live number in ``cmd_basis_run``.  Bars with less than ``min_days_left``
+    left are dropped (annualising the last hours of a contract is pure noise).
     """
     instr = _future_instrument(asset, dte)
     if not instr:
         return None
-    cfg = surface.acfg(asset)
+    days = min(int(days), 200)  # keep hourly bars under the endpoint's 5000 cap
     end_ms = int(time.time() * 1000)
-    start_ms = end_ms - int(days * 24 * 3600 * 1000)
-    fut = deribit.get_tradingview_ohlc(instr, "1D", start_ms, end_ms)
-    perp = (perp_daily if perp_daily is not None
-            else deribit.get_tradingview_ohlc(cfg["perp"], "1D", start_ms, end_ms))
-    if fut is None or perp is None or fut.empty or perp.empty:
+    start_ms = end_ms - days * 86400 * 1000
+    fut = deribit.get_tradingview_ohlc(instr, "60", start_ms, end_ms)
+    idx_ser = index_hourly if index_hourly is not None else _hourly_index(asset, days)
+    if fut is None or idx_ser is None or fut.empty:
         return None
 
     parts = instr.split("-")
@@ -95,26 +122,22 @@ def _basis_apr_history(asset: str, dte: int, days: int,
     if exp is None:
         return None
 
-    fut = fut.set_index(pd.to_datetime(fut["timestamp"], utc=True))["close"]
-    perp = perp.set_index(pd.to_datetime(perp["timestamp"], utc=True))["close"]
-    idx = fut.index.intersection(perp.index)
-    if len(idx) < 2:
+    # A bar stamped t covers [t, t+1h); its close is compared with the index
+    # printed at t+1h, and the time left is measured at that same instant.
+    close = fut.set_index(pd.to_datetime(fut["timestamp"], utc=True))["close"].astype(float)
+    close.index = close.index + pd.Timedelta(hours=1)
+    both = pd.concat([close.rename("f"), idx_ser.rename("s")], axis=1, join="inner")
+    both = both[both["s"] > 0]
+    if len(both) < 2:
         return None
-    f, s = fut.reindex(idx), perp.reindex(idx)
-    basis_dec = (f - s) / s.replace(0, np.nan)
-    out = {}
-    for ts, bd in basis_dec.items():
-        if not _finite(bd):
-            continue
-        d = (exp - ts.date()).days
-        if d <= 0:
-            continue
-        base = 1.0 + float(bd)
-        if base <= 0:
-            continue
-        out[ts] = (base ** (365.0 / d) - 1.0) * 100.0
-    s_out = pd.Series(out).sort_index()
-    return s_out if len(s_out) >= 2 else None
+    exp_ts = pd.Timestamp(exp.year, exp.month, exp.day,
+                          surface.EXPIRY_HOUR_UTC, tz="UTC")
+    left = (exp_ts - both.index).total_seconds() / 86400.0
+    basis = both["f"] / both["s"] - 1.0
+    vals = [_annualise(b, d) if d >= min_days_left else float("nan")
+            for b, d in zip(basis.values, left)]
+    out = pd.Series(vals, index=both.index).dropna().sort_index()
+    return out if len(out) >= 2 else None
 
 
 def cmd_basis_run(asset: str, lookback_days: int = 90, **kwargs):
@@ -126,11 +149,10 @@ def cmd_basis_run(asset: str, lookback_days: int = 90, **kwargs):
     perp = surface.perp_mark(asset)
     futures = surface.future_prices_by_dte(asset)
 
-    today = _now().date()
-    # One perp daily-candle fetch shared by every future's basis history.
-    _end = int(time.time() * 1000)
-    perp_daily = deribit.get_tradingview_ohlc(
-        cfg["perp"], "1D", _end - int(int(lookback_days) * 86400 * 1000), _end)
+    now = _now()
+    today = now.date()
+    # One hourly-index fetch shared by every future's basis history.
+    index_hourly = _hourly_index(asset, min(int(lookback_days), 200))
     rows = []
     if perp is not None:
         rows.append({
@@ -142,12 +164,17 @@ def cmd_basis_run(asset: str, lookback_days: int = 90, **kwargs):
         })
 
     for dte in sorted(futures):
-        if dte <= 0:
+        days_left = surface.frac_dte(dte, now)
+        if days_left <= 0:
             continue
         fut = futures[dte]
         basis_dec = (fut - spot) / spot
-        apr = ((1.0 + basis_dec) ** (365.0 / dte) - 1.0) * 100.0
-        hist = _basis_apr_history(asset, dte, int(lookback_days), perp_daily=perp_daily)
+        apr = _annualise(basis_dec, days_left)
+        if not _finite(apr):
+            continue
+        hist = _basis_apr_history(asset, dte, int(lookback_days),
+                                  index_hourly=index_hourly,
+                                  min_days_left=min(1.0, days_left))
         lo = hi = pct = np.nan
         if hist is not None and len(hist) >= 2:
             lo, hi = float(hist.min()), float(hist.max())
@@ -310,20 +337,15 @@ def cmd_plot_funding_rates(asset: str, days: int = 30, **kwargs):
     """Deribit perpetual funding history, annualised to APR."""
     cfg = surface.acfg(asset)
     end_ms = int(time.time() * 1000)
-    frames = []
-    # The endpoint caps the window, so walk it in ~7-day chunks.
-    chunk_ms = 7 * 24 * 3600 * 1000
-    cursor = end_ms - int(days * 24 * 3600 * 1000)
-    while cursor < end_ms:
-        stop = min(cursor + chunk_ms, end_ms)
-        df = deribit.get_funding_history(cfg["perp"], start_ms=cursor, end_ms=stop)
-        if df is not None and not df.empty:
-            frames.append(df)
-        cursor = stop
-    if not frames:
+    # get_funding_history already pages the endpoint's ~31-day cap in 30-day
+    # chunks; walking it here in 7-day pieces as well cost 5 sequential
+    # requests per asset for what one request returns (720 hourly rows).
+    df = deribit.get_funding_history(
+        cfg["perp"], start_ms=end_ms - int(days * 24 * 3600 * 1000), end_ms=end_ms)
+    if df is None or df.empty:
         return None, None, "No funding rate data from Deribit."
 
-    df = pd.concat(frames, ignore_index=True)
+    df = df.copy()
     if "timestamp" not in df.columns:
         return None, None, "No funding rate data from Deribit."
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -360,8 +382,39 @@ def cmd_plot_funding_rates(asset: str, days: int = 30, **kwargs):
 # Block trades
 # ===========================================================================
 
+# SOL and HYPE options both live on the USDC book, so their block summaries
+# page through the very same 24h USDC trade tape. Keep the last tape per
+# currency briefly and serve any window it covers from memory.
+_TRADES_MEMO: dict[str, tuple[float, int, int, int, list[dict]]] = {}
+_TRADES_MEMO_TTL = 60.0
+_TRADES_LOCKS: dict[str, threading.Lock] = {}
+_TRADES_LOCKS_GUARD = threading.Lock()
+
+
 def _fetch_trades_paginated(currency: str, start_ms: int, end_ms: int,
                             max_pages: int = 25) -> list[dict]:
+    # Per-currency lock so two assets on the same book (run concurrently)
+    # page the tape once: the second caller waits, then reads the memo.
+    with _TRADES_LOCKS_GUARD:
+        lock = _TRADES_LOCKS.setdefault(currency, threading.Lock())
+    with lock:
+        hit = _TRADES_MEMO.get(currency)
+        if hit is not None:
+            fetched_at, gen, lo, _hi, tape = hit
+            if (gen == deribit.cache_generation()
+                    and (time.time() - fetched_at) < _TRADES_MEMO_TTL
+                    and lo <= start_ms):
+                return [t for t in tape
+                        if start_ms <= int(t.get("timestamp") or 0) <= end_ms]
+        trades = _fetch_trades_pages(currency, start_ms, end_ms, max_pages)
+        if trades:
+            _TRADES_MEMO[currency] = (time.time(), deribit.cache_generation(),
+                                      start_ms, end_ms, trades)
+        return trades
+
+
+def _fetch_trades_pages(currency: str, start_ms: int, end_ms: int,
+                        max_pages: int = 25) -> list[dict]:
     trades: list[dict] = []
     cursor = start_ms
     for _ in range(max_pages):

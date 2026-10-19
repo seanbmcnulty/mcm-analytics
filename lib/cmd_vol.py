@@ -293,8 +293,26 @@ def cmd_butterfly_term_structure(asset: str, **kwargs):
 # 3. Vol surface (smile) figure — shared by vol_run and vol_smile
 # ===========================================================================
 
-def build_vol_surface_figure(asset: str, dte: int) -> go.Figure | None:
-    """Smile for one expiry: current + lagged snapshots + high/low cloud."""
+def _smile_history(asset: str) -> tuple[dict[str, pd.DataFrame], bool]:
+    """35-day surface history per delta bucket (shared by every expiry's smile)."""
+    hist_maps: dict[str, pd.DataFrame] = {}
+    estimated = True
+    for key in surface.DELTA_KEYS:
+        f, est, _src = history.surface_history(asset, key, days=35)
+        if f is not None and not f.empty:
+            hist_maps[key] = f
+            estimated = est
+    return hist_maps, estimated
+
+
+def build_vol_surface_figure(asset: str, dte: int,
+                             smile_hist: tuple[dict, bool] | None = None) -> go.Figure | None:
+    """Smile for one expiry: current + lagged snapshots + high/low cloud.
+
+    ``smile_hist`` is ``_smile_history(asset)``; /vol_run builds ~11 of these
+    figures and passes it in once instead of each one re-deriving the same
+    7 history frames.
+    """
     now = _now()
     cur = surface.current_smile(asset, int(dte))
     if len(cur) < 3:
@@ -304,13 +322,7 @@ def build_vol_surface_figure(asset: str, dte: int) -> go.Figure | None:
     snaps: dict[str, dict[int, float]] = {"Current": cur}
 
     # Historical smiles, re-levelled per delta bucket.
-    hist_maps: dict[str, pd.DataFrame] = {}
-    estimated = True
-    for key in surface.DELTA_KEYS:
-        f, est, _src = history.surface_history(asset, key, days=35)
-        if f is not None and not f.empty:
-            hist_maps[key] = f
-            estimated = est
+    hist_maps, estimated = smile_hist if smile_hist is not None else _smile_history(asset)
 
     cloud: dict[int, tuple[float, float]] = {}
     cloud_days = 0
@@ -500,7 +512,7 @@ def cmd_vol_run(asset: str, **kwargs):
             continue
         iv_pct = iv_dec * 100.0
         daily_move = iv_dec * sqrt(1.0 / 365.0) * 100
-        be_move = iv_dec * sqrt(max(dte, 0) / 365.0) * 100
+        be_move = iv_dec * sqrt(max(surface.frac_dte(dte, now), 0.0) / 365.0) * 100
 
         v3 = surface.interp_at_dte(map_3h, float(dte)) if map_3h else float("nan")
         vo = surface.interp_at_dte(map_open, float(dte)) if map_open else float("nan")
@@ -562,8 +574,9 @@ def cmd_vol_run(asset: str, **kwargs):
     header = "      ".join(groups)
 
     figs = []
+    smile_hist = _smile_history(asset)
     for dte in sorted({int(d) for d in df["DTE"].tolist()}):
-        f = build_vol_surface_figure(asset, dte)
+        f = build_vol_surface_figure(asset, dte, smile_hist)
         if f is not None:
             figs.append(f)
 
@@ -966,12 +979,17 @@ def cmd_atm_iv_box_plot(asset: str, lookback_days: int = 90, **kwargs):
               "<span style='color:#1E4D7A'>─</span> median   "
               "<span style='color:#C62828'>◆</span> current IV"))
     if estimated:
-        fig.add_annotation(x=0.5, y=-0.28, xref="paper", yref="paper",
+        fig.add_annotation(x=0.5, y=0, xref="paper", yref="paper", yanchor="top",
+                           yshift=-80,
                            showarrow=False, font=dict(size=10, color=GREY),
                            text=f"Distribution reconstructed from {src}; "
                                 "Deribit publishes no historical option IV.")
     for i, lbl in enumerate(labels):
-        fig.add_annotation(x=lbl, xref="x", y=-0.045, yref="paper", yanchor="top",
+        # Pixel offset below the axis, not a paper fraction: -0.045 of a
+        # ~235 px plot area is ~10 px, which drew the sigma line on top of
+        # the 13 px tenor tick labels (garbled "1W"/"2W" in the Auto theme).
+        fig.add_annotation(x=lbl, xref="x", y=0, yref="paper", yanchor="top",
+                           yshift=-28,
                            showarrow=False, font=dict(size=9, color="#555"),
                            text=f"σ {stds[i]:.1f}<br>IQR {iqrs[i]:.1f}<br>"
                                 f"<b>P{pcts[i]:.0f}</b>")
