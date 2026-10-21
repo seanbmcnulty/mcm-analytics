@@ -171,6 +171,7 @@ page_info = [
     ("08 Spot-Vol Correlation", "DVOL vs spot analysis (BTC/ETH; SOL/HYPE on RV-scaled vol)"),
     ("10 Macro Event Impact", "CPI/FOMC/NFP surprise z-scores + price reactions"),
     ("11 Fear & Greed Signal", "Contrarian delta-lean backtest vs alternative.me Fear & Greed Index"),
+    ("12 IBIT", "IBIT (iShares Bitcoin ETF) options vs Deribit BTC: vol surface, skew, OI, gamma, implied distribution (Cboe delayed chain)"),
 ]
 
 grid_cols = st.columns(3)

@@ -24,6 +24,7 @@ The app will open at `http://localhost:8020`.
 | 7 | **Regime Identifier** | Vol regime classification (GARCH + implied vol) |
 | 8 | **Spot-Vol Correlation** | DVOL vs spot price analysis (BTC/ETH) |
 | 10 | **Macro Event Impact** | CPI/FOMC/NFP surprise z-scores + price reactions |
+| 12 | **IBIT** | IBIT (iShares Bitcoin ETF) options vs Deribit BTC options: vol surface, skew, term structure, OI, gamma/max pain, implied distribution. Free Cboe delayed chain snapshot (no trade tape) |
 
 ## Asset Universe
 
