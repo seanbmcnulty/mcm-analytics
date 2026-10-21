@@ -20,6 +20,9 @@ The app will open at `http://localhost:8020`.
 |---|------|-------------|
 | 1 | **MCM Bot** | Full markets bot: vol surface, term structure, skew, trade flow, RV |
 | 2 | **Block Trades** | Deribit block trade analysis with Greeks and Telegram reporting |
+| 3 | **Block Trades — Derive** | Derive RFQ block flow |
+| 4 | **Block Trades — Paradex** | Paradex BLOCK_TRADE tape |
+| 5 | **Block Trades — OKX / Bybit / Bullish / Binance** | OKX RFQ block tape, Bybit `isBlockTrade` prints (latest 1,000 trades per coin only; geo-blocks some regions), Bullish BTC options (no block flag; shows every print above a minimum size), Binance `blockTrades` tape |
 | 6 | **Realized Vol** | Multi-estimator RV matrix (BTC/ETH/SOL/HYPE) |
 | 7 | **Regime Identifier** | Vol regime classification (GARCH + implied vol) |
 | 8 | **Spot-Vol Correlation** | DVOL vs spot price analysis (BTC/ETH) |

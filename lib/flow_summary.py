@@ -1,15 +1,18 @@
 """
-Cross-exchange option-block-flow summary (Deribit, Derive, Paradex) for the Home page.
+Cross-exchange option-block-flow summary (Deribit, Derive, Paradex, OKX, Bybit, Bullish, Binance) for the Home page.
 
-* Derive / Paradex frames come straight from ``lib.derive`` / ``lib.paradex``
-  (``fetch_all``), which already return block trades in the shared schema.
+* Derive / Paradex / OKX / Bybit / Binance frames come straight from ``lib.derive`` / ``lib.paradex`` /
+  ``lib.okx`` / ``lib.bybit`` / ``lib.binance`` (``fetch_all``), which already return block trades in the shared schema.
+* Bullish has no block flag either, so its frames hold every option trade and ``collect`` keeps only those at/above
+  ``lib.bullish.DEFAULT_MIN_SIZES`` (the exchange minimum order, i.e. all prints) (every venue's ``default_min_sizes`` is applied the same way; it is empty,
+  i.e. a no-op, for the others).
 * Deribit has no block flag on its public trades feed, so — exactly like
   ``pages/02_Block_Trades_-_Deribit.py`` — a "block" is a trade at or above a per-asset
   minimum size (``DERIBIT_MIN_SIZES``; keep in sync with that page's
   ``DEFAULT_MIN_SIZES``).  Coin-margined BTC/ETH prices are converted to USD with each
   trade's index price so every venue is on the same USD footing.
 
-``collect()`` gathers all three venues in parallel; ``summarize()`` turns the result
+``collect()`` gathers all seven venues in parallel; ``summarize()`` turns the result
 into a per-venue table and a per-underlying table.
 """
 
@@ -22,7 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from lib import block_flow, deribit, derive, paradex
+from lib import binance, block_flow, bullish, bybit, deribit, derive, okx, paradex
 from lib.constants import TTL_MEDIUM
 
 SGT = timezone(timedelta(hours=8))
@@ -38,6 +41,8 @@ DERIBIT_EXTRA_MIN_SIZES: Dict[str, float] = {
     k: v for k, v in DERIBIT_MIN_SIZES.items() if k in ("BTC_USDC", "ETH_USDC", "TRX_USDC")}
 _CURRENCY = {a: ("USDC" if a.endswith("_USDC") else a) for a in DERIBIT_MIN_SIZES}
 _COIN_MARGINED = {"BTC", "ETH"}
+VENUE_ORDER = ["Deribit", "Derive", "Paradex", "OKX", "Bybit", "Bullish", "Binance"]
+_NO_MARK = {"Paradex", "Bullish", "Binance"}   # tapes with no mark price -> no Edge / Aggression
 
 
 def _deribit_currency_trades(currency: str, start_ms: int, end_ms: int, max_pages: int = 20):
@@ -110,17 +115,37 @@ def deribit_blocks(start_ms: int, end_ms: int,
     return {"frames": frames, "meta": {"listed": list(min_sizes), "truncated": truncated}}
 
 
+def _venue_blocks(venue, start_ms: int, end_ms: int) -> Dict:
+    """``venue.fetch_all`` with the venue's default minimum block sizes applied (a no-op where empty)."""
+    p = venue.fetch_all(start_ms, end_ms, list(venue.assets))
+    mins = venue.default_min_sizes
+    if mins:
+        for a, df in p["frames"].items():
+            if df is not None and not df.empty and mins.get(a):
+                p["frames"][a] = df[df["abs_amount"] >= mins[a]].reset_index(drop=True)
+    meta = p["meta"]
+    if venue is bybit.VENUE:
+        meta["home_note"] = bybit.feed_status(meta)
+    elif meta.get("truncated"):
+        meta["home_note"] = "window exceeded the page-fetch cap — figures are a lower bound"
+    return p
+
+
 def collect(start_ms: int) -> Dict[str, Dict]:
-    """Fetch all three venues in parallel -> {venue_title: {'frames', 'meta'}}.
+    """Fetch all seven venues in parallel -> {venue_title: {'frames', 'meta'}}.
     A venue that errors comes back as {'error': str}."""
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     jobs = {
         "Deribit": lambda: deribit_blocks(start_ms, end_ms),
-        "Derive": lambda: derive.fetch_all(start_ms, end_ms, list(derive.VENUE.assets)),
-        "Paradex": lambda: paradex.fetch_all(start_ms, end_ms, list(paradex.VENUE.assets)),
+        "Derive": lambda: _venue_blocks(derive.VENUE, start_ms, end_ms),
+        "Paradex": lambda: _venue_blocks(paradex.VENUE, start_ms, end_ms),
+        "OKX": lambda: _venue_blocks(okx.VENUE, start_ms, end_ms),
+        "Bybit": lambda: _venue_blocks(bybit.VENUE, start_ms, end_ms),
+        "Bullish": lambda: _venue_blocks(bullish.VENUE, start_ms, end_ms),
+        "Binance": lambda: _venue_blocks(binance.VENUE, start_ms, end_ms),
     }
     out: Dict[str, Dict] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
         futs = {k: ex.submit(fn) for k, fn in jobs.items()}
         for k, f in futs.items():
             try:
@@ -169,12 +194,14 @@ def summarize(payloads: Dict[str, Dict]) -> Tuple[pd.DataFrame, pd.DataFrame, Di
         if "error" in p:
             notes[venue] = f"fetch failed: {p['error']}"
             continue
-        has_mark = venue != "Paradex"
+        has_mark = venue not in _NO_MARK
         for asset, df in p["frames"].items():
             r = _asset_row(venue, asset, df, has_mark)
             if r:
                 rows.append(r)
-        if p["meta"].get("truncated"):
+        if p["meta"].get("home_note"):
+            notes[venue] = p["meta"]["home_note"]
+        elif p["meta"].get("truncated"):
             notes[venue] = ("window exceeded the 20k-trade fetch cap for " +
                             ", ".join(p["meta"]["truncated"]) + " — figures are a lower bound")
     by_asset = pd.DataFrame(rows)
@@ -195,7 +222,7 @@ def summarize(payloads: Dict[str, Dict]) -> Tuple[pd.DataFrame, pd.DataFrame, Di
         })
 
     by_venue = by_asset.groupby("Exchange").apply(agg, include_groups=False).reset_index()
-    order = {"Deribit": 0, "Derive": 1, "Paradex": 2}
+    order = {v: i for i, v in enumerate(VENUE_ORDER)}
     by_venue = by_venue.sort_values("Exchange", key=lambda s: s.map(order)).reset_index(drop=True)
     by_asset = by_asset.sort_values(["Exchange", "Gross premium $"], ascending=[True, False]).reset_index(drop=True)
     return by_venue, by_asset, notes

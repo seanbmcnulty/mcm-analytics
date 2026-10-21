@@ -159,7 +159,13 @@ st.subheader("Pages")
 
 page_info = [
     ("01 MCM Bot", f"Full markets bot: {len(cmdreg.COMMAND_NAMES)} commands — vol/skew term structure, forward vols, carry, basis, flow, RV"),
-    ("02 Block Trades", "Deribit block trade analysis with Greeks and Telegram reporting"),
+    ("02 Block Trades — Deribit", "Deribit block trade analysis with Greeks and Telegram reporting"),
+    ("03 Block Trades — Derive", "Derive RFQ block flow (BTC/ETH/SOL/HYPE)"),
+    ("04 Block Trades — Paradex", "Paradex BLOCK_TRADE tape (BTC/ETH/SOL/HYPE)"),
+    ("05 Block Trades — OKX", "OKX RFQ block tape (BTC/ETH/SOL/XAU), coin-margined prices converted to USD"),
+    ("05 Block Trades — Bybit", "Bybit isBlockTrade option prints; public feed only reaches back the latest 1,000 trades per coin"),
+    ("05 Block Trades — Bullish", "Bullish BTC option tape (no block flag); every print at/above a minimum size"),
+    ("05 Block Trades — Binance", "Binance Options blockTrades tape (BTC/ETH/SOL/BNB + others), USDT-settled"),
     ("06 Time Based Realized Vol", "RV across hedging frequencies + lookbacks (BTC/ETH/SOL/HYPE perps), 7 estimators, decision matrix"),
     ("07 Regime Identifier", "Vol regime classification (GARCH + implied vol)"),
     ("08 Spot-Vol Correlation", "DVOL vs spot analysis (BTC/ETH; SOL/HYPE on RV-scaled vol)"),
@@ -175,12 +181,12 @@ for i, (name, desc) in enumerate(page_info):
 
 
 # ---------------------------------------------------------------------------
-# Cross-exchange option block flow (Deribit / Derive / Paradex)
+# Cross-exchange option block flow (Deribit / Derive / Paradex / OKX / Bybit / Bullish / Binance)
 # ---------------------------------------------------------------------------
-# Placed last so everything above renders before the (slower) three-venue fetch.
+# Placed last so everything above renders before the (slower) seven-venue fetch.
 
 st.divider()
-st.subheader("Option Block Flow — Deribit vs Derive vs Paradex")
+st.subheader("Option Block Flow — Deribit vs Derive vs Paradex vs OKX vs Bybit vs Bullish vs Binance")
 
 from datetime import timedelta
 
@@ -202,7 +208,7 @@ _hours = 12 if _win == "Last 12 Hours" else 24
 _start_ms = int((datetime.now(timezone.utc) - timedelta(hours=_hours))
                 .replace(second=0, microsecond=0).timestamp() * 1000)
 
-with st.spinner("Loading block flow from Deribit, Derive and Paradex..."):
+with st.spinner("Loading block flow from Deribit, Derive, Paradex, OKX, Bybit, Bullish and Binance..."):
     _by_venue, _by_asset, _notes = flow_summary.summarize(_flow_payloads(_start_ms))
 
 if _by_venue.empty:
@@ -240,7 +246,10 @@ else:
     st.caption(
         "Block definitions differ by venue: Deribit = trades at/above the per-asset minimum size used on the "
         "Block Trades — Deribit page (its public feed has no block flag); Derive = RFQ fills (quote_id/rfq_id "
-        "present); Paradex = trade_type BLOCK_TRADE. Premium is USD (coin-margined Deribit BTC/ETH converted at "
+        "present); Paradex = trade_type BLOCK_TRADE; OKX = RFQ block tape (rfq/public-trades); Bybit = "
+        "isBlockTrade prints (its feed only reaches back the latest 1,000 trades per coin); Bullish = no block flag, "
+        "so every print at/above its 0.0005 BTC minimum order; Binance = blockTrades tape (side assumed to be the taker's). "
+        "Venue minimum sizes are each exchange's minimum order. Premium is USD (coin-margined Deribit and OKX BTC/ETH converted at "
         "each trade's index). Call %, Taker-buy % are premium-weighted; Net delta/vega are dollar Greeks at "
         "execution, signed from the taker's side (buy +, sell -), using each trade's own IV. "
         "Greeks cover = share of premium with an index price to compute them."

@@ -293,6 +293,36 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-10-21 — Block Trades pages for OKX, Bybit, Bullish, Binance (+ Home grid and seven-venue flow summary)
+
+Four new venues on the shared `lib/block_flow.render_page` renderer, same pattern as Derive/Paradex:
+`lib/okx.py`, `lib/bybit.py`, `lib/bullish.py`, `lib/binance.py` + thin `pages/05_Block_Trades_-_{OKX,Bybit,Bullish,Binance}.py`
+(all share prefix 05 so they sit together; Streamlit tie-breaks by label, so the sidebar order is
+Binance, Bullish, Bybit, OKX). Default min sizes = each exchange's minimum order (OKX 1 contract, Bybit minOrderQty
+per coin, Bullish 0.0005 BTC, Binance 0.01), so the quiet venues show every print. `lib/flow_summary.py` now collects seven venues (`VENUE_ORDER`, `_NO_MARK`) and applies each
+venue's `default_min_sizes`; Home.py lists all block pages and the summary covers all six. Endpoints and
+gotchas (all public, no auth; each is documented in the module docstring):
+- **OKX** `GET /api/v5/rfq/public-trades` is the real block tape (leg `side` = taker, published ~15 min late,
+  `endId` pagination, 5 req/2 s). Options are coin-margined with sizes in contracts: price_usd = px x idxPx,
+  units = sz x ctVal x ctMult (BTC 0.01, ETH 0.1, SOL 0.1, XAU 0.01; `public/instruments` needs `uly=`, `instFamily`
+  is rejected for SOL/XAU). There is also a linear USD-settled `_UM` family (`ETH-USD_UM-…`, px already USD, ETH
+  ctMult 0.01 vs 0.1 for the coin-margined ETH-USD) — contract size/linearity is read per family, never per
+  underlying. Mark/IV/index come from joining `public/block-trades?instId=` on `tradeId`.
+- **Bybit** `GET /v5/market/recent-trade?category=option` has `isBlockTrade`, mark/index/IV, but NO time or cursor
+  parameter: only the latest 1,000 trades per coin (BTC ~35 min, ETH ~1 h). Blocks are accumulated in a
+  process-wide dict so history grows while the app stays up. **Bybit geo-blocks US IPs at CloudFront (403), which
+  likely includes Streamlit Community Cloud** — the page then shows an error naming `BYBIT_API_BASE` (env var or
+  `[bybit] api_base` secret) as the override. `/v5/rfq/public-trades` needs an API key, so it is not usable.
+- **Bullish** `GET /trading-api/v1/history/option-trades` (BTC options only). No block flag, so a block is a trade
+  >= `DEFAULT_MIN_SIZES` (0.0005 BTC = every print; raise it in the sidebar, >= 2 BTC is ~12/day). Server rejects ranges > 3 days, so fetches are
+  chunked at 2.9 days; old pages can take 10-30 s. No mark/IV: backed out of price vs BTCUSDC candles.
+- **Binance** `GET eapi.binance.com/eapi/v1/blockTrades?limit=500` (exchange-wide, newest 500, no time/cursor; ~53 days
+  deep today). `side` (-1/1) is undocumented there — treated as the taker side, unverified. No mark/IV; index from
+  `fapi.binance.com/fapi/v1/indexPriceKlines`. Region-blocks US IPs (451): override with `BINANCE_EAPI_BASE` /
+  `BINANCE_FAPI_BASE` (env or `[binance]` secrets).
+Tests: `tests/test_block_flow.py` (offline). Smoke-tested all three pages with `streamlit.testing.v1.AppTest`
+against the live APIs. Local only — push via `push_to_github.bat`.
+
 ### 2026-09-08 — Desk-speed core preset, pipeline timeout, Telegram/caption tests, Block Trades via lib.deribit
 
 Nine small UX/reliability items (pending Macro dirty files left alone):
