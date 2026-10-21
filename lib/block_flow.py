@@ -1,7 +1,7 @@
 """
 Shared block-trade analytics + Streamlit page renderer for non-Deribit venues.
 
-``pages/03_Block_Trades_-_Derive.py`` and ``pages/04_Block_Trades_-_Paradex.py``
+``pages/02_Block_Trades_-_Derive.py`` and ``pages/02_Block_Trades_-_Paradex.py``
 are thin wrappers around :func:`render_page`.  The layout, charts and Telegram
 sending mirror ``pages/02_Block_Trades_-_Deribit.py``; that page is left
 untouched.

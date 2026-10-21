@@ -1,7 +1,7 @@
 """
 OKX public REST client — block-trade tape for options (BTC, ETH, SOL, XAU).
 
-No auth needed.  Used by ``pages/05_Block_Trades_-_OKX.py`` via
+No auth needed.  Used by ``pages/02_Block_Trades_-_OKX.py`` via
 ``lib.block_flow.render_page(okx.VENUE)``.
 
 Public endpoints used (all GET ``https://www.okx.com/api/v5/...``, no auth):

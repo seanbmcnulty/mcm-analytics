@@ -4,7 +4,7 @@ Derive (derive.xyz, formerly Lyra) public REST client — block/RFQ option trade
 No auth needed: every call here is a ``POST https://api.derive.xyz/v3/public/<method>``
 with a JSON body (the v3 API).  NOTE: the legacy v2 host ``api.lyra.finance`` is still
 up but its trade history is frozen/stale (checked 2026-10-10: ~80h behind), so it must
-not be used.  Used by ``pages/03_Block_Trades_-_Derive.py`` via
+not be used.  Used by ``pages/02_Block_Trades_-_Derive.py`` via
 ``lib.block_flow.render_page(derive.VENUE)``.
 
 Block definition

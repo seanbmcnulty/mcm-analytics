@@ -296,9 +296,9 @@ nothing here persists otherwise.
 ### 2026-10-21 — Block Trades pages for OKX, Bybit, Bullish, Binance (+ Home grid and seven-venue flow summary)
 
 Four new venues on the shared `lib/block_flow.render_page` renderer, same pattern as Derive/Paradex:
-`lib/okx.py`, `lib/bybit.py`, `lib/bullish.py`, `lib/binance.py` + thin `pages/05_Block_Trades_-_{OKX,Bybit,Bullish,Binance}.py`
-(all share prefix 05 so they sit together; Streamlit tie-breaks by label, so the sidebar order is
-Binance, Bullish, Bybit, OKX). Default min sizes = each exchange's minimum order (OKX 1 contract, Bybit minOrderQty
+`lib/okx.py`, `lib/bybit.py`, `lib/bullish.py`, `lib/binance.py` + thin `pages/02_Block_Trades_-_{OKX,Bybit,Bullish,Binance}.py`
+(all seven block pages share prefix 02 — Streamlit tie-breaks equal numbers by label, so the sidebar
+lists them alphabetically: Binance, Bullish, Bybit, Deribit, Derive, OKX, Paradex). Default min sizes = each exchange's minimum order (OKX 1 contract, Bybit minOrderQty
 per coin, Bullish 0.0005 BTC, Binance 0.01), so the quiet venues show every print. `lib/flow_summary.py` now collects seven venues (`VENUE_ORDER`, `_NO_MARK`) and applies each
 venue's `default_min_sizes`; Home.py lists all block pages and the summary covers all six. Endpoints and
 gotchas (all public, no auth; each is documented in the module docstring):

@@ -1,7 +1,7 @@
 """
 Bybit public REST client — option block trades (V5 API).
 
-No auth needed.  Used by ``pages/05_Block_Trades_-_Bybit.py`` via
+No auth needed.  Used by ``pages/02_Block_Trades_-_Bybit.py`` via
 ``lib.block_flow.render_page(bybit.VENUE)``.
 
 Public endpoints used (all GET ``https://api.bybit.com/v5/...``, no auth):

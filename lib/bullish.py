@@ -1,7 +1,7 @@
 """
 Bullish (bullish.com) public REST client — option trade tape (BTC options).
 
-No auth needed.  Used by ``pages/05_Block_Trades_-_Bullish.py`` via
+No auth needed.  Used by ``pages/02_Block_Trades_-_Bullish.py`` via
 ``lib.block_flow.render_page(bullish.VENUE)``.
 
 Public endpoints used (all GET ``https://api.exchange.bullish.com/trading-api/v1/...``, no auth):

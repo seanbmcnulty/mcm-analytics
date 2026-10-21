@@ -5,7 +5,7 @@ No auth needed.  ``GET https://api.prod.paradex.trade/v1/trades`` with
 ``trade_type=BLOCK_TRADE`` returns the exchange-wide block tape with ``market``
 and ``base_asset`` both omitted — a single cursor-paged feed covering every
 market, so there is no per-market looping.  Used by
-``pages/04_Block_Trades_-_Paradex.py`` via ``lib.block_flow.render_page``.
+``pages/02_Block_Trades_-_Paradex.py`` via ``lib.block_flow.render_page``.
 
 Per the Paradex docs:
 * each leg of a block package is its own print; legs share one ``block_id``

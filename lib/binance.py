@@ -1,7 +1,7 @@
 """
 Binance Options (eapi) public REST client - block-trade tape.
 
-No auth needed.  Used by ``pages/05_Block_Trades_-_Binance.py`` via
+No auth needed.  Used by ``pages/02_Block_Trades_-_Binance.py`` via
 ``lib.block_flow.render_page(binance.VENUE)``.
 
 Public endpoints used (no auth):
