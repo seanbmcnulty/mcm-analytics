@@ -187,6 +187,29 @@ def _asset_row(venue: str, asset: str, df: pd.DataFrame, has_mark: bool) -> Opti
     return row
 
 
+def _all_venues(by_venue: pd.DataFrame, payloads: Dict[str, Dict], notes: Dict[str, str]) -> pd.DataFrame:
+    """One row per venue in ``VENUE_ORDER`` (plus any unexpected extras), even when a venue failed or printed no
+    blocks, with a Status column saying which."""
+    have = set(by_venue["Exchange"]) if not by_venue.empty else set()
+    names = VENUE_ORDER + [v for v in payloads if v not in VENUE_ORDER]
+    cols = list(by_venue.columns) if not by_venue.empty else [
+        "Exchange", "Blocks", "Underlyings", "Gross premium $", "Call %", "Taker-buy %",
+        "Net delta $", "Net vega $", "Greeks cover", "Largest print"]
+    rows = []
+    for v in names:
+        if v in have:
+            r = by_venue[by_venue["Exchange"] == v].iloc[0].to_dict()
+            r["Status"] = "ok"
+        else:
+            r = {c: np.nan for c in cols}
+            r.update({"Exchange": v, "Blocks": 0, "Underlyings": 0, "Largest print": "—",
+                      "Status": ("fetch failed" if v in payloads and "error" in payloads[v]
+                                 else "no data" if v not in payloads else "no blocks in window")})
+        rows.append(r)
+    out = pd.DataFrame(rows, columns=cols + ["Status"])
+    return out
+ 
+
 def summarize(payloads: Dict[str, Dict]) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, str]]:
     """-> (per-venue table, per-underlying table, {venue: note})."""
     rows, notes = [], {}
@@ -206,7 +229,7 @@ def summarize(payloads: Dict[str, Dict]) -> Tuple[pd.DataFrame, pd.DataFrame, Di
                             ", ".join(p["meta"]["truncated"]) + " — figures are a lower bound")
     by_asset = pd.DataFrame(rows)
     if by_asset.empty:
-        return pd.DataFrame(), by_asset, notes
+        return _all_venues(pd.DataFrame(), payloads, notes), by_asset, notes
 
     def agg(g: pd.DataFrame) -> pd.Series:
         gp = g["Gross premium $"].sum()
@@ -223,6 +246,6 @@ def summarize(payloads: Dict[str, Dict]) -> Tuple[pd.DataFrame, pd.DataFrame, Di
 
     by_venue = by_asset.groupby("Exchange").apply(agg, include_groups=False).reset_index()
     order = {v: i for i, v in enumerate(VENUE_ORDER)}
-    by_venue = by_venue.sort_values("Exchange", key=lambda s: s.map(order)).reset_index(drop=True)
+    by_venue = _all_venues(by_venue, payloads, notes)
     by_asset = by_asset.sort_values(["Exchange", "Gross premium $"], ascending=[True, False]).reset_index(drop=True)
     return by_venue, by_asset, notes
