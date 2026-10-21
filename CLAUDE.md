@@ -224,7 +224,7 @@ pages/08_Spot_Vol_Correlation.py  spot vs. CVOL/skew/RR/BF + vol-prediction ense
                                  only (DVOL-dependent); full port from exodus-analytics (2026-09-04)
 pages/10_*.py                   secondary analytics page (macro)
 pages/11_Fear_Greed_Signal.py   contrarian delta-lean backtest vs alternative.me F&G Index
-pages/12_IBIT.py               IBIT vs Deribit BTC options lab (32 charts; Cboe delayed chain)
+pages/12_IBIT.py               IBIT vs Deribit BTC options lab (~32 charts over 6 views; Cboe delayed chain)
                                  (the one non-Deribit data source in this app — see above)
 pages/03,04,05,09,12,13,14      retired — moved to _to_delete/ on the device, not in git
 
@@ -306,8 +306,9 @@ User asked for an IBIT page with as many charts as possible, centred on Deribit 
 skew and OI, and visually compelling. `lib/ibit.py` normalises both chains into one schema (IV, BS
 delta/gamma recomputed at r=0 on both sides, USD notional OI) and provides per-expiry ATM/RR/fly,
 surface grids, OI by moneyness/tenor, max pain, GEX, Breeden-Litzenberger density. `pages/12_IBIT.py`
-has 6 tabs (head-to-head, IBIT surface, positioning, gamma & max pain, activity, data/notes), custom
-CSS hero + KPI cards, dark Plotly theme. Cboe URL redirects cdn -> cdn-api (requests follows it).
+has 6 views (radio, one rendered at a time like MCM Bot: head-to-head, IBIT surface, positioning,
+gamma & max pain, activity, data/notes) using MCM Bot chrome (page CSS, tile badges, pills, sidebar
+chart-theme Auto/Light/Dark via fx_style). Cboe URL redirects cdn -> cdn-api (requests follows it).
 Data is stale outside US hours (banner shows age). tests/test_ibit.py (4 offline tests; 50 total).
 
 ### 2026-10-21 — Block Trades pages for OKX, Bybit, Bullish, Binance (+ Home grid and seven-venue flow summary)

@@ -24,7 +24,10 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+import html
+
 from lib import cache as cache_lib
+from lib import fx_style
 from lib import ibit as L
 from lib.constants import TTL_LONG, TTL_SLOW
 
@@ -32,72 +35,77 @@ st.set_page_config(page_title="IBIT", page_icon="🪙", layout="wide",
                    initial_sidebar_state="expanded")
 
 # ---------------------------------------------------------------------------
-# Look & feel
+# Look & feel — same chrome as the MCM Bot page (CSS, tile badges, pills,
+# sidebar chart-theme selector, one-view-at-a-time radio).
 # ---------------------------------------------------------------------------
 
-IB, DER = "#4DA6FF", "#F7931A"            # IBIT blue, Deribit/BTC orange
-CALL, PUT, VIO, MUTED = "#2ECC71", "#FF5C5C", "#A78BFA", "#8B95A5"
-GRID = "rgba(255,255,255,0.07)"
+IB, DER = "#3790C7", "#f7931a"           # IBIT blue (house blue), BTC orange
+CALL, PUT, VIO, MUTED = "#22a35a", "#e5574a", "#8e6fd8", "#8B95A5"
 
 st.markdown("""
 <style>
-.block-container{padding-top:1.6rem;}
-.hero{position:relative;overflow:hidden;border-radius:20px;padding:26px 32px;margin-bottom:18px;
-  background:radial-gradient(1200px 300px at 85% -20%,rgba(247,147,26,.28),transparent 60%),
-             radial-gradient(900px 300px at 0% 120%,rgba(77,166,255,.30),transparent 60%),
-             linear-gradient(135deg,#101826 0%,#0b1220 100%);
-  border:1px solid rgba(255,255,255,.08);box-shadow:0 10px 40px rgba(0,0,0,.35);}
-.hero h1{margin:0;font-size:2.3rem;font-weight:800;letter-spacing:-.02em;color:#fff;}
-.hero h1 .a{color:#4DA6FF}.hero h1 .b{color:#F7931A}.hero h1 .x{color:#6b7790;font-weight:400;padding:0 .35em}
-.hero p{margin:.35rem 0 .9rem;color:#a9b4c6;font-size:.98rem;max-width:900px}
-.pill{display:inline-block;margin:0 8px 6px 0;padding:4px 12px;border-radius:999px;font-size:.78rem;
-  background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);color:#d6deeb;}
-.pill.warn{background:rgba(255,92,92,.12);border-color:rgba(255,92,92,.4);color:#ffb3b3;}
-.pill.ok{background:rgba(46,204,113,.12);border-color:rgba(46,204,113,.4);color:#a6f0c6;}
-.kgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:6px 0 10px;}
-.kpi{border-radius:14px;padding:14px 16px;background:linear-gradient(160deg,#151d2e,#0f1522);
-  border:1px solid rgba(255,255,255,.07);border-top:3px solid var(--c,#4DA6FF);}
-.kpi .l{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:#8b95a5;}
-.kpi .v{font-size:1.65rem;font-weight:750;color:#fff;line-height:1.25;}
-.kpi .s{font-size:.78rem;color:#9aa6b8;}
-.kpi .s.up{color:#2ECC71}.kpi .s.dn{color:#FF5C5C}
-.sec{margin:26px 0 4px;font-size:1.15rem;font-weight:700;color:#e8edf6;
-  border-left:4px solid var(--c,#4DA6FF);padding-left:10px;}
-.sec small{display:block;font-weight:400;color:#8b95a5;font-size:.82rem;margin-top:2px;}
-.stTabs [data-baseweb="tab-list"]{gap:6px;}
-.stTabs [data-baseweb="tab"]{border-radius:10px 10px 0 0;padding:8px 16px;}
+.block-container{padding-top:2.2rem;max-width:1500px}
+h1{letter-spacing:-0.02em;font-weight:800}
+div[data-testid="stButton"]>button{border-radius:10px;font-weight:600;transition:all .15s ease}
+div[data-testid="stButton"]>button:hover{transform:translateY(-1px);
+  box-shadow:0 3px 10px rgba(55,144,199,.28);border-color:#3790C7}
+div[data-testid="stDataFrame"]{border:1px solid rgba(128,128,128,.25);border-radius:12px;overflow:hidden}
+div[data-testid="stPlotlyChart"]{border:1px solid rgba(128,128,128,.2);border-radius:12px}
+div[data-testid="stExpander"]{border-radius:12px}
+.mcm-tile{display:flex;align-items:center;gap:.55rem;margin:1.1rem 0 .4rem}
+.mcm-tile .a{font-size:.68rem;font-weight:800;letter-spacing:.09em;padding:.14rem .5rem;
+  border-radius:6px;color:#fff}
+.mcm-tile .c{font-size:1rem;font-weight:700;letter-spacing:-0.01em}
+.mcm-pills{display:flex;flex-wrap:wrap;gap:.45rem;margin:.15rem 0 .75rem}
+.mcm-pill{border:1px solid rgba(128,128,128,.3);border-radius:999px;padding:.24rem .75rem;
+  font-size:.88rem;background:rgba(128,128,128,.08);white-space:nowrap}
+.mcm-pill b{opacity:.6;font-weight:700;margin-right:.4rem;font-size:.72rem;letter-spacing:.06em}
+.mcm-pill.lead{font-weight:700}
+.mcm-pill .pos{color:#22a35a;font-weight:700}
+.mcm-pill .neg{color:#e5574a;font-weight:700}
 </style>
 """, unsafe_allow_html=True)
 
+_cur_badge = "IBIT×BTC"
 
-def sec(title: str, sub: str = "", color: str = IB) -> None:
-    s = f"<small>{sub}</small>" if sub else ""
-    st.markdown(f'<div class="sec" style="--c:{color}">{title}{s}</div>',
+
+def sec(title: str, sub: str = "", color: str = IB, badge: str | None = None) -> None:
+    """Coloured badge + report name (MCM Bot tile label), optional caption."""
+    b = badge or _cur_badge
+    st.markdown(f'<div class="mcm-tile"><span class="a" style="background:{color}">'
+                f'{html.escape(b)}</span><span class="c">{html.escape(title)}</span></div>',
                 unsafe_allow_html=True)
+    if sub:
+        st.caption(sub)
 
 
 def kpis(items: list[tuple]) -> None:
-    """items: (label, value, sub, color[, direction up|dn|''])."""
-    h = '<div class="kgrid">'
+    """MCM Bot header pills. items: (label, value, sub, color[, direction])."""
+    ps = []
     for it in items:
-        lab, val, sub, col = it[:4]
+        lab, val, sub = it[0], str(it[1]), it[2]
         d = it[4] if len(it) > 4 else ""
-        h += (f'<div class="kpi" style="--c:{col}"><div class="l">{lab}</div>'
-              f'<div class="v">{val}</div><div class="s {d}">{sub}</div></div>')
-    st.markdown(h + "</div>", unsafe_allow_html=True)
+        v = html.escape(val)
+        if d:
+            v = f'<span class="{"pos" if d == "up" else "neg"}">{v}</span>'
+        ps.append(f'<span class="mcm-pill" title="{html.escape(sub)}"><b>{html.escape(lab.upper())}</b>{v}</span>')
+    st.markdown(f'<div class="mcm-pills">{"".join(ps)}</div>', unsafe_allow_html=True)
+
+
+def _chart_theme() -> str:
+    t = str(st.session_state.get("ibit_chart_theme") or "Auto").lower()
+    return t if t in fx_style.CHART_THEMES else "auto"
 
 
 def sty(fig: go.Figure, h: int = 420, title: str | None = None,
         xt: str | None = None, yt: str | None = None) -> go.Figure:
     fig.update_layout(
-        template="plotly_dark", height=h, paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#d6deeb", size=12),
-        margin=dict(l=50, r=20, t=50 if title else 30, b=45),
+        height=h, margin=dict(l=50, r=20, t=50 if title else 30, b=45),
         title=dict(text=title, x=0.01, font=dict(size=15)) if title else None,
-        legend=dict(orientation="h", y=1.08, x=1, xanchor="right", bgcolor="rgba(0,0,0,0)"),
-        hovermode="x unified", hoverlabel=dict(bgcolor="#151d2e"))
-    fig.update_xaxes(gridcolor=GRID, zeroline=False, title=xt)
-    fig.update_yaxes(gridcolor=GRID, zeroline=False, title=yt)
+        legend=dict(orientation="h", y=1.08, x=1, xanchor="right"),
+        hovermode="x unified")
+    fig.update_xaxes(zeroline=False, title=xt)
+    fig.update_yaxes(zeroline=False, title=yt)
     return fig
 
 
@@ -115,7 +123,11 @@ def usd(x):
 
 
 def show(fig, key):
-    st.plotly_chart(fig, width="stretch", key=key, config={"displaylogo": False})
+    th = _chart_theme()
+    fx_style.apply_chart_theme(fig, th)
+    fx_style.add_watermark(fig)
+    st.plotly_chart(fig, theme=fx_style.streamlit_chart_theme(th), width="stretch", key=key,
+                    config={"displaylogo": False})
 
 
 # ---------------------------------------------------------------------------
@@ -133,13 +145,47 @@ def load_deribit():
 
 
 with st.sidebar:
-    st.header("🪙 IBIT controls")
+    st.title("🪙 IBIT")
+    st.caption("Cboe delayed option chain (free, ~15 min delayed, snapshot) vs Deribit public API")
+    st.radio("Chart theme", ["Auto", "Light", "Dark"], index=0, key="ibit_chart_theme", horizontal=True,
+             help="Auto follows the app theme (☰ → Settings → Appearance).")
+    st.divider()
     cache_lib.render_refresh_button()
-    tenor = st.select_slider("Comparison tenor (days)", options=L.TENORS, value=30)
-    kmax = st.slider("Moneyness window (± K/F)", 10, 40, 25, step=5,
-                     help="Strike range shown on smile / surface charts") / 100
-    st.caption("Source: Cboe delayed option chain (free, ~15 min delayed, "
-               "snapshot only) vs Deribit BTC options (live).")
+
+st.title("🪙 IBIT")
+st.caption("IBIT (iShares Bitcoin Trust) options vs Deribit BTC options · Cboe delayed chain · "
+           f"{fx_style.local_now():%d-%b-%Y %H:%M} {fx_style.DISPLAY_TZ_LABEL} time")
+
+with st.expander("What each view shows"):
+    st.markdown("""
+| View | What it shows |
+|------|----------------|
+| **Deribit vs IBIT** | Smile at a fixed tenor, ATM / 25Δ risk-reversal / 25Δ butterfly / skew-% term structures, tenor table, side-by-side vol surfaces + difference heatmap, OI by moneyness & tenor, put/call, market-implied distribution. |
+| **IBIT surface** | 3D vol surface, smiles by expiry, ATM/25Δ term structure, skew & wings, quote quality. |
+| **IBIT positioning** | OI by strike / expiry, volume by expiry, put/call by expiry, strike × expiry OI heatmap, cumulative OI. |
+| **Gamma & max pain** | Dealer-gamma proxy by strike and expiry, gamma flip, vega by expiry, max pain per expiry. |
+| **Activity** | Most active contracts, vol/OI turnover, volume bubbles and volume by strike. |
+| **Data & notes** | Normalised chains (CSV download) and methodology. |
+
+IBIT trades only in US hours, so outside them the snapshot is the last close while Deribit is live — the age pill shows how stale it is.
+""")
+
+_tb1, _tb2, _tb3 = st.columns([1.4, 1.4, 1.2])
+with _tb1:
+    tenor = st.selectbox("Comparison tenor", options=L.TENORS, index=L.TENORS.index(30),
+                         format_func=lambda d: f"{d} DTE", key="ibit_tenor",
+                         help="Tenor used for the smile, KPI pills and implied distribution.")
+with _tb2:
+    kmax = st.selectbox("Strike window", options=[10, 15, 20, 25, 30, 40], index=3,
+                        format_func=lambda p: f"±{p}% of forward", key="ibit_kmax",
+                        help="Strike range shown on smile / surface charts.") / 100
+with _tb3:
+    st.write("")
+    if st.button("Reload chains", type="primary", width="stretch", key="ibit_reload",
+                 help="Re-fetch Cboe and Deribit option chains (clears cached data)."):
+        load_ibit.clear()
+        load_deribit.clear()
+        st.rerun()
 
 try:
     with st.spinner("Fetching IBIT chain from Cboe…"):
@@ -166,18 +212,12 @@ if snap is not None:
 age_txt = "" if not np.isfinite(age_h) else (
     f"{age_h * 60:.0f} min old" if age_h < 2 else f"{age_h:.1f} h old")
 
-st.markdown(f"""
-<div class="hero">
-  <h1><span class="a">IBIT</span><span class="x">×</span><span class="b">Deribit</span> Options Lab</h1>
-  <p>iShares Bitcoin Trust listed options versus Deribit BTC options — vol surface, skew, term structure,
-  open interest, gamma and the market-implied distribution, side by side.</p>
-  <span class="pill">Spot IBIT <b>${ibm['spot']:.2f}</b></span>
-  <span class="pill">BTC <b>${(derm or {}).get('spot', float('nan')):,.0f}</b></span>
-  <span class="pill {'warn' if stale else 'ok'}">Cboe snapshot {snap_txt} · {age_txt}{' · US market closed / stale' if stale else ''}</span>
-  <span class="pill">{ibm['n_contracts']:,} IBIT contracts · {ibm['n_expiries']} expiries</span>
-  <span class="pill">{(derm or {}).get('n_contracts', 0):,} Deribit contracts</span>
-</div>
-""", unsafe_allow_html=True)
+kpis([("IBIT", f"${ibm['spot']:.2f}", "IBIT last", IB),
+      ("BTC", f"${(derm or {}).get('spot', float('nan')):,.0f}", "Deribit index", DER),
+      ("Cboe snapshot", f"{snap_txt} · {age_txt}" + (" · stale" if stale else ""), "delayed ~15 min", IB,
+       "dn" if stale else "up"),
+      ("IBIT chain", f"{ibm['n_contracts']:,} contracts · {ibm['n_expiries']} expiries", "", IB),
+      ("Deribit chain", f"{(derm or {}).get('n_contracts', 0):,} contracts", "", DER)])
 if der_err:
     st.warning(f"Deribit chain unavailable ({der_err}) — comparison tabs show IBIT only.")
 
@@ -219,13 +259,16 @@ if HAS_D:
            f"{usd(der.oi_usd.sum())} notional OI", DER)]
 kpis(k)
 
-tabs = st.tabs(["⚔️ Deribit vs IBIT", "🌋 IBIT surface", "📊 IBIT positioning",
-                "🧲 Gamma & max pain", "🔥 Activity", "🗂 Data & notes"])
+_VIEWS = ["⚔️ Deribit vs IBIT", "🌋 IBIT surface", "📊 IBIT positioning",
+          "🧲 Gamma & max pain", "🔥 Activity", "🗂 Data & notes"]
+# Only the selected view renders (like MCM Bot): ~30 charts across six views.
+_view = st.radio("View", _VIEWS, key="ibit_view", horizontal=True, label_visibility="collapsed")
+_cur_badge = "IBIT×BTC" if _view == _VIEWS[0] else "IBIT"
 
 # ===========================================================================
 # TAB 1 — head to head
 # ===========================================================================
-with tabs[0]:
+if _view == _VIEWS[0]:
     if not HAS_D:
         st.info("Deribit data is required for this tab.")
     else:
@@ -270,14 +313,14 @@ with tabs[0]:
                 if col == "atm":
                     f.add_scatter(x=[30], y=[ibm["iv30"]], name="Cboe iv30", mode="markers",
                                   marker=dict(symbol="diamond", size=12, color=IB,
-                                              line=dict(color="white", width=1)))
+                                              line=dict(color="#13314F", width=1)))
                     try:
                         from lib import surface
                         dv = surface.dvol_now("BTC")
                         if dv:
                             f.add_scatter(x=[30], y=[dv * (100 if dv < 5 else 1)], name="DVOL",
                                           mode="markers", marker=dict(symbol="diamond", size=12,
-                                                                      color=DER, line=dict(color="white", width=1)))
+                                                                      color=DER, line=dict(color="#13314F", width=1)))
                     except Exception:  # noqa: BLE001
                         pass
                 if col != "atm":
@@ -411,7 +454,7 @@ with tabs[0]:
 # ===========================================================================
 # TAB 2 — IBIT surface
 # ===========================================================================
-with tabs[1]:
+if _view == _VIEWS[1]:
     sec("IBIT implied-vol surface", "Interpolated OTM mid-quote IV from Cboe; blank = no live two-sided quotes")
     zw = zI[[c for c in KG if abs(c) <= kmax]]
     zw = zw[zw.index <= 400]
@@ -419,8 +462,7 @@ with tabs[1]:
                              connectgaps=False,
                              colorbar=dict(title="IV %", len=0.7),
                              hovertemplate="K/F %{x:.0f}%<br>%{y:.0f}d<br>IV %{z:.1f}%<extra></extra>"))
-    f.update_layout(template="plotly_dark", height=560, paper_bgcolor="rgba(0,0,0,0)",
-                    margin=dict(l=0, r=0, t=10, b=0),
+    f.update_layout(height=560, margin=dict(l=0, r=0, t=10, b=0),
                     scene=dict(xaxis_title="Strike vs fwd (%)", yaxis_title="DTE", zaxis_title="IV %",
                                camera=dict(eye=dict(x=1.7, y=-1.6, z=0.9))))
     show(f, "surf3d")
@@ -447,10 +489,10 @@ with tabs[1]:
         s = mI[mI.dte >= 2]
         f = go.Figure()
         f.add_scatter(x=s.dte, y=s.p25 * 100, name="25Δ put", line=dict(color=PUT, width=2))
-        f.add_scatter(x=s.dte, y=s.atm * 100, name="ATM", line=dict(color="#e8edf6", width=3))
+        f.add_scatter(x=s.dte, y=s.atm * 100, name="ATM", line=dict(color="#7f8fa6", width=3))
         f.add_scatter(x=s.dte, y=s.c25 * 100, name="25Δ call", line=dict(color=CALL, width=2))
         f.add_scatter(x=[30], y=[ibm["iv30"]], name="Cboe iv30", mode="markers",
-                      marker=dict(symbol="diamond", size=12, color=IB, line=dict(color="white", width=1)))
+                      marker=dict(symbol="diamond", size=12, color=IB, line=dict(color="#13314F", width=1)))
         show(sty(f, 420, xt="Days to expiry", yt="IV (%)").update_xaxes(type="log"), "ib_ts")
 
     c1, c2 = st.columns(2)
@@ -475,7 +517,7 @@ with tabs[1]:
 # ===========================================================================
 # TAB 3 — IBIT positioning
 # ===========================================================================
-with tabs[2]:
+if _view == _VIEWS[2]:
     sec("Open interest by strike", "Calls up, puts down — contracts (×100 shares)", CALL)
     opts = ["All expiries"] + [f"{e:%d %b %y} ({ib[ib.expiry == e].dte.iloc[0]:.0f}d)" for e in sorted(ib.expiry.unique())]
     pick = st.selectbox("Expiry", opts, index=0)
@@ -490,7 +532,7 @@ with tabs[2]:
     f = go.Figure()
     f.add_bar(x=byk.index, y=byk.C, name="Call OI", marker_color=CALL)
     f.add_bar(x=byk.index, y=-byk.P, name="Put OI", marker_color=PUT)
-    f.add_vline(x=ibm["spot"], line=dict(color="#fff", dash="dash"),
+    f.add_vline(x=ibm["spot"], line=dict(color=MUTED, dash="dash"),
                 annotation_text=f"spot {ibm['spot']:.2f}")
     mp = L.max_pain(sub if pick != "All expiries" else ib[ib.dte > 0])
     if pick != "All expiries" and len(mp):
@@ -548,13 +590,13 @@ with tabs[2]:
         if c in cum:
             f.add_scatter(x=cum.index, y=cum[c].cumsum() / cum[c].sum() * 100, name=nm,
                           line=dict(color=cc, width=3, shape="hv"))
-    f.add_vline(x=ibm["spot"], line=dict(color="#fff", dash="dash"))
+    f.add_vline(x=ibm["spot"], line=dict(color=MUTED, dash="dash"))
     show(sty(f, 340, xt="Strike", yt="Cumulative % of OI"), "cum")
 
 # ===========================================================================
 # TAB 4 — Gamma & max pain
 # ===========================================================================
-with tabs[3]:
+if _view == _VIEWS[3]:
     sec("Dealer gamma exposure (GEX) by strike",
         "$ gamma per 1% spot move. Assumes customers are long calls & puts → dealers short: calls +, puts −. "
         "A rough positioning proxy, not observed dealer inventory.", VIO)
@@ -568,7 +610,7 @@ with tabs[3]:
           ("Largest +GEX strike", f"{gz.loc[gz.gex.idxmax(), 'strike']:.1f}" if len(gz) else "–", "call wall", CALL),
           ("Largest −GEX strike", f"{gz.loc[gz.gex.idxmin(), 'strike']:.1f}" if len(gz) else "–", "put wall", PUT)])
     f = go.Figure(go.Bar(x=gz.strike, y=gz.gex, marker_color=np.where(gz.gex >= 0, CALL, PUT)))
-    f.add_vline(x=ibm["spot"], line=dict(color="#fff", dash="dash"), annotation_text="spot")
+    f.add_vline(x=ibm["spot"], line=dict(color=MUTED, dash="dash"), annotation_text="spot")
     if np.isfinite(flip):
         f.add_vline(x=flip, line=dict(color=VIO, dash="dot"), annotation_text="flip", annotation_position="bottom")
     show(sty(f, 420, xt="Strike", yt="GEX ($ per 1% move)"), "gex")
@@ -591,7 +633,7 @@ with tabs[3]:
     mp = mp[(mp.dte >= 1) & (mp.dte <= 120) & (mp.oi_usd > 5e6)]
     f = go.Figure()
     f.add_scatter(x=mp.expiry, y=mp.max_pain, name="Max pain", mode="lines+markers", line=dict(color=DER, width=3))
-    f.add_hline(y=ibm["spot"], line=dict(color="#fff", dash="dash"), annotation_text="spot")
+    f.add_hline(y=ibm["spot"], line=dict(color=MUTED, dash="dash"), annotation_text="spot")
     show(sty(f, 360, xt=None, yt="Strike"), "pain")
     mp2 = mp.assign(expiry=mp.expiry.dt.strftime("%d %b %y"), dte=mp.dte.round(0))
     st.dataframe(mp2[["expiry", "dte", "max_pain", "pain_vs_spot", "oi_usd"]].rename(columns={
@@ -602,7 +644,7 @@ with tabs[3]:
 # ===========================================================================
 # TAB 5 — Activity
 # ===========================================================================
-with tabs[4]:
+if _view == _VIEWS[4]:
     sec("Most active contracts", "Ranked by notional volume in the latest session; vol/OI > 1 = new positioning", "#FF8A5C")
     mv = st.slider("Minimum contracts traded", 50, 5000, 300, step=50)
     act = L.activity(ib, mv)
@@ -623,7 +665,7 @@ with tabs[4]:
                 marker=dict(size=np.clip(np.sqrt(b.volume) / 4, 5, 40), color=np.where(b.type == "C", CALL, PUT),
                             opacity=.65, line=dict(width=0)),
                 hovertemplate="K %{x} · %{y:.0f}d<br>%{text:,.0f} contracts<extra></extra>"))
-            f.add_vline(x=ibm["spot"], line=dict(color="#fff", dash="dash"))
+            f.add_vline(x=ibm["spot"], line=dict(color=MUTED, dash="dash"))
             show(sty(f, 440, "Volume bubbles: strike × DTE", "Strike", "Days to expiry")
                  .update_layout(hovermode="closest"), "act_bub")
         tbl = top.assign(IV=top.iv * 100)[["Contract", "dte", "volume", "oi", "vol_oi", "IV", "vol_usd",
@@ -648,14 +690,14 @@ with tabs[4]:
         f.add_bar(x=vv.index, y=vv.C, name="Calls", marker_color=CALL)
     if "P" in vv:
         f.add_bar(x=vv.index, y=-vv.P, name="Puts", marker_color=PUT)
-    f.add_vline(x=ibm["spot"], line=dict(color="#fff", dash="dash"))
+    f.add_vline(x=ibm["spot"], line=dict(color=MUTED, dash="dash"))
     f.update_layout(barmode="relative")
     show(sty(f, 380, xt="Strike", yt="Volume (contracts)"), "vol_k")
 
 # ===========================================================================
 # TAB 6 — Data & notes
 # ===========================================================================
-with tabs[5]:
+if _view == _VIEWS[5]:
     sec("Chains", "Normalised schema, identical for both venues", MUTED)
     which = st.radio("Dataset", ["IBIT", "Deribit BTC"] if HAS_D else ["IBIT"], horizontal=True)
     d = ib if which == "IBIT" else der
