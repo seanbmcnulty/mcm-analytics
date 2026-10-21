@@ -6,7 +6,8 @@ are thin wrappers around :func:`render_page`.  The layout, charts and Telegram
 sending mirror ``pages/02_Block_Trades_-_Deribit.py``; that page is left
 untouched.
 
-A venue object (see ``lib.derive.VENUE`` / ``lib.paradex.VENUE``) supplies:
+A venue object (see ``lib.derive.VENUE`` / ``lib.paradex.VENUE``) supplies (and may set an optional ``notice``
+string, shown as a warning at the top of the page):
 
     key, title, icon, assets, default_min_sizes, has_mark, perp_label, definition
     fetch_all(start_ms, end_ms, assets) -> {"frames": {asset: df}, "meta": {...}}
@@ -679,6 +680,12 @@ def render_page(venue) -> None:
 </style>""", unsafe_allow_html=True)
     st.markdown(f'<div class="main-header"><h1>📊 BLOCK TRADES - {venue.title.upper()}</h1></div>',
                 unsafe_allow_html=True)
+
+    # Optional standing notice from the venue (e.g. a known region block), shown before any fetch so it
+    # is visible even when the fetch below fails.
+    notice = getattr(venue, "notice", None)
+    if notice:
+        st.warning(notice)
 
     # Every underlying with live options gets a tab + a min-size filter.
     listed = _cached_listed(venue.key)

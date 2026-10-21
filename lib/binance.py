@@ -232,6 +232,9 @@ class _Venue:
     has_mark = False
     has_iv = False
     perp_label = "Index"
+    notice = ("Binance blocks US servers, so on the deployed Streamlit Cloud app this page will show a fetch error. "
+              "It works when the app is run locally from Singapore. Fix still to be decided (local recorder or a "
+              "Singapore relay via `BINANCE_EAPI_BASE` / `BINANCE_FAPI_BASE`).")
     definition = ("**Block definition:** every print on Binance Options' public block-trade tape "
                   "(`GET /eapi/v1/blockTrades`, the latest 500 across all markets). USDT-settled linear options; "
                   "`side` is undocumented and treated as the taker side; legs printing in the same millisecond are "

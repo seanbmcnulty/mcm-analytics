@@ -257,6 +257,9 @@ class _Venue:
     has_mark = True
     has_iv = True
     perp_label = "Index"
+    notice = ("Bybit blocks US servers, so on the deployed Streamlit Cloud app this page will show a fetch error. It "
+              "works when the app is run locally from Singapore. Fix still to be decided (local recorder or a "
+              "Singapore relay via `BYBIT_API_BASE`).")
     definition = ("**Block definition:** option executions with `isBlockTrade=true` in "
                   "`GET /v5/market/recent-trade?category=option` (USDT-settled linear options). `side` is the "
                   "taker side; multi-leg blocks printing in the same millisecond are grouped into one package. Default "
