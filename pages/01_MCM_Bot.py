@@ -83,6 +83,7 @@ CORE_COMMANDS = (
     "vol_run",
     "vol_term_structure",
     "skew_term_structure",
+    "skew_term_structure_10d",
     "basis_run",
     "block_trades_summary",
 )
@@ -179,7 +180,7 @@ def _tint(v, scale: float, max_a: float = 0.34) -> str:
     return f"background-color: rgba({rgb},{a:.2f}); color: {fg}; font-weight: 600"
 
 
-_TILE_WORDS = {"atm": "ATM", "iv": "IV", "rv": "RV", "25d": "25Δ"}
+_TILE_WORDS = {"atm": "ATM", "iv": "IV", "rv": "RV", "25d": "25Δ", "10d": "10Δ"}
 
 
 def _tile_label(asset: str, cn: str) -> None:
@@ -638,6 +639,7 @@ with st.expander("What each report shows"):
 | **Vol run** | Implied volatility by expiry (ATM σ, 3h/open change, RV, IV−RV, 25Δ wings, forward IV). Green/red = up/down. |
 | **Vol term structure** | ATM vol across expiries; current vs 24h / 1w / 1m ago. |
 | **Skew term structure** | 25Δ call minus put skew by expiry (call–put vol spread). |
+| **Skew term structure 10Δ** | 10Δ call minus put skew by expiry, shown beside the 25Δ chart. |
 | **Butterfly term structure** | 10Δ butterfly by expiry: average of 10Δ call/put vol minus ATM vol. |
 | **Basis run** | Perp and dated futures basis vs index. Basis % (1Y APR) = annualized; green/red = contango/backwardation. |
 | **Forward vols** | Combined ATM, 25d call, 25d put vols and their forward vols by expiry date. |

@@ -160,18 +160,28 @@ def cmd_vol_term_structure(asset: str, **kwargs):
 
 def cmd_skew_term_structure(asset: str, **kwargs):
     """25d risk reversal (call IV - put IV) across listed expiries."""
+    return _skew_term_structure(asset, 25)
+
+
+def cmd_skew_term_structure_10d(asset: str, **kwargs):
+    """10d risk reversal (call IV - put IV) across listed expiries."""
+    return _skew_term_structure(asset, 10)
+
+
+def _skew_term_structure(asset: str, delta: int):
+    """Call IV - put IV at ``delta`` (25 or 10) across listed expiries."""
     now = _now()
     vols = surface.option_vols_by_dte(asset)
-    call = {float(k): float(v) for k, v in vols.get("call25", {}).items() if _finite(v)}
-    put = {float(k): float(v) for k, v in vols.get("put25", {}).items() if _finite(v)}
+    call = {float(k): float(v) for k, v in vols.get(f"call{delta}", {}).items() if _finite(v)}
+    put = {float(k): float(v) for k, v in vols.get(f"put{delta}", {}).items() if _finite(v)}
     if len(call) < 2 or len(put) < 2:
         return None, None, "No skew data available."
 
     dtes = surface.listed_expiries(asset) or sorted(int(d) for d in call)
     x_cat = [(now.date() + timedelta(days=int(d))).strftime("%d-%b") for d in dtes]
 
-    fc, estimated, src = history.surface_history(asset, "deltaCall25", days=35)
-    fp, _, _ = history.surface_history(asset, "deltaPut25", days=35)
+    fc, estimated, src = history.surface_history(asset, f"deltaCall{delta}", days=35)
+    fp, _, _ = history.surface_history(asset, f"deltaPut{delta}", days=35)
 
     fig = go.Figure()
     entries: list[tuple[str, str, dict[float, float], dict[float, float]]] = [
@@ -209,8 +219,8 @@ def cmd_skew_term_structure(asset: str, **kwargs):
         ))
 
     fig.update_layout(
-        title=f"{asset} Skew Term Structure (25Δ Call - Put)",
-        xaxis_title="Expiry (Deribit)", yaxis_title="25 Delta Skew (Call - Put)",
+        title=f"{asset} Skew Term Structure ({delta}Δ Call - Put)",
+        xaxis_title="Expiry (Deribit)", yaxis_title=f"{delta} Delta Skew (Call - Put)",
         height=450, template=TEMPLATE, xaxis=dict(type="category"),
         yaxis=dict(zeroline=True, zerolinewidth=1, zerolinecolor="rgba(0,0,0,0.3)"),
     )
