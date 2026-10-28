@@ -11,6 +11,7 @@ main-area expander under the title.
 import sys
 import html
 import logging
+import re
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -194,17 +195,16 @@ def _tile_label(asset: str, cn: str) -> None:
 
 def _render_header(text: str) -> None:
     """Render a '**LABEL** value   |   **LABEL** value' header as pills."""
-    import re as _re
     if not text or "**" not in text:
         st.markdown(text or "")
         return
     pills = []
-    for group in _re.split(r"\s{6,}", text.strip()):
+    for group in re.split(r"\s{6,}", text.strip()):
         for seg in group.split("|"):
             seg = seg.strip()
             if not seg:
                 continue
-            m = _re.match(r"\*\*(.+?)\*\*\s*(.*)$", seg)
+            m = re.match(r"\*\*(.+?)\*\*\s*(.*)$", seg)
             if not m:
                 pills.append(f'<span class="mcm-pill">{html.escape(seg)}</span>')
                 continue
@@ -343,7 +343,6 @@ def render_output(fig, df, text, key_prefix: str = "out",
         st.caption("Nothing to show — no qualifying data in the window.")
 
 
-
 def _send_photo(png: bytes | None, caption: str) -> bool:
     """Send one PNG to Telegram. telegram.send_photo already retries a
     429 (rate limit) with Telegram's own retry_after, and separately
@@ -445,7 +444,7 @@ def _stale_expiry_commands(asset: str, results: dict) -> list[str]:
             and built.get((asset, cn)) != cur]
 
 
-def _send_to_telegram(assets: list[str], label: str) -> None:
+def _send_to_telegram(assets: list[str]) -> None:
     """Ensure every command is loaded for `assets` (running only what's
     missing — a single-asset button doesn't force-load the other 3), then
     send them all to Telegram as images. Shared by the per-asset buttons
@@ -675,15 +674,13 @@ if st.session_state.get("auto_pipeline") == "mcm_bot":
                 f"{', '.join(_auto_assets)} and sending to Telegram…")
         with st.spinner(f"Refreshing MCM Bot commands for {', '.join(_auto_assets)}…"):
             cache_lib.clear_all_caches()
-            if st.session_state.mcm_all_results is None:
-                st.session_state.mcm_all_results = {}
-            _merged = dict(st.session_state.mcm_all_results)
+            _merged = dict(st.session_state.mcm_all_results or {})
             run_reports(_auto_assets, list(cmdreg.COMMAND_NAMES),
                         st.session_state.get("mcm_dte_days", 30),
                         merge_into=_merged)
             st.session_state.mcm_all_results = _merged
             st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
-        _send_to_telegram(_auto_assets, "BTC+ETH")
+        _send_to_telegram(_auto_assets)
         st.session_state["auto_pipeline"] = "block_trades"
         st.switch_page("pages/02_Block_Trades_-_Deribit.py")
     else:
@@ -704,6 +701,10 @@ if st.session_state.get("auto_pipeline") == "mcm_bot":
 
 _expiries, _using_fallback = _expiry_options()
 _default_idx = _expiries.index(min(_expiries, key=lambda d: abs(d - 30)))
+# Listed DTEs shift daily; a remembered value that is no longer listed makes
+# the selectbox raise, so fall back to the nearest listed expiry.
+if st.session_state.get("mcm_dte_days") not in _expiries:
+    st.session_state["mcm_dte_days"] = _expiries[_default_idx]
 
 _core_help = ("Run desk-speed subset for BTC+ETH only: "
               + ", ".join(CORE_COMMANDS)
@@ -767,41 +768,34 @@ with _sb_all:
 
 if load_all_btn or refresh_all_btn:
     with st.spinner(f"Running all commands for {', '.join(ASSETS)}…"):
-        if st.session_state.mcm_all_results is None:
-            st.session_state.mcm_all_results = {}
         st.session_state.mcm_all_results = run_reports(
             list(ASSETS), list(cmdreg.COMMAND_NAMES),
             st.session_state.get("mcm_dte_days", 30),
             merge_into={} if refresh_all_btn else dict(st.session_state.mcm_all_results or {}))
         st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
-    st.success("All reports loaded." if load_all_btn else "All reports refreshed.")
     st.rerun()
 
 if core_btn:
     _core_assets = [a for a in ASSETS if a in CORE_ASSETS]
     with st.spinner(f"Running core commands for {', '.join(_core_assets)}…"):
-        if st.session_state.mcm_all_results is None:
-            st.session_state.mcm_all_results = {}
-        _merged = dict(st.session_state.mcm_all_results)
+        _merged = dict(st.session_state.mcm_all_results or {})
         run_reports(
             _core_assets, list(CORE_COMMANDS),
             st.session_state.get("mcm_dte_days", 30),
             merge_into=_merged)
         st.session_state.mcm_all_results = _merged
         st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
-    st.success(f"Core reports loaded for {', '.join(_core_assets)} "
-               f"({len(CORE_COMMANDS)} commands).")
     st.rerun()
 
 for _a in ASSETS:
     if send_asset_clicked.get(_a):
-        _send_to_telegram([_a], _a)
+        _send_to_telegram([_a])
 
 if send_btc_eth_btn and _BTC_ETH:
-    _send_to_telegram(_BTC_ETH, "BTC+ETH")
+    _send_to_telegram(_BTC_ETH)
 
 if send_all_btn:
-    _send_to_telegram(list(ASSETS), "all assets")
+    _send_to_telegram(list(ASSETS))
 
 # Drop very old results rather than showing stale data indefinitely.
 _ts = st.session_state.get("mcm_all_results_ts")
@@ -893,9 +887,7 @@ for ia, a in enumerate(ASSETS):
                      "only need this asset.")
         if run_asset_btn:
             with st.spinner(f"Running all commands for {a}…"):
-                if st.session_state.mcm_all_results is None:
-                    st.session_state.mcm_all_results = {}
-                _base = dict(st.session_state.mcm_all_results)
+                _base = dict(st.session_state.mcm_all_results or {})
                 run_reports([a], list(cmdreg.COMMAND_NAMES),
                             st.session_state.get("mcm_dte_days", 30),
                             merge_into=_base)

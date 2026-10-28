@@ -2,7 +2,7 @@
 # Install: pip install -r requirements.txt
 # Requires Python 3.10+
 
-streamlit>=1.35.0
+streamlit>=1.50.0  # width="stretch" (used on every page) needs >=1.49
 # pandas' DataFrame.style (MCM Bot table colouring/formatting) needs
 # jinja2>=3.1.2. It only arrives transitively today (via altair); pin it so a
 # dependency change can't silently drop the page back to unstyled tables.

@@ -40,7 +40,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from lib.deribit import get_tradingview_ohlc, clear_cache
+from lib.deribit import get_tradingview_ohlc
 from lib import cache as cache_lib
 from lib.constants import ASSET_CONFIG, ASSET_COLORS, PLOTLY_LAYOUT
 from lib.telegram import send_message, send_photo, is_configured
@@ -235,10 +235,6 @@ def safe_pick_row(df: pd.DataFrame, metric: str, ascending: bool) -> pd.Series:
 # Data fetching — Deribit tradingview OHLC, paginated + resilient
 # ---------------------------------------------------------------------------
 
-def _resolution_bar_ms(resolution: str) -> int:
-    if resolution == "1D":
-        return 86_400_000
-    return int(resolution) * 60_000
 
 
 def _build_chunk_plan(start_ms: int, end_ms: int, bar_ms: int) -> List[Tuple[int, int]]:
@@ -1487,11 +1483,7 @@ if _auto_pipeline_step in ("tbrv_btc", "tbrv_eth"):
         _auto_tbrv_asset = "BTC" if _auto_pipeline_step == "tbrv_btc" else "ETH"
         st.info(f"🔄📤 Auto pipeline — step 3/4: refreshing Time Based Realized "
                 f"Vol data for {_auto_tbrv_asset} and sending to Telegram…")
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
-        clear_cache()
+        cache_lib.clear_all_caches()
         st.session_state.pop(_SNAP_KEY, None)
         st.session_state.pop(_UI_CACHE_KEY, None)
     else:
@@ -1571,11 +1563,7 @@ if not is_configured():
     st.caption("Telegram not configured — set credentials in secrets.toml or environment to enable sending.")
 
 if hard_refresh:
-    try:
-        st.cache_data.clear()
-    except Exception:
-        pass
-    clear_cache()
+    cache_lib.clear_all_caches()
     st.session_state.pop(_SNAP_KEY, None)
     st.session_state.pop(_UI_CACHE_KEY, None)
     st.rerun()

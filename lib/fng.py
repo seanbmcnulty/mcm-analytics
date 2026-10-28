@@ -15,7 +15,6 @@ Endpoint: https://api.alternative.me/fng/?limit=N&format=json
 """
 
 import time
-from typing import Any
 
 import requests
 import pandas as pd

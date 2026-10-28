@@ -10,11 +10,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import streamlit as st
-import time
 from datetime import datetime, timezone
 
 from lib.deribit import get_index_price, get_option_chain, get_ticker
-from lib.constants import ASSET_CONFIG, ASSETS, ASSET_COLORS
+from lib.constants import ASSET_CONFIG, ASSETS
 from lib.telegram import is_configured
 from lib import cache as cache_lib
 from lib import commands as cmdreg

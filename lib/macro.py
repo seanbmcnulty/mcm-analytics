@@ -48,7 +48,7 @@ Adapted, not verbatim:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone
 from math import sqrt
 
 import numpy as np

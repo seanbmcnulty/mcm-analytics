@@ -33,7 +33,6 @@ and the calibration *persistence* mechanism differ, both deliberately:
 from __future__ import annotations
 
 import time
-from datetime import timedelta
 
 import numpy as np
 import pandas as pd

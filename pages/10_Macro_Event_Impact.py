@@ -507,8 +507,6 @@ def _event_key(date_str: str, event: str) -> str:
     return f"{date_str}|{event}"
 
 
-def _event_label(date_str: str, event: str) -> str:
-    return f"{date_str} — {event}"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)

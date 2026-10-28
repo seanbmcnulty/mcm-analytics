@@ -49,7 +49,7 @@ import streamlit as st
 from scipy.stats import norm
 
 from lib import deribit, history, surface
-from lib.constants import ASSET_CONFIG, ASSET_COLORS, PLOTLY_LAYOUT
+from lib.constants import ASSET_CONFIG, PLOTLY_LAYOUT
 from lib import fx_style
 from lib import cache as cache_lib
 from lib.telegram import send_message, send_photo, is_configured
