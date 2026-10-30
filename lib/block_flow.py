@@ -786,7 +786,9 @@ def render_page(venue) -> None:
         c_all = st.button("📤 All with data", key=f"{venue.key}_tg_all", width="stretch", disabled=not (tg_ok and active),
                           help=f"Send every underlying that has blocks ({len(active)} x {n_charts} charts).")
 
-    tabs = st.tabs([f"📈 {a}" for a in assets] + ["📊 ALL (2x2 Grid)", "📋 Block Trade Statistics"])
+    extra = getattr(venue, "extra_tab", None)       # optional (title, render_fn) venue-specific tab
+    tabs = st.tabs([f"📈 {a}" for a in assets] + ["📊 ALL (2x2 Grid)", "📋 Block Trade Statistics"]
+                   + ([extra[0]] if extra else []))
     for i, a in enumerate(assets):
         with tabs[i]:
             st.markdown(f'<div class="asset-header">{a} Option Block Flow Analysis — {venue.title}</div>',
@@ -857,3 +859,7 @@ def render_page(venue) -> None:
                     st.dataframe(style_statistics_table(create_expiry_table(data[a], venue.has_mark)), width="stretch")
                     st.caption("Greeks are dollar Greeks at execution using each trade's own (price-implied) IV; "
                                "Delta/Vega/Gamma are signed from the taker's side (buy +, sell -).")
+
+    if extra:
+        with tabs[len(assets) + 2]:
+            extra[1]()

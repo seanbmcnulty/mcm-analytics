@@ -365,5 +365,12 @@ class _Venue:
     fetch_hist_spot = staticmethod(fetch_hist_spot)
     feed_status = staticmethod(feed_status)
 
+    @staticmethod
+    def _render_vol_compare():
+        from lib import venue_vol
+        venue_vol.render()
+
+    extra_tab = ("⚖️ Deribit vs OKX Vol", _render_vol_compare.__func__)
+
 
 VENUE = _Venue()

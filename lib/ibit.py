@@ -141,18 +141,18 @@ def parse_cboe(payload: dict, now: datetime | None = None
     return df, meta
 
 
-def deribit_chain(now: datetime | None = None) -> tuple[pd.DataFrame, dict]:
-    """Deribit BTC option book summary -> same schema as parse_cboe."""
+def deribit_chain(now: datetime | None = None, asset: str = "BTC") -> tuple[pd.DataFrame, dict]:
+    """Deribit (inverse BTC / ETH) option book summary -> same schema as parse_cboe."""
     from lib import deribit, surface
     from lib.constants import ASSET_CONFIG
 
     now = now or datetime.now(UTC)
-    spot = deribit.get_index_price(ASSET_CONFIG["BTC"]["index"])
-    chain = deribit.get_option_chain("BTC", "option") or []
+    spot = deribit.get_index_price(ASSET_CONFIG[asset]["index"])
+    chain = deribit.get_option_chain(asset, "option") or []
     rows = []
     for r in chain:
         parts = (r.get("instrument_name") or "").split("-")
-        if len(parts) != 4 or parts[0] != "BTC":
+        if len(parts) != 4 or parts[0] != asset:
             continue
         exp_d = surface.parse_expiry_date(parts[1])
         strike = surface.parse_strike(parts[2])
