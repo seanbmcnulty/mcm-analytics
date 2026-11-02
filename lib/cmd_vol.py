@@ -44,8 +44,32 @@ def _dec(v) -> float:
     return v / 100.0 if abs(v) >= 5 else v
 
 
-def _row_to_map(row: pd.Series) -> dict[float, float]:
-    return {float(c): float(row[c]) for c in row.index if _finite(row.get(c))}
+def _row_to_map(row: pd.Series, now: datetime | None = None) -> dict[float, float]:
+    """
+    Historical row -> {DTE: IV}.
+
+    Snapshot columns are DTE *at the time of the snapshot*, so a given column
+    refers to a different expiry date than the same DTE today. When ``now`` is
+    given, re-key the columns to today's DTE for the SAME expiry date:
+    ``dte_now = dte_then - (calendar days elapsed since the snapshot)``.
+    Expiries already gone (dte_now < 0) are dropped.
+    """
+    shift = 0
+    if now is not None:
+        ts = getattr(row, "name", None)
+        try:
+            shift = (now.date() - pd.Timestamp(ts).tz_convert("UTC").date()).days
+        except Exception:
+            shift = 0
+    out: dict[float, float] = {}
+    for c in row.index:
+        if not _finite(row.get(c)):
+            continue
+        d = float(c) - shift
+        if d < 0:
+            continue
+        out[d] = float(row[c])
+    return out
 
 
 def _fmt_ago(delta: timedelta) -> str:
@@ -125,7 +149,7 @@ def cmd_vol_term_structure(asset: str, **kwargs):
         ("1 Week Ago", timedelta(days=7)),
         ("1 Month Ago", timedelta(days=30)),
     ]):
-        series.append((label, style_key, _row_to_map(row)))
+        series.append((label, style_key, _row_to_map(row, now)))
 
     for label, style_key, vals in series:
         style = TERM_STRUCTURE_SERIES_STYLE.get(style_key, TERM_STRUCTURE_SERIES_STYLE["Current"])
@@ -196,7 +220,7 @@ def _skew_term_structure(asset: str, delta: int):
             # call row, not a fresh (and possibly differently-aged) lookup.
             rp, _ = history.surface_row_near(fp, ts)
             if rp is not None:
-                entries.append((label, style_key, _row_to_map(rc), _row_to_map(rp)))
+                entries.append((label, style_key, _row_to_map(rc, now), _row_to_map(rp, now)))
 
     for label, style_key, cmap, pmap in entries:
         style = TERM_STRUCTURE_SERIES_STYLE.get(style_key, TERM_STRUCTURE_SERIES_STYLE["Current"])
@@ -265,8 +289,8 @@ def cmd_butterfly_term_structure(asset: str, **kwargs):
             rp, _ = history.surface_row_near(fp, ts)
             ra, _ = history.surface_row_near(fa, ts)
             if rp is not None and ra is not None:
-                entries.append((label, style_key, _row_to_map(rc),
-                                _row_to_map(rp), _row_to_map(ra)))
+                entries.append((label, style_key, _row_to_map(rc, now),
+                                _row_to_map(rp, now), _row_to_map(ra, now)))
 
     for label, style_key, cmap, pmap, amap in entries:
         style = TERM_STRUCTURE_SERIES_STYLE.get(style_key, TERM_STRUCTURE_SERIES_STYLE["Current"])
@@ -357,7 +381,7 @@ def build_vol_surface_figure(asset: str, dte: int,
                 row, _ts = history.surface_row_near(frame, now - delta)
                 if row is None:
                     continue
-                v = surface.interp_at_dte(_row_to_map(row), float(dte))
+                v = surface.interp_at_dte(_row_to_map(row, now), float(dte))
                 if _finite(v) and v > 0:
                     pts[surface.DELTA_X_MAP[key]] = _pct(v)
             if len(pts) >= 3:
@@ -493,8 +517,8 @@ def cmd_vol_run(asset: str, **kwargs):
     row_3h = history.surface_row_at(frame, now - timedelta(hours=3)) if frame is not None else None
     open_ts = now.replace(hour=0, minute=0, second=0, microsecond=0)
     row_open = history.surface_row_at(frame, open_ts) if frame is not None else None
-    map_3h = _row_to_map(row_3h) if row_3h is not None else {}
-    map_open = _row_to_map(row_open) if row_open is not None else {}
+    map_3h = _row_to_map(row_3h, now) if row_3h is not None else {}
+    map_open = _row_to_map(row_open, now) if row_open is not None else {}
 
     # Parkinson RV by tenor from Deribit perp candles.
     daily = history.perp_ohlc(asset, days=400, resolution="1D")
