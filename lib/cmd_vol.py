@@ -72,6 +72,14 @@ def _row_to_map(row: pd.Series, now: datetime | None = None) -> dict[float, floa
     return out
 
 
+def _at(vals: dict, dte: float) -> float:
+    """IV at ``dte``: exact expiry match for per-expiry history, interpolation otherwise."""
+    if isinstance(vals, history.ExactMap):
+        v = vals.get(int(round(dte)))
+        return float(v) if v is not None else float("nan")
+    return surface.interp_at_dte(vals, float(dte))
+
+
 def _fmt_ago(delta: timedelta) -> str:
     """Human label for an elapsed time, e.g. '6d Ago', '18h Ago'."""
     hours = delta.total_seconds() / 3600.0
@@ -144,20 +152,30 @@ def cmd_vol_term_structure(asset: str, **kwargs):
     x_cat = [(now.date() + timedelta(days=int(d))).strftime("%d-%b") for d in dtes]
 
     series: list[tuple[str, str, dict[float, float]]] = [("Current", "Current", live)]
-    for label, style_key, _ts, row in _lookback_points(frame, now, [
-        ("24h Ago", timedelta(hours=24)),
-        ("1 Week Ago", timedelta(days=7)),
-        ("1 Month Ago", timedelta(days=30)),
-    ]):
-        series.append((label, style_key, _row_to_map(row, now)))
+    # Prefer per-expiry history (same expiry DATE then vs now); fall back to the
+    # fixed-tenor snapshot grid only where that history doesn't reach back yet.
+    exact_labels: set[str] = set()
+    lookbacks = [("24h Ago", timedelta(hours=24), 3.0),
+                 ("1 Week Ago", timedelta(days=7), 6.0),
+                 ("1 Month Ago", timedelta(days=30), 12.0)]
+    grid_pts = {sk: (lb, r) for lb, sk, _t, r in _lookback_points(
+        frame, now, [(l, d) for l, d, _ in lookbacks])}
+    for label, delta, tol in lookbacks:
+        ex = history.expiry_snapshot_near(asset, now - delta, tol, now)
+        if ex is not None:
+            series.append((label, label, ex["atm"]))
+            exact_labels.add(label)
+        elif label in grid_pts:
+            lb, row = grid_pts[label]
+            series.append((lb, label, _row_to_map(row, now)))
 
     for label, style_key, vals in series:
         style = TERM_STRUCTURE_SERIES_STYLE.get(style_key, TERM_STRUCTURE_SERIES_STYLE["Current"])
-        y = [_pct(surface.interp_at_dte(vals, float(d))) for d in dtes]
+        y = [_pct(_at(vals, d)) for d in dtes]
         is_current = label == "Current"
-        name = label if (is_current or not estimated) else f"{label} (est.)"
+        name = label if (is_current or not estimated or style_key in exact_labels) else f"{label} (est.)"
         fig.add_trace(go.Scatter(
-            x=x_cat, y=y, name=name,
+            x=x_cat, y=y, name=name, connectgaps=True,
             mode="lines+markers+text" if is_current else "lines+markers",
             text=surface.tidy_labels(x_cat) if is_current else [""] * len(x_cat),
             textposition="top center", textfont=dict(size=12),
@@ -519,6 +537,14 @@ def cmd_vol_run(asset: str, **kwargs):
     row_open = history.surface_row_at(frame, open_ts) if frame is not None else None
     map_3h = _row_to_map(row_3h, now) if row_3h is not None else {}
     map_open = _row_to_map(row_open, now) if row_open is not None else {}
+    # Per-expiry history wins (same expiry date, no tenor interpolation); the
+    # grid maps above are only a fallback until that history covers the window.
+    ex_3h = history.expiry_snapshot_near(asset, now - timedelta(hours=3), 1.0, now)
+    ex_open = history.expiry_snapshot_near(asset, open_ts, 1.0, now)
+    if ex_3h is not None:
+        map_3h = ex_3h["atm"]
+    if ex_open is not None:
+        map_open = ex_open["atm"]
 
     # Parkinson RV by tenor from Deribit perp candles.
     daily = history.perp_ohlc(asset, days=400, resolution="1D")
@@ -548,8 +574,8 @@ def cmd_vol_run(asset: str, **kwargs):
         daily_move = iv_dec * sqrt(1.0 / 365.0) * 100
         be_move = iv_dec * sqrt(max(surface.frac_dte(dte, now), 0.0) / 365.0) * 100
 
-        v3 = surface.interp_at_dte(map_3h, float(dte)) if map_3h else float("nan")
-        vo = surface.interp_at_dte(map_open, float(dte)) if map_open else float("nan")
+        v3 = _at(map_3h, dte) if map_3h else float("nan")
+        vo = _at(map_open, dte) if map_open else float("nan")
         atm_3h_chg = (iv_dec - _dec(v3)) * 100 if _finite(v3) else float("nan")
         atm_open_chg = (iv_dec - _dec(vo)) * 100 if _finite(vo) else float("nan")
 

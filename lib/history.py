@@ -358,6 +358,10 @@ def record_snapshot_status(asset: str, min_interval_s: float = 1800.0,
                     v = surface.interp_at_dte(series, float(dte)) if series else np.nan
                 row[f"{field}_{dte}"] = round(float(v), 6) if surface.finite(v) else ""
         row[SOURCE_COL] = SOURCE_LIVE
+        try:
+            record_expiry_snapshot(asset, now, vols)  # best-effort; never blocks the main row
+        except Exception:
+            pass
         if path.suffix == ".parquet":
             df = pd.read_parquet(path)
             new = pd.DataFrame([row]).reindex(columns=list(df.columns))
@@ -469,6 +473,132 @@ def _fetch_remote_snapshots(asset: str) -> pd.DataFrame | None:
             break
     _REMOTE_SNAPSHOT_CACHE[asset] = (time.time(), frame)
     return frame
+
+
+# ---------------------------------------------------------------------------
+# Per-expiry snapshot store
+# ---------------------------------------------------------------------------
+# The wide store above only keeps IV at fixed tenors (1/7/14/30/... days), which
+# linearly interpolates away single-expiry bumps (event expiries, the Friday
+# roll) and can't say which *expiry* a column was. This long-format store keeps
+# IV keyed by the actual expiry DATE so "change vs 3h ago / open / 24h ago" is
+# always the same expiry, however the day count has shifted since.
+
+EXPIRY_FIELDS = ("atm", "call10", "call25", "put10", "put25")
+EXPIRY_RETENTION_DAYS = 40
+_EXPIRY_SUFFIX = "expiry"
+_REMOTE_EXPIRY_CACHE: dict[str, tuple[float, "pd.DataFrame | None"]] = {}
+
+
+class ExactMap(dict):
+    """{DTE-now: iv} for ONE expiry date each; missing keys mean 'no such expiry then'."""
+
+
+def _expiry_csv(asset: str, base: Path | None = None) -> Path:
+    return (base or SNAPSHOT_DIR) / f"{asset}_{_EXPIRY_SUFFIX}.csv"
+
+
+def record_expiry_snapshot(asset: str, now: datetime, vols: dict) -> bool:
+    rows = []
+    today = now.date()
+    for dte, iv in (vols.get("atm") or {}).items():
+        if not surface.finite(iv):
+            continue
+        r = {"timestamp": now.isoformat(),
+             "expiry": (today + timedelta(days=int(dte))).isoformat()}
+        for f in EXPIRY_FIELDS:
+            v = (vols.get(f) or {}).get(dte)
+            r[f] = round(float(v), 6) if v is not None and surface.finite(v) else ""
+        rows.append(r)
+    if not rows:
+        return False
+    path = _expiry_csv(asset)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new = pd.DataFrame(rows)
+    df = pd.concat([pd.read_csv(path, dtype=str), new]) if path.exists() else new
+    ts = pd.to_datetime(df["timestamp"], utc=True, format="ISO8601", errors="coerce")
+    df = df[ts >= now - timedelta(days=EXPIRY_RETENTION_DAYS)]
+    df = df.drop_duplicates(["timestamp", "expiry"], keep="last")
+    df.to_csv(path, index=False)
+    return True
+
+
+def _parse_expiry_csv(text) -> pd.DataFrame | None:
+    try:
+        df = pd.read_csv(io.StringIO(text)) if isinstance(text, str) else text.copy()
+        if df.empty or "timestamp" not in df or "expiry" not in df:
+            return None
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True,
+                                         format="ISO8601", errors="coerce")
+        df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce").dt.date
+        for f in EXPIRY_FIELDS:
+            df[f] = pd.to_numeric(df.get(f), errors="coerce")
+        return df.dropna(subset=["timestamp", "expiry"])
+    except Exception:
+        return None
+
+
+def _fetch_remote_expiry(asset: str) -> pd.DataFrame | None:
+    hit = _REMOTE_EXPIRY_CACHE.get(asset)
+    if hit is not None and (time.time() - hit[0]) < _REMOTE_SNAPSHOT_TTL:
+        return hit[1]
+    frame = None
+    try:
+        resp = requests.get(f"{_REMOTE_SNAPSHOT_BASE}/{asset}_{_EXPIRY_SUFFIX}.csv",
+                            timeout=_REMOTE_TIMEOUT)
+        if resp.status_code == 200 and resp.content:
+            frame = _parse_expiry_csv(resp.text)
+    except Exception:
+        frame = None
+    _REMOTE_EXPIRY_CACHE[asset] = (time.time(), frame)
+    return frame
+
+
+def load_expiry_snapshots(asset: str) -> pd.DataFrame | None:
+    local = None
+    try:
+        p = _expiry_csv(asset)
+        if p.exists():
+            local = _parse_expiry_csv(p.read_text())
+    except Exception:
+        local = None
+    remote = _fetch_remote_expiry(asset)
+    frames = [f for f in (remote, local) if f is not None]
+    if not frames:
+        return None
+    df = pd.concat(frames)
+    return df.drop_duplicates(["timestamp", "expiry"], keep="last")
+
+
+def expiry_snapshot_near(asset: str, when: datetime, tol_hours: float,
+                         now: datetime | None = None) -> dict[str, ExactMap] | None:
+    """
+    Per-expiry IV from the recorded snapshot nearest ``when`` (within
+    ``tol_hours``), as ``{field: ExactMap({dte_today: iv})}``. DTE is re-keyed to
+    today's day count for the SAME expiry date; expired dates are dropped.
+    None when no snapshot is close enough (history not that long yet).
+    """
+    df = load_expiry_snapshots(asset)
+    if df is None or df.empty:
+        return None
+    now = now or datetime.now(timezone.utc)
+    stamps = df["timestamp"].drop_duplicates()
+    target = pd.Timestamp(when)
+    gaps = (stamps - target).abs()
+    best = gaps.idxmin()
+    if gaps.loc[best] > pd.Timedelta(hours=tol_hours):
+        return None
+    sub = df[df["timestamp"] == stamps.loc[best]]
+    today = now.date()
+    out = {f: ExactMap() for f in EXPIRY_FIELDS}
+    for _, r in sub.iterrows():
+        d = (r["expiry"] - today).days
+        if d < 0:
+            continue
+        for f in EXPIRY_FIELDS:
+            if surface.finite(r[f]) and r[f] > 0:
+                out[f][d] = float(r[f])
+    return out if out["atm"] else None
 
 
 def load_snapshots(asset: str, days: int) -> pd.DataFrame | None:

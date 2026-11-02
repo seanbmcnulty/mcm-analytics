@@ -77,6 +77,7 @@ jobs:
             git worktree add -B snapshots "$PUB" FETCH_HEAD
             cp "$PUB"/data/snapshots/*_surface.* "$BASELINE"/ 2>/dev/null || true
             cp "$PUB"/data/snapshots/*_surface.* data/snapshots/ 2>/dev/null || true
+            cp "$PUB"/data/snapshots/*_expiry.csv data/snapshots/ 2>/dev/null || true
           elif [ "$rc" -eq 2 ]; then
             echo "HAVE_BRANCH=0" >> "$GITHUB_ENV"
             git worktree add --orphan -b snapshots "$PUB"
@@ -114,6 +115,7 @@ jobs:
             if [ "$attempt" -eq 1 ]; then
               rm -f "$PUB"/data/snapshots/*_surface.*   # mirror candidate exactly (csv->parquet switch)
               cp data/snapshots/*_surface.* "$PUB/data/snapshots/"
+              cp data/snapshots/*_expiry.csv "$PUB/data/snapshots/" 2>/dev/null || true
             else
               # Branch moved: merge our rows onto the new tip, re-validate.
               git -C "$PUB" fetch --depth=1 origin snapshots
@@ -121,6 +123,7 @@ jobs:
               rm -rf "$BASELINE" && mkdir -p "$BASELINE"
               cp "$PUB"/data/snapshots/*_surface.* "$BASELINE"/
               python scripts/snapshot_tools.py merge --base "$PUB/data/snapshots" --incoming data/snapshots
+              python scripts/merge_expiry.py "$PUB/data/snapshots" data/snapshots
               python scripts/snapshot_tools.py validate --published "$BASELINE" --candidate "$PUB/data/snapshots" --max-added 2
             fi
             git -C "$PUB" add -f -A data/snapshots
