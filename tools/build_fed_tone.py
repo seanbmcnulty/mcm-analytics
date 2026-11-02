@@ -18,8 +18,8 @@ for y in range(first, pd.Timestamp.utcnow().year + 1):
         html = requests.get(BASE + page, headers=UA, timeout=30).text
     except Exception as e:
         print("skip", y, e); continue
-    for m in re.finditer(r"/mediacenter/files/FOMCpresconf(\d{8})\.pdf", html):
-        urls[m.group(1)] = BASE + m.group(0)
+    for m in re.finditer(r"presconf(\d{8})\.(?:htm|pdf)", html):
+        urls[m.group(1)] = f"{BASE}/mediacenter/files/FOMCpresconf{m.group(1)}.pdf"
 rows = []
 for ds, u in sorted(urls.items()):
     if int(ds[:4]) < first: continue
@@ -30,8 +30,8 @@ for ds, u in sorted(urls.items()):
         print(ds, rows[-1]["score"])
     except Exception as e:
         print("fail", ds, e)
-out = pd.DataFrame(rows).sort_values("date")
-if out.empty:
+if not rows:
     sys.exit("no transcripts fetched; existing data/fed_tone.csv left untouched")
+out = pd.DataFrame(rows).sort_values("date")
 out.to_csv(DATA_DIR / "fed_tone.csv", index=False)
 print("wrote", len(out))

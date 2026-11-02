@@ -32,3 +32,4 @@ arch>=6.2.0
 toml>=0.10.2
 kaleido>=0.2.1,<0.3.0
 streamlit-autorefresh>=1.0.1
+lxml>=4.9.0  # pandas.read_html (Farside ETF flows scrape, lib/ecoinometrics.py)

@@ -90,11 +90,20 @@ def rolling_flow(df: pd.DataFrame, window: int = 30) -> pd.Series:
 
 
 # ----------------------------------------------------------- external helpers
-def fred_series(series_id: str, timeout: int = 20) -> pd.DataFrame:
-    """FRED public CSV (no key). Returns DataFrame[date, value]."""
-    r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv", params={"id": series_id},
-                     headers=UA, timeout=timeout)
-    r.raise_for_status()
+def fred_series(series_id: str, timeout: int = 45, start: str = "2013-01-01", retries: int = 3) -> pd.DataFrame:
+    """FRED public CSV (no key). Returns DataFrame[date, value].
+    `cosd` limits history — the full-history CSV is large and often times out."""
+    err = None
+    for _ in range(retries):
+        try:
+            r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
+                             params={"id": series_id, "cosd": start}, headers=UA, timeout=timeout)
+            r.raise_for_status()
+            break
+        except requests.RequestException as e:
+            err = e
+    else:
+        raise err
     df = pd.read_csv(io.StringIO(r.text))
     df.columns = ["date", "value"]
     df["date"] = pd.to_datetime(df["date"])
