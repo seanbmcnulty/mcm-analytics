@@ -90,9 +90,11 @@ def rolling_flow(df: pd.DataFrame, window: int = 30) -> pd.Series:
 
 
 # ----------------------------------------------------------- external helpers
-def fred_series(series_id: str, timeout: int = 45, start: str = "2013-01-01", retries: int = 3) -> pd.DataFrame:
+def fred_series(series_id: str, timeout: int = 15, start: str = "2013-01-01", retries: int = 2,
+                live_only: bool = False) -> pd.DataFrame:
     """FRED public CSV (no key). Returns DataFrame[date, value].
-    `cosd` limits history — the full-history CSV is large and often times out."""
+    Falls back to data/fred_<ID>.csv (kept fresh by tools/build_fred_cache.py + GH Action)
+    because Streamlit Cloud frequently times out reaching FRED."""
     err = None
     for _ in range(retries):
         try:
@@ -103,7 +105,11 @@ def fred_series(series_id: str, timeout: int = 45, start: str = "2013-01-01", re
         except requests.RequestException as e:
             err = e
     else:
-        raise err
+        p = DATA_DIR / f"fred_{series_id}.csv"
+        if live_only or not p.exists():
+            raise err
+        df = pd.read_csv(p, parse_dates=["date"])
+        return df.dropna().reset_index(drop=True)
     df = pd.read_csv(io.StringIO(r.text))
     df.columns = ["date", "value"]
     df["date"] = pd.to_datetime(df["date"])

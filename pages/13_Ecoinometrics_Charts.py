@@ -164,18 +164,42 @@ with tabs[2]:
             ft = eco.add_fed_funds(ft, dff)
         fig = go.Figure()
         have = "ffr" in ft
-        cmax = max(5.5, float(ft["ffr"].max())) if have else 5.5
-        # line: one segment per meeting pair, coloured by fed funds
+        # colour driver: fed funds when FRED is available, else the tone level itself
+        drv = ft["ffr"] if have else ft["avg6"]
+        lo, hi = (0.0, max(5.5, float(drv.max()))) if have else (-50.0, 100.0)
+        ramp = [[0, "#1B4F72"], [0.2, es.TEAL], [0.4, "#8CC7A1"], [0.55, es.YELLOW],
+                [0.78, "#F08A0A"], [1, "#B3123F"]]
+        def _col(v):
+            t = min(1.0, max(0.0, (v - lo) / (hi - lo)))
+            for (t0, c0), (t1, c1) in zip(ramp, ramp[1:]):
+                if t <= t1:
+                    f = (t - t0) / (t1 - t0) if t1 > t0 else 0
+                    a_, b_ = [int(c0[i:i + 2], 16) for i in (1, 3, 5)], [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+                    return "#%02X%02X%02X" % tuple(round(x + (y - x) * f) for x, y in zip(a_, b_))
+            return ramp[-1][1]
+        ymax = float(max(100, ft["idx"].max() + 5)); ymin = float(min(-50, ft["idx"].min() - 5))
+        fig.add_hrect(y0=0, y1=ymax, fillcolor="#F51E0A", opacity=0.06, line_width=0,
+                      annotation_text="HAWKISH", annotation_position="top right",
+                      annotation_font=dict(color="#B3123F", size=11))
+        fig.add_hrect(y0=ymin, y1=0, fillcolor="#4A9AB5", opacity=0.12, line_width=0,
+                      annotation_text="DOVISH", annotation_position="bottom right",
+                      annotation_font=dict(color="#1B4F72", size=11))
+        # lollipop stems from zero to each meeting's score
+        for d, v, c in zip(ft["date"], ft["idx"], drv):
+            fig.add_shape(type="line", x0=d, x1=d, y0=0, y1=v, line=dict(color=_col(c), width=1.5), opacity=0.45)
+        # smoothed line: one glowing segment per meeting pair
         for i in range(1, len(ft)):
-            col = es.RAMP[min(4, int(ft["ffr"].iloc[i] / cmax * 4.999))][1] if have else es.ORANGE
-            fig.add_trace(go.Scatter(x=ft["date"].iloc[i - 1:i + 1], y=ft["avg6"].iloc[i - 1:i + 1],
-                                     mode="lines", line=dict(color=col, width=4), hoverinfo="skip"))
+            seg = dict(x=ft["date"].iloc[i - 1:i + 1], y=ft["avg6"].iloc[i - 1:i + 1], mode="lines",
+                       hoverinfo="skip", showlegend=False)
+            fig.add_trace(go.Scatter(**seg, line=dict(color=_col(drv.iloc[i]), width=11), opacity=0.18))
+            fig.add_trace(go.Scatter(**seg, line=dict(color=_col(drv.iloc[i]), width=4)))
         fig.add_trace(go.Scatter(
-            x=ft["date"], y=ft["idx"], mode="markers",
-            marker=dict(size=9, symbol=["triangle-up" if v > 0 else "square" for v in ft["idx"]],
-                        color=ft["ffr"] if have else es.ORANGE, colorscale=es.RAMP, cmin=0, cmax=cmax,
-                        showscale=have, colorbar=dict(title="Fed funds %", orientation="h", y=1.02, len=0.4,
-                                                      thickness=10, x=0.35)),
+            x=ft["date"], y=ft["idx"], mode="markers", showlegend=False,
+            marker=dict(size=11, symbol=["triangle-up" if v > 0 else "triangle-down" for v in ft["idx"]],
+                        color=drv, colorscale=ramp, cmin=lo, cmax=hi,
+                        line=dict(color="white", width=1.2),
+                        showscale=True, colorbar=dict(title="Fed funds %" if have else "Tone", orientation="h",
+                                                      y=1.02, len=0.4, thickness=10, x=0.35)),
             hovertemplate="%{x|%d %b %Y}: %{y:.1f}<extra></extra>"))
         es.style(fig, "Fed Press-Conference Tone", "Tone",
                  "Hawkish minus dovish language in the Chair's FOMC press-conference remarks; line is the six-meeting average.",
