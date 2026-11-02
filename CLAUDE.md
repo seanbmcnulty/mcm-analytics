@@ -1485,3 +1485,15 @@ not a code bug — confirmed via `WebFetch` on the raw GitHub content).
   while sanity-checking the diff, which left a `.git/index.lock` behind
   (see the new warning above) — flagged to the user to delete it by hand
   before they run `push_to_github.bat`.
+
+### 2026-11-01 — Ecoinometrics charts page
+`pages/13_Ecoinometrics_Charts.py` + `lib/ecoinometrics.py` replicate charts from the
+Ecoinometrics newsletter (ETF flow streaks + rolling flow, BTC returns after exchange hacks,
+Fed press-conference tone). **Third deliberate non-Deribit exception** (user-approved
+2026-11-01): Farside ETF flows (scraped; fallback `data/etf_flows.csv`) and federalreserve.gov
+transcripts (`tools/build_fed_tone.py` -> `data/fed_tone.csv`, lexicon proxy, not their index).
+`data/exchange_hacks.csv` is hand-curated and UNVERIFIED. Network paths were not testable from the
+Cowork shell (no egress); pure functions covered by `tests/test_ecoinometrics.py`.
+Weekly scheduled task scans new Ecoinometrics emails for reproducible charts.
+
+2026-11-01 (later): Ecoinometrics page restyled via `lib/eco_style.py` (cream card, serif, red/teal); ETF chart now in BTC (Farside US$ / BTC close), hacks = 16-event scatter vs size (Bitstamp for pre-Aug-2018 prices), Fed tone coloured by FRED DFF; added 200DMA, BTC–Nasdaq correlation, CPI/10Y tabs (FRED). Network paths untested from Cowork.

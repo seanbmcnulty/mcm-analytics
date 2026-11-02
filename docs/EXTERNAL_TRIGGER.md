@@ -6,7 +6,7 @@ fix is an outside timer that calls the workflow's `workflow_dispatch` API
 every 15 minutes. The crons in `record_snapshots.yml` stay as a backup, and
 slot-based skip (`--slot-minutes 15`: at most one row per :00/:15/:30/:45 UTC slot) means duplicate triggers do nothing.
 
-Nothing in this doc has been set up yet. You need to do both steps yourself.
+**Status (1 Nov 2026):** the live trigger is a cron-job.org job, "MCM snapshot trigger" (every 15 min, POST to the URL below, fine-grained token `mcm-snapshot-trigger` in its Authorization header). It replaced a Grok automation that read the token from a file in Grok's sandbox; that file was wiped twice (23 Oct, 31 Oct) and the trigger silently stopped. The Grok automation is paused. If snapshots go stale again, check the job history at console.cron-job.org first (expect HTTP 204).
 
 ## 1. Create a fine-grained GitHub token (github.com)
 

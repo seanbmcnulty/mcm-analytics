@@ -1,0 +1,17 @@
+date,exchange,loss_usd_m,note
+2015-01-05,Bitstamp,5,VERIFY dates/sizes (16 events as plotted by Ecoinometrics 2026-10-30; sizes read off their chart)
+2016-08-02,Bitfinex,70,
+2017-12-06,NiceHash,64,
+2018-01-26,Coincheck,530,
+2018-02-09,BitGrail,170,
+2018-06-10,Coinrail,40,
+2018-06-20,Bithumb,31,
+2018-09-20,Zaif,60,
+2019-05-07,Binance,40,
+2019-11-27,Upbit,49,
+2020-09-25,KuCoin,280,
+2024-05-31,DMM Bitcoin,305,
+2024-07-18,WazirX,235,
+2025-01-23,Phemex,80,
+2025-02-21,Bybit,1500,
+2025-11-27,Upbit,30,
