@@ -159,19 +159,26 @@ def cmd_vol_term_structure(asset: str, **kwargs):
     lookbacks = [("24h Ago", timedelta(hours=24), 3.0),
                  ("1 Week Ago", timedelta(days=7), 6.0),
                  ("1 Month Ago", timedelta(days=30), 12.0)]
+    grid_pts = {sk: (lb, r) for lb, sk, _t, r in _lookback_points(
+        frame, now, [(l, d) for l, d, _ in lookbacks])}
     for label, delta, tol in lookbacks:
         ex = history.expiry_snapshot_near(asset, now - delta, tol, now)
         if ex is not None:
             series.append((label, label, ex["atm"]))
             exact_labels.add(label)
-        else:
-            missing_lookbacks.append(label)  # no grid fallback: it smears expiry bumps
+        elif label in grid_pts:
+            # Fallback until per-expiry history reaches back this far: the
+            # fixed-tenor grid, re-keyed to today's expiry dates. It smooths
+            # single-expiry bumps, so it's flagged "(est.)".
+            lb, row = grid_pts[label]
+            series.append((lb, label, _row_to_map(row, now)))
+            missing_lookbacks.append(label)
 
     for label, style_key, vals in series:
         style = TERM_STRUCTURE_SERIES_STYLE.get(style_key, TERM_STRUCTURE_SERIES_STYLE["Current"])
         y = [_pct(_at(vals, d)) for d in dtes]
         is_current = label == "Current"
-        name = label if (is_current or not estimated or style_key in exact_labels) else f"{label} (est.)"
+        name = label if (is_current or style_key in exact_labels) else f"{label} (est.)"
         fig.add_trace(go.Scatter(
             x=x_cat, y=y, name=name, connectgaps=True,
             mode="lines+markers+text" if is_current else "lines+markers",
@@ -188,8 +195,9 @@ def cmd_vol_term_structure(asset: str, **kwargs):
         height=450, template=TEMPLATE, xaxis=dict(type="category"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
     )
-    note = (f"Per-expiry history not yet recorded far enough back for: "
-            f"{', '.join(missing_lookbacks)}." if missing_lookbacks else None)
+    note = (f"(est.) lines use smoothed fixed-tenor history until per-expiry history "
+            f"reaches back far enough: {', '.join(missing_lookbacks)}."
+            if missing_lookbacks else None)
     finalize(fig, note=note, legend_rows=1)
     return fig, None, None
 
