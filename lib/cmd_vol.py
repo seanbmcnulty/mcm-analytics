@@ -155,19 +155,17 @@ def cmd_vol_term_structure(asset: str, **kwargs):
     # Prefer per-expiry history (same expiry DATE then vs now); fall back to the
     # fixed-tenor snapshot grid only where that history doesn't reach back yet.
     exact_labels: set[str] = set()
+    missing_lookbacks: list[str] = []
     lookbacks = [("24h Ago", timedelta(hours=24), 3.0),
                  ("1 Week Ago", timedelta(days=7), 6.0),
                  ("1 Month Ago", timedelta(days=30), 12.0)]
-    grid_pts = {sk: (lb, r) for lb, sk, _t, r in _lookback_points(
-        frame, now, [(l, d) for l, d, _ in lookbacks])}
     for label, delta, tol in lookbacks:
         ex = history.expiry_snapshot_near(asset, now - delta, tol, now)
         if ex is not None:
             series.append((label, label, ex["atm"]))
             exact_labels.add(label)
-        elif label in grid_pts:
-            lb, row = grid_pts[label]
-            series.append((lb, label, _row_to_map(row, now)))
+        else:
+            missing_lookbacks.append(label)  # no grid fallback: it smears expiry bumps
 
     for label, style_key, vals in series:
         style = TERM_STRUCTURE_SERIES_STYLE.get(style_key, TERM_STRUCTURE_SERIES_STYLE["Current"])
@@ -190,8 +188,8 @@ def cmd_vol_term_structure(asset: str, **kwargs):
         height=450, template=TEMPLATE, xaxis=dict(type="category"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
     )
-    note = (f"Lagged snapshots reconstructed from {src} — Deribit serves no "
-            "option-IV history." if (estimated and len(series) > 1) else None)
+    note = (f"Per-expiry history not yet recorded far enough back for: "
+            f"{', '.join(missing_lookbacks)}." if missing_lookbacks else None)
     finalize(fig, note=note, legend_rows=1)
     return fig, None, None
 
@@ -541,10 +539,11 @@ def cmd_vol_run(asset: str, **kwargs):
     # grid maps above are only a fallback until that history covers the window.
     ex_3h = history.expiry_snapshot_near(asset, now - timedelta(hours=3), 1.0, now)
     ex_open = history.expiry_snapshot_near(asset, open_ts, 1.0, now)
-    if ex_3h is not None:
-        map_3h = ex_3h["atm"]
-    if ex_open is not None:
-        map_open = ex_open["atm"]
+    # No fallback to the fixed-tenor grid here: it interpolates away single-expiry
+    # bumps and gave wildly wrong changes. Blank until per-expiry history covers
+    # the window.
+    map_3h = ex_3h["atm"] if ex_3h is not None else {}
+    map_open = ex_open["atm"] if ex_open is not None else {}
 
     # Parkinson RV by tenor from Deribit perp candles.
     daily = history.perp_ohlc(asset, days=400, resolution="1D")
