@@ -76,3 +76,21 @@ def test_surface_grid_masks_outside_range():
     kg = np.linspace(-0.9, 0.9, 19)
     z = L.surface_grid(df, kg)
     assert z.shape[0] == 2 and z.isna().to_numpy().any() and z.notna().to_numpy().any()
+
+
+def test_deribit_expiry_grid():
+    import pandas as pd
+    df, _ = L.parse_cboe(_payload(), NOW)
+    mI = L.expiry_metrics(df)
+    exps = pd.to_datetime(["2026-10-30", "2026-11-06", "2026-11-27", "2026-12-25", "2027-12-31"], utc=True)
+    mD = pd.DataFrame(dict(expiry=exps, dte=[(e - pd.Timestamp(NOW)).total_seconds() / 86400 for e in exps],
+                           atm=[0.5] * 5, rr25=[-0.02] * 5, fly25=[0.01] * 5, rr10=[-0.03] * 5,
+                           fly10=[0.02] * 5, rr25_n=[-0.04] * 5))
+    g = L.deribit_expiry_grid(mD, mI)
+    assert len(g) == 5 and list(g["type"]) == ["Monthly", "Weekly", "Monthly", "Quarterly", "Quarterly"]
+    # IBIT quoted only 20-Nov..15-Jan -> NaN outside that range (no extrapolation)
+    assert g["I_atm"].iloc[:2].isna().all() and g["I_atm"].iloc[2:4].notna().all() and np.isnan(g["I_atm"].iloc[-1])
+    assert abs(g["X_atm"].iloc[2] - (g["I_atm"].iloc[2] - 0.5)) < 1e-12
+    assert len(L.deribit_expiry_grid(mD, mI, kind=L.EXPIRY_FILTERS[1])) == 5
+    assert len(L.deribit_expiry_grid(mD, mI, kind=L.EXPIRY_FILTERS[2])) == 4
+    assert len(L.deribit_expiry_grid(mD, mI, max_dte=30)) == 2

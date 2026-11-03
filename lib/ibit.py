@@ -239,6 +239,44 @@ def at_tenors(metrics: pd.DataFrame, cols: list[str],
     return pd.DataFrame(res)
 
 
+EXPIRY_FILTERS = ("All expiries", "Fridays (weekly+)", "Monthlies & quarterlies")
+TS_COLS = ["atm", "rr25", "fly25", "rr10", "fly10", "rr25_n"]
+
+
+def _last_friday(ts: pd.Timestamp) -> bool:
+    return ts.weekday() == 4 and (ts + pd.Timedelta(days=7)).month != ts.month
+
+
+def deribit_expiry_grid(mD: pd.DataFrame, mI: pd.DataFrame, cols: list[str] = TS_COLS,
+                        kind: str = "All expiries", min_dte: float = 2.0,
+                        max_dte: float = 1e9) -> pd.DataFrame:
+    """Term structure on Deribit's *listed* expiry dates.
+
+    One row per Deribit expiry; ``D_<c>`` is Deribit's own value, ``I_<c>`` is IBIT
+    linearly interpolated (in DTE, no extrapolation) at that expiry's DTE, and
+    ``X_<c>`` = IBIT - Deribit.  ``kind`` filters the Deribit expiries (Fridays =
+    weeklies and longer; monthlies & quarterlies = last Friday of the month).
+    """
+    d = mD[(mD["dte"] >= min_dte) & (mD["dte"] <= max_dte)].copy()
+    if kind != EXPIRY_FILTERS[0]:
+        ex = pd.to_datetime(d["expiry"])
+        d = d[ex.map(lambda t: t.weekday() == 4)] if kind == EXPIRY_FILTERS[1] \
+            else d[ex.map(_last_friday)]
+    if d.empty:
+        return pd.DataFrame()
+    out = d[["expiry", "dte"]].reset_index(drop=True)
+    out["type"] = ["Quarterly" if (_last_friday(pd.Timestamp(e)) and pd.Timestamp(e).month % 3 == 0)
+                   else "Monthly" if _last_friday(pd.Timestamp(e))
+                   else "Weekly" if pd.Timestamp(e).weekday() == 4 else "Daily"
+                   for e in out["expiry"]]
+    ti = at_tenors(mI, cols, out["dte"].tolist()) if len(mI) else None
+    for c in cols:
+        out[f"D_{c}"] = d[c].values
+        out[f"I_{c}"] = ti[c].values if ti is not None else np.nan
+        out[f"X_{c}"] = out[f"I_{c}"] - out[f"D_{c}"]
+    return out
+
+
 def surface_grid(df: pd.DataFrame, kgrid: np.ndarray, min_dte: float = 2.0
                  ) -> pd.DataFrame:
     """Rows = expiry DTE, cols = log-moneyness; NaN outside the quoted range."""

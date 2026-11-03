@@ -327,6 +327,65 @@ if _view == _VIEWS[0]:
                     f.add_hline(y=0, line=dict(color=MUTED, dash="dot"))
                 show(sty(f, 340, ttl, "Days to expiry", None).update_xaxes(type="log"), f"ts_{col}")
 
+        # -- term structure on Deribit's fixed expiries ---------------------------
+        sec("Term structure on Deribit expiries",
+            "Deribit's listed expiry dates on the x-axis; IBIT interpolated (in DTE) to each one. "
+            "Blank = Deribit expiry outside IBIT's listed range", VIO)
+        _TS_MET = {"atm": ("ATM implied vol", "%"), "rr25": ("25Δ risk reversal", "vol pts"),
+                   "fly25": ("25Δ butterfly", "vol pts"), "rr10": ("10Δ risk reversal", "vol pts"),
+                   "fly10": ("10Δ butterfly", "vol pts"), "rr25_n": ("Skew: RR25 / ATM", "%")}
+        e1, e2, e3 = st.columns([1.3, 1.1, 1.3])
+        with e1:
+            ts_kind = st.selectbox("Deribit expiries", L.EXPIRY_FILTERS, index=0, key="ibit_ts_kind",
+                                   help="All = dailies + weeklies + monthlies + quarterlies. "
+                                        "Monthlies/quarterlies = last Friday of the month.")
+        with e2:
+            ts_max = st.selectbox("Max DTE", [30, 60, 90, 180, 365, 730], index=4, key="ibit_ts_max",
+                                  format_func=lambda d: f"{d} DTE")
+        with e3:
+            ts_met = st.selectbox("Chart metric", list(_TS_MET), index=0, key="ibit_ts_met",
+                                  format_func=lambda c: _TS_MET[c][0])
+        eg = L.deribit_expiry_grid(mD, mI, kind=ts_kind, max_dte=ts_max)
+        if eg.empty:
+            st.info("No Deribit expiries match this filter.")
+        else:
+            lab = [f"{e:%d %b %y}" for e in eg["expiry"]]
+            cd = np.column_stack([eg["dte"].round(1), eg["type"]])
+            f = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.68, 0.32],
+                              vertical_spacing=0.06)
+            for nm, pre, colr in (("Deribit BTC", "D_", DER), ("IBIT (interp.)", "I_", IB)):
+                f.add_scatter(x=lab, y=eg[f"{pre}{ts_met}"] * 100, name=nm, mode="lines+markers",
+                              line=dict(color=colr, width=2.5), marker=dict(size=7), customdata=cd,
+                              connectgaps=False,
+                              hovertemplate="%{x} · %{customdata[0]}d · %{customdata[1]}<br>"
+                                            "%{y:.2f}<extra>" + nm + "</extra>", row=1, col=1)
+            dx = eg[f"X_{ts_met}"] * 100
+            f.add_bar(x=lab, y=dx, name="IBIT − Deribit", marker_color=np.where(dx >= 0, IB, DER),
+                      showlegend=False, customdata=cd,
+                      hovertemplate="%{x} · %{customdata[0]}d<br>%{y:+.2f} pts<extra>IBIT − Deribit</extra>",
+                      row=2, col=1)
+            f.add_hline(y=0, line=dict(color=MUTED, dash="dot"), row=2, col=1)
+            f.update_xaxes(type="category", tickangle=-45)
+            f.update_yaxes(title_text=_TS_MET[ts_met][1], row=1, col=1)
+            f.update_yaxes(title_text="IBIT − Deribit", row=2, col=1)
+            show(sty(f, 520, f"{_TS_MET[ts_met][0]} by Deribit expiry"), "ts_dexp")
+
+            tt = pd.DataFrame({"Expiry": lab, "Type": eg["type"], "DTE": eg["dte"].round(1)})
+            for c, nm in (("atm", "ATM"), ("rr25", "RR25"), ("fly25", "Fly25")):
+                tt[f"Deribit {nm}"] = eg[f"D_{c}"] * 100
+                tt[f"IBIT {nm}"] = eg[f"I_{c}"] * 100
+                tt[f"Δ {nm}"] = eg[f"X_{c}"] * 100
+            st.dataframe(
+                tt.style.format({c: "{:+.1f}" if c.startswith("Δ") else "{:.1f}" for c in tt.columns[3:]},
+                                na_rep="–")
+                .format({"DTE": "{:.1f}"})
+                .background_gradient(subset=[c for c in tt.columns if c.startswith("Δ")],
+                                     cmap="RdBu", vmin=-8, vmax=8),
+                hide_index=True, width="stretch")
+            st.caption("Vol points; Δ = IBIT − Deribit. IBIT is linearly interpolated in DTE between its listed "
+                       "expiries (no extrapolation), so very short Deribit dailies and the far wings of the curve "
+                       "can be blank. Deribit expires 08:00 UTC, IBIT at the 16:00 ET close — matched on time to expiry.")
+
         # -- tenor table ---------------------------------------------------------
         cols = ["atm", "rr25", "fly25", "rr10", "fly10"]
         tI, tD = L.at_tenors(mI, cols), L.at_tenors(mD, cols)
