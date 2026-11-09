@@ -300,6 +300,32 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-11-09 — Ecoinometrics: close/200DMA ratio and MCM ETF flow regime
+
+Two extra tabs on `pages/13_Ecoinometrics_Charts.py`, inspired by the 6 Nov 2026
+Ecoinometrics issue. Existing streak, price-vs-200DMA, hack, Fed, Nasdaq, and
+CPI/yields views are unchanged.
+
+- **BTC / 200DMA ratio.** `lib/ecoinometrics.py:price_sma_ratio` is the Deribit
+  BTC-PERPETUAL daily close divided by a 200-**calendar**-day mean. The series
+  is reindexed onto every UTC day; a gap stays blank (no fill, no Bitstamp
+  splice). A ratio exists only when all 200 days have a real close. This is
+  separate from `sma_gap`, which still averages the last 200 observations for
+  the older "BTC vs 200DMA" tab. The line is coloured by that day's close.
+- **ETF flow regime.** Farside US$ millions converted with the existing
+  `flows_to_btc` rule (× 1,000,000 / same-UTC-date Deribit perp close; sessions
+  without a positive close are dropped). `etf_flow_regime` labels each session
+  from the trailing 5-session sum versus the trailing 63-session median of
+  absolute flow: mild at 2×, strong at 5×. Warmup sessions are `unclassified`,
+  not neutral. Zero scale does not use "strong". This is MCM's rule, documented
+  in the tab, and was not fitted to the Ecoinometrics model (unpublished).
+- Charts go through `lib/eco_charts.py` → `fx_style.apply_theme(..., "light")`
+  and `finalize`, so axis text is dark on white. Display window uses
+  `fx_style.local_now()` (SGT). No new process cache; the page's existing
+  `st.cache_data` fetches are already cleared by `clear_all_caches`.
+- Compute on the full history, then `display_from`. Slicing first would treat
+  the left edge of the lookback as warmup.
+
 ### 2026-10-21 - IBIT page (Cboe delayed chain vs Deribit BTC)
 
 User asked for an IBIT page with as many charts as possible, centred on Deribit vs IBIT vol surface,

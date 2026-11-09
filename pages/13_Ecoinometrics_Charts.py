@@ -5,6 +5,11 @@ Ecoinometrics newsletter, restyled to match their look (lib/eco_style.py).
 Exceptions to "Deribit-only" (user-approved 2026-11-01): Farside ETF flows, Bitstamp daily
 closes (hack events before Aug 2018 only), FRED (fed funds, Nasdaq, CPI, 10Y), and
 federalreserve.gov transcripts. Fed tone is a lexicon proxy, NOT their Fed Communication Index.
+
+The "BTC / 200DMA ratio" and "ETF flow regime" tabs (2026-11-09) are extra views
+inspired by the 6 Nov 2026 Ecoinometrics issue. The ratio is the Deribit daily
+close over a 200-calendar-day average. The flow colours are MCM's own regime,
+not the unpublished Ecoinometrics model. Both are drawn with fx_style.
 """
 import sys
 from pathlib import Path
@@ -21,13 +26,16 @@ from lib.deribit import get_tradingview_ohlc
 from lib.constants import TTL_SLOW, TTL_DAILY_EXTERNAL
 from lib import cache as cache_lib
 from lib import ecoinometrics as eco
+from lib import eco_charts
 from lib import eco_style as es
+from lib import fx_style
 
 st.set_page_config(page_title="Ecoinometrics Charts", page_icon="📰",
                    layout="wide", initial_sidebar_state="expanded")
 st.title("📰 Ecoinometrics-style charts")
 st.caption("Our own versions of recurring Ecoinometrics charts, plus extras. Sources: Farside, "
-           "Deribit BTC-PERP, Bitstamp (pre-2018), FRED, federalreserve.gov.")
+           "Deribit BTC-PERP, Bitstamp (pre-2018), FRED, federalreserve.gov. "
+           "The flow-regime colours are an MCM approximation, not the Ecoinometrics model.")
 
 with st.sidebar:
     st.header("Parameters")
@@ -39,7 +47,17 @@ with st.sidebar:
     cache_lib.render_refresh_button()
 
 LB_DAYS = {"6 months": 183, "1 year": 365, "2 years": 730, "All": 10_000}[lookback]
-cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=LB_DAYS)
+# Display window is anchored on the SGT calendar date. The ratio and the
+# flow regime are still computed on the full history, then sliced — see
+# eco.display_from.
+_now_sgt = fx_style.local_now()
+as_of_date = pd.Timestamp(_now_sgt.year, _now_sgt.month, _now_sgt.day)
+cutoff = as_of_date - pd.Timedelta(days=LB_DAYS)
+st.sidebar.caption(
+    f"Display window from {cutoff:%d %b %Y}. "
+    f"As of {_now_sgt:%d %b %Y %H:%M} SGT. "
+    "The 200-day average and the flow-regime scale use the full history, then this window is applied."
+)
 
 
 def show(fig):
@@ -83,7 +101,8 @@ def _safe(fn, *a):
 
 
 tabs = st.tabs(["ETF flow streaks", "Exchange hacks", "Fed tone", "BTC vs 200DMA",
-                "BTC–Nasdaq correlation", "Inflation & yields"])
+                "BTC–Nasdaq correlation", "Inflation & yields",
+                "BTC / 200DMA ratio", "ETF flow regime"])
 px = _btc_daily()
 
 # ------------------------------------------------------------------ ETF flows
@@ -261,5 +280,110 @@ with tabs[5]:
         fig.update_yaxes(ticksuffix="%")
         show(fig)
 
+# ------------------------------------------------------- close / 200-day ratio
+with tabs[6]:
+    st.caption(
+        "Bitcoin close divided by its 200-calendar-day average, coloured by the close. "
+        "Inspired by the 6 Nov 2026 Ecoinometrics chart "
+        "\"Bitcoin On Its Way To Retest The Long Term Trend\". "
+        f"As of {_now_sgt:%d %b %Y %H:%M} SGT."
+    )
+    if px is None:
+        st.error("No Deribit BTC-PERP daily history, so the ratio cannot be computed.")
+    else:
+        ratio_full = eco.price_sma_ratio(px, eco.SMA_CALENDAR_DAYS)
+        ratio_view = eco.display_from(ratio_full, cutoff)
+        valid = ratio_view.dropna(subset=["ratio"])
+        if valid.empty:
+            st.info(
+                f"No complete {eco.SMA_CALENDAR_DAYS}-calendar-day window inside this display range. "
+                "The average is left blank until every day in it has a real close."
+            )
+        else:
+            last = valid.iloc[-1]
+            c = st.columns(3)
+            c[0].metric("Close / 200-day average", f"{last['ratio']:.3f}")
+            c[1].metric("BTC close", f"{last['close']:,.0f} USD")
+            c[2].metric("200-day average", f"{last['sma']:,.0f} USD")
+            st.caption(
+                f"Latest valid session {pd.Timestamp(last['date']):%d %b %Y} "
+                f"(UTC date of the daily bar; Deribit stamps it at 08:00 UTC, "
+                f"16:00 SGT the same calendar date). "
+                f"The close is {last['ratio'] - 1:+.1%} versus the average."
+            )
+        show(eco_charts.figure_price_sma_ratio(ratio_view))
+    with st.expander("How the 200-day ratio is calculated"):
+        st.markdown(eco.sma_ratio_methodology())
+
+# ------------------------------------------------------- ETF flow regime
+with tabs[7]:
+    st.caption(
+        "Daily US spot BTC ETF net flow in BTC, coloured by MCM's trailing-flow regime. "
+        "Inspired by the 6 Nov 2026 Ecoinometrics chart "
+        "\"Bitcoin ETFs Regime Has Switched To Strong Outflows\". "
+        "The regime is our approximation, not their unpublished model. "
+        f"As of {_now_sgt:%d %b %Y %H:%M} SGT."
+    )
+    flows = _safe(_etf)
+    if flows is None or px is None:
+        st.error("The flow regime needs the Farside total and Deribit BTC-PERP daily closes.")
+    else:
+        btc_flow = eco.flows_to_btc(flows, px)
+        if btc_flow.empty:
+            st.warning(
+                "No Farside session shared a UTC date with a positive Deribit close, "
+                "so no bar was converted. Missing prices were not filled with zero or with an earlier close."
+            )
+        else:
+            regime_full = eco.etf_flow_regime(btc_flow)
+            regime_view = eco.display_from(regime_full, cutoff)
+            if regime_view.empty:
+                st.info("No aligned sessions inside this display window.")
+            else:
+                last = regime_view.iloc[-1]
+                label = eco_charts.REGIME_LABELS.get(str(last["regime"]), str(last["regime"]))
+                c = st.columns(3)
+                c[0].metric("Latest daily flow", f"{last['flow']:,.0f} BTC")
+                c[1].metric("MCM regime", label)
+                sum_txt = "warmup" if pd.isna(last["sum_window"]) else f"{last['sum_window']:,.0f} BTC"
+                c[2].metric(f"{eco.FLOW_REGIME_WINDOW}-session sum", sum_txt)
+                if pd.notna(last["scale_median"]):
+                    st.caption(
+                        f"Session {pd.Timestamp(last['date']):%d %b %Y}. "
+                        f"Scale median {last['scale_median']:,.0f} BTC. "
+                        f"Mild cutoff ±{last['mild_cutoff']:,.0f} BTC. "
+                        f"Strong cutoff ±{last['strong_cutoff']:,.0f} BTC. "
+                        f"{len(regime_full)} aligned sessions in the full tape; "
+                        f"the first {eco.FLOW_REGIME_SCALE - 1} stay unclassified."
+                    )
+                else:
+                    st.caption(
+                        f"Session {pd.Timestamp(last['date']):%d %b %Y} is unclassified. "
+                        f"The scale median needs {eco.FLOW_REGIME_SCALE} aligned sessions; "
+                        f"the tape has {len(regime_full)}."
+                    )
+                audit = regime_view.tail(12).copy()
+                audit["date"] = pd.to_datetime(audit["date"]).dt.strftime("%d %b %Y")
+                audit["regime"] = audit["regime"].map(lambda r: eco_charts.REGIME_LABELS.get(str(r), str(r)))
+                show_cols = ["date", "flow", "sum_window", "scale_median", "mild_cutoff", "strong_cutoff", "regime"]
+                st.dataframe(
+                    audit[show_cols].rename(columns={
+                        "date": "Session",
+                        "flow": "Daily flow (BTC)",
+                        "sum_window": f"{eco.FLOW_REGIME_WINDOW}-session sum (BTC)",
+                        "scale_median": f"{eco.FLOW_REGIME_SCALE}-session median |flow| (BTC)",
+                        "mild_cutoff": "Mild cutoff (BTC)",
+                        "strong_cutoff": "Strong cutoff (BTC)",
+                        "regime": "Regime",
+                    }),
+                    width="stretch", hide_index=True,
+                )
+            show(eco_charts.figure_etf_flow_regime(regime_view))
+    with st.expander("How the flow regime is calculated"):
+        st.markdown(eco.flow_regime_methodology())
+
 st.divider()
-st.caption("Our own charts inspired by the Ecoinometrics newsletter, built from public data; not their data or index. No trading advice.")
+st.caption(
+    "Our own charts inspired by the Ecoinometrics newsletter, built from public data. "
+    "The ETF regime colours are an MCM approximation, not their model or their data. No trading advice."
+)
