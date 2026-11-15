@@ -300,6 +300,26 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-11-15 — Vol term structure lookbacks span every listed expiry
+
+`cmd_vol_term_structure` used the per-expiry snapshot for a whole lookback
+whenever one fell inside the tolerance, and `_at` on an `ExactMap` is NaN for
+any expiry that was not listed then. On 15 Nov 2026 that dropped BTC and ETH
+16–19 Nov plus 4 Dec from "1 Week Ago", and 19 Nov from "24h Ago".
+`connectgaps` hid a one-expiry hole; the unlisted front of the curve simply
+never started. Skew and butterfly already interpolate the fixed-tenor grid
+onto every current expiry, so they did not have the gap and were left alone.
+
+Recorded per-expiry IV is still kept where that expiry was listed (so a
+Friday bump is not smoothed away). A missing tenor inside the snapshot's
+range is linearly interpolated between the recorded expiries beside it — the
+1/7-day fixed-tenor pillars notched the 24h 19-Nov point by ~3 vol against
+those prints. Off either end of the recorded range (new dailies) the point
+comes from the same smoothed fixed-tenor grid the full "(est.)" line uses.
+Open markers plus the subtitle mark those points "(est.)". A lookback with
+no per-expiry history at all is unchanged ("1 Month Ago (est.)"). The
+command is shared by every asset. `tests/test_vol_term_structure.py`.
+
 ### 2026-10-21 - IBIT page (Cboe delayed chain vs Deribit BTC)
 
 User asked for an IBIT page with as many charts as possible, centred on Deribit vs IBIT vol surface,
