@@ -300,6 +300,19 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-11-15 — Exchange hacks: 2026 Bitget and Binance, coloured by year
+
+Added Bitget (2026-09-24, $387.5m; detection ~18:31 UTC) and Binance
+(2026-10-29, $6.34bn; ~20:05 UTC) to `data/exchange_hacks.csv`.
+`hack_event_returns` still anchors on the close of the daily bar stamped on
+the UTC event date. Deribit 1D bars open at 08:00 UTC, so a late-evening hack
+starts at the next morning's 08:00 print — the first settlement after the
+theft — not the previous close and not the next calendar date's bar. A
+horizon that runs past the last bar leaves `ret` as NaN (out of the average)
+and is drawn as an open circle at the return so far, with "(incomplete)" in
+the hover. Dots are coloured by year (`es.hack_scatter`); the zero line still
+shows the sign of the return.
+
 ### 2026-11-15 — Vol term structure lookbacks span every listed expiry
 
 `cmd_vol_term_structure` used the per-expiry snapshot for a whole lookback
