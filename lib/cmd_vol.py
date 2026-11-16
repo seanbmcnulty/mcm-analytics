@@ -80,6 +80,73 @@ def _at(vals: dict, dte: float) -> float:
     return surface.interp_at_dte(vals, float(dte))
 
 
+def _merge_lookback_iv(dtes, exact: dict | None,
+                       grid: dict | None) -> tuple[list[float], list[bool]]:
+    """Decimal IV at each current DTE, and whether that point is estimated.
+
+    A recorded per-expiry IV wins — that expiry was listed at the lookback,
+    so the print is the same contract, not a smoothed tenor. A tenor that was
+    not listed is an estimate, from recorded data only:
+
+    * inside the snapshot's expiry range, linearly between the surrounding
+      recorded expiries. The fixed-tenor grid is too coarse here (pillars at
+      1/7/14 days) and would notch a single missing daily against the real
+      prints on either side;
+    * off either end of that range (the usual case: new dailies inside the
+      front pillar), the smoothed fixed-tenor grid — the same curve a fully
+      estimated lookback already plots.
+
+    Nothing else is invented. A tenor with neither source stays NaN.
+    """
+    exact_pts: list[tuple[float, float]] = []
+    if exact is not None:
+        for k, v in exact.items():
+            try:
+                d = float(k)
+            except (TypeError, ValueError):
+                continue
+            if _finite(v):
+                exact_pts.append((d, float(v)))
+        exact_pts.sort()
+
+    ys: list[float] = []
+    est: list[bool] = []
+    for dte in dtes:
+        d = float(dte)
+        raw = None
+        if exact is not None:
+            raw = exact.get(int(round(d)))
+            if raw is None:
+                raw = exact.get(d)
+        if raw is not None and _finite(raw):
+            ys.append(float(raw))
+            est.append(False)
+            continue
+        left = [p for p in exact_pts if p[0] < d - 1e-6]
+        right = [p for p in exact_pts if p[0] > d + 1e-6]
+        if left and right:
+            (cl, vl), (cr, vr) = left[-1], right[0]
+            if cr != cl:
+                w = (d - cl) / (cr - cl)
+                ys.append(vl + (vr - vl) * w)
+                est.append(True)
+                continue
+        if grid:
+            g = surface.interp_at_dte(grid, d)
+            if _finite(g):
+                ys.append(float(g))
+                est.append(True)
+                continue
+        ys.append(float("nan"))
+        est.append(False)
+    return ys, est
+
+
+def _open_marker(symbol: str) -> str:
+    """Hollow twin of a series marker, used for estimated points on a mixed line."""
+    return symbol if str(symbol).endswith("-open") else f"{symbol}-open"
+
+
 def _fmt_ago(delta: timedelta) -> str:
     """Human label for an elapsed time, e.g. '6d Ago', '18h Ago'."""
     hours = delta.total_seconds() / 3600.0
@@ -135,7 +202,13 @@ def _lookback_points(frame: pd.DataFrame, now: datetime,
 # ===========================================================================
 
 def cmd_vol_term_structure(asset: str, **kwargs):
-    """ATM IV across listed expiries, with 24h / 1w / 1m lagged snapshots."""
+    """ATM IV across listed expiries, with 24h / 1w / 1m lagged snapshots.
+
+    Every lookback is drawn at every current expiry. Recorded per-expiry IV
+    is kept where that expiry was listed; tenors that were not listed yet are
+    filled (and marked estimated) so the line spans the same x-axis as the
+    live curve. See ``_merge_lookback_iv``.
+    """
     now = _now()
     live = surface.iv_by_dte_for_delta(asset, "delta50")
     live = {float(k): float(v) for k, v in live.items() if _finite(v)}
@@ -146,16 +219,18 @@ def cmd_vol_term_structure(asset: str, **kwargs):
     if not dtes:
         dtes = sorted(int(d) for d in live)
 
-    frame, estimated, src = history.surface_history(asset, "delta50", days=35)
+    frame, _estimated, _src = history.surface_history(asset, "delta50", days=35)
 
     fig = go.Figure()
     x_cat = [(now.date() + timedelta(days=int(d))).strftime("%d-%b") for d in dtes]
 
-    series: list[tuple[str, str, dict[float, float]]] = [("Current", "Current", live)]
-    # Prefer per-expiry history (same expiry DATE then vs now); fall back to the
-    # fixed-tenor snapshot grid only where that history doesn't reach back yet.
-    exact_labels: set[str] = set()
-    missing_lookbacks: list[str] = []
+    # (legend name, style key, decimal IV per dte, per-point estimated flag)
+    series: list[tuple[str, str, list[float], list[bool]]] = [(
+        "Current", "Current", [_at(live, d) for d in dtes], [False] * len(dtes))]
+    # Whole line is the smoothed grid (no per-expiry history that far back).
+    full_est: list[str] = []
+    # Some tenors on an otherwise recorded line were not listed yet.
+    partial: list[tuple[str, list[str]]] = []
     lookbacks = [("24h Ago", timedelta(hours=24), 3.0),
                  ("1 Week Ago", timedelta(days=7), 6.0),
                  ("1 Month Ago", timedelta(days=30), 12.0)]
@@ -163,30 +238,65 @@ def cmd_vol_term_structure(asset: str, **kwargs):
         frame, now, [(l, d) for l, d, _ in lookbacks])}
     for label, delta, tol in lookbacks:
         ex = history.expiry_snapshot_near(asset, now - delta, tol, now)
-        if ex is not None:
-            series.append((label, label, ex["atm"]))
-            exact_labels.add(label)
-        elif label in grid_pts:
-            # Fallback until per-expiry history reaches back this far: the
-            # fixed-tenor grid, re-keyed to today's expiry dates. It smooths
-            # single-expiry bumps, so it's flagged "(est.)".
-            lb, row = grid_pts[label]
-            series.append((lb, label, _row_to_map(row, now)))
-            missing_lookbacks.append(label)
+        exact = ex["atm"] if ex is not None else None
+        grid = None
+        grid_label = label
+        if label in grid_pts:
+            grid_label, row = grid_pts[label]
+            grid = _row_to_map(row, now)
+        if exact is None and not grid:
+            continue
+        ys, flags = _merge_lookback_iv(dtes, exact, grid)
+        finite = [i for i, v in enumerate(ys) if _finite(v)]
+        if not finite:
+            continue
+        # Per-expiry snapshot within tolerance keeps the requested label.
+        # A pure grid fallback uses the honest elapsed-time label.
+        display = label if exact is not None else grid_label
+        n_est = sum(1 for i in finite if flags[i])
+        if n_est == len(finite):
+            name = f"{display} (est.)"
+            full_est.append(display)
+        else:
+            name = display
+            if n_est:
+                partial.append((display, [x_cat[i] for i in finite if flags[i]]))
+        series.append((name, label, ys, flags))
 
-    for label, style_key, vals in series:
+    for name, style_key, ys, flags in series:
         style = TERM_STRUCTURE_SERIES_STYLE.get(style_key, TERM_STRUCTURE_SERIES_STYLE["Current"])
-        y = [_pct(_at(vals, d)) for d in dtes]
-        is_current = label == "Current"
-        name = label if (is_current or style_key in exact_labels) else f"{label} (est.)"
+        y = [_pct(v) for v in ys]
+        is_current = style_key == "Current"
+        wholly_est = name.endswith("(est.)")
+        # Mixed line: hollow markers on the tenors that were not listed then.
+        # A fully estimated line keeps its filled marker; the legend carries
+        # the "(est.)" suffix instead.
+        if (not is_current) and (not wholly_est) and any(flags):
+            symbol = [_open_marker(style["marker_symbol"]) if f else style["marker_symbol"]
+                      for f in flags]
+        else:
+            symbol = style["marker_symbol"]
+        custom = []
+        for v, f in zip(y, flags):
+            if not _finite(v):
+                custom.append("")
+            elif f and not wholly_est:
+                custom.append(f"{v:.1f} (est.)")
+            else:
+                custom.append(f"{v:.1f}")
+        marker = dict(symbol=symbol, size=8 if is_current else 7)
+        if isinstance(symbol, list):
+            marker["line"] = dict(width=1.6, color=style["color"])
         fig.add_trace(go.Scatter(
             x=x_cat, y=y, name=name, connectgaps=True,
             mode="lines+markers+text" if is_current else "lines+markers",
             text=surface.tidy_labels(x_cat) if is_current else [""] * len(x_cat),
             textposition="top center", textfont=dict(size=12),
+            customdata=custom,
+            hovertemplate="%{x}<br>" + name + ": %{customdata}<extra></extra>",
             line=dict(color=style["color"], width=style["width"],
                       dash=style["dash"], shape="spline"),
-            marker=dict(symbol=style["marker_symbol"], size=8 if is_current else 7),
+            marker=marker,
         ))
 
     fig.update_layout(
@@ -195,11 +305,32 @@ def cmd_vol_term_structure(asset: str, **kwargs):
         height=450, template=TEMPLATE, xaxis=dict(type="category"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
     )
-    note = (f"(est.) lines use smoothed fixed-tenor history until per-expiry history "
-            f"reaches back far enough: {', '.join(missing_lookbacks)}."
-            if missing_lookbacks else None)
-    finalize(fig, note=note, legend_rows=1)
+    note = _term_structure_est_note(full_est, partial)
+    # The filled-tenor sentence adds a subtitle line. The shared header
+    # estimate is a few pixels short of clearing the legend once that
+    # line is there.
+    finalize(fig, note=note, legend_rows=1, extra_top=20 if partial else 0)
     return fig, None, None
+
+
+def _term_structure_est_note(full_est: list[str],
+                             partial: list[tuple[str, list[str]]]) -> str | None:
+    """Subtitle for estimated vol-term lines and for filled points on mixed lines."""
+    parts = []
+    if full_est:
+        parts.append(
+            "(est.) lines use smoothed fixed-tenor history until per-expiry history "
+            f"reaches back far enough: {', '.join(full_est)}"
+        )
+    if partial:
+        bits = [f"{lab} ({', '.join(dates)})" for lab, dates in partial]
+        parts.append(
+            "Open markers are (est.) tenors not listed then: "
+            + "; ".join(bits)
+        )
+    if not parts:
+        return None
+    return ". ".join(parts) + "."
 
 
 # ===========================================================================

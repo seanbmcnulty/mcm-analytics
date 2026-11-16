@@ -153,23 +153,7 @@ with tabs[1]:
         if res.empty:
             st.warning("No events overlap the price history.")
         else:
-            m = res["ret"].mean()
-            fig = go.Figure(go.Scatter(
-                x=res["loss_usd_m"], y=res["ret"] * 100, mode="markers+text",
-                text=res["exchange"] + " (" + res["date"].dt.year.astype(str) + ")",
-                textposition=["top left" if v > 400 else ("bottom right" if r < 0 else "top right") for v, r in zip(res["loss_usd_m"], res["ret"])], textfont=dict(family="Arial", size=12, color=es.INK),
-                marker=dict(size=13, color=[es.RED if v >= 0 else es.TEAL for v in res["ret"]]),
-                hovertemplate="%{text}<br>%{y:.1f}% | $%{x:,.0f}M<extra></extra>"))
-            es.style(fig, "Bitcoin Returns After Major Crypto Hacks", "Bitcoin",
-                     f"Across {len(res)} exchange hacks the average {horizon}-day Bitcoin return was {m:.1%}. "
-                     "Size of the hack tells us little about what happens next.",
-                     f"Notes: {len(res)} selected events; close-to-close return from event date to date + {horizon} days. "
-                     "Event list hand-curated in data/exchange_hacks.csv (verify). Prices: Deribit, Bitstamp pre-2018.")
-            fig.update_xaxes(type="log", title_text="Reported hack size (USD millions, log scale)",
-                             tickvals=[5, 10, 30, 100, 300, 1000], ticktext=["$5M", "$10M", "$30M", "$100M", "$300M", "$1,000M"])
-            fig.update_yaxes(ticksuffix="%", title_text=f"Bitcoin return after {horizon} days")
-            es.note(fig, res["loss_usd_m"].max(), m * 100, f"On average, returns<br>are {m:.1%}", ax=-20, ay=-50)
-            show(fig)
+            show(es.hack_scatter(res, int(horizon)))
 
 # --------------------------------------------------------------------- Fed tone
 with tabs[2]:
