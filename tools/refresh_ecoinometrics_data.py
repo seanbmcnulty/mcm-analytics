@@ -1,7 +1,7 @@
 """Rebuild the Ecoinometrics CSVs that the page falls back to.
 
 Usage:
-  python tools/refresh_ecoinometrics_data.py [--datasets all|etf_flows|fred|fed_tone]
+  python tools/refresh_ecoinometrics_data.py [--datasets all|etf_flows|fred|fed_tone|strategy]
 
 Used by ``.github/workflows/update_ecoinometrics_data.yml``. Exit 0 when at
 least one requested dataset succeeds, 1 when every requested dataset fails.
@@ -16,7 +16,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib import ecoinometrics as eco
-from lib.eco_refresh import DISPATCH_DATASETS, build_etf_flows, build_fed_tone, build_fred_cache
+from lib.eco_refresh import (DISPATCH_DATASETS, build_etf_flows, build_fed_tone, build_fred_cache,
+                             build_strategy_funding)
 
 
 def main(argv=None) -> int:
@@ -28,7 +29,7 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--fed-from", type=int, default=eco.FED_TONE_START_YEAR)
     args = parser.parse_args(argv)
-    selected = ["etf_flows", "fred", "fed_tone"] if args.datasets == "all" else [args.datasets]
+    selected = ["etf_flows", "fred", "fed_tone", "strategy"] if args.datasets == "all" else [args.datasets]
     failed = 0
     for name in selected:
         if name == "etf_flows":
@@ -39,6 +40,9 @@ def main(argv=None) -> int:
             ok = any(item.ok for item in results.values())
             if not ok:
                 print("FRED: every series failed")
+        elif name == "strategy":
+            result = build_strategy_funding(log=print)
+            ok = result.ok
         else:
             result = build_fed_tone(args.fed_from, log=print)
             ok = result.ok
