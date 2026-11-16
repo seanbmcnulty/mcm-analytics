@@ -224,8 +224,9 @@ pages/08_Spot_Vol_Correlation.py  spot vs. CVOL/skew/RR/BF + vol-prediction ense
                                  only (DVOL-dependent); full port from exodus-analytics (2026-09-04)
 pages/10_*.py                   secondary analytics page (macro)
 pages/11_Fear_Greed_Signal.py   contrarian delta-lean backtest vs alternative.me F&G Index
-pages/12_IBIT.py               IBIT vs Deribit BTC options lab (~32 charts over 6 views; Cboe delayed chain)
-                                 (the one non-Deribit data source in this app — see above)
+pages/12_IBIT.py               IBIT vs Deribit BTC options lab (Cboe delayed chain), plus the
+                                 large-tickets view (recorded OI change, unusual volume,
+                                 last-print lean, Deribit block comparison)
 pages/03,04,05,09,12,13,14      retired — moved to _to_delete/ on the device, not in git
 
 lib/deribit.py                  Deribit public API client, caching, rate limiting
@@ -241,7 +242,8 @@ lib/constants.py                ASSET_CONFIG, ASSETS, color scheme
 lib/fx_style.py                 plotly theming, SGT timezone helpers (local_now, to_local),
                                  watermark, chart title/legend/margin layout (finalize())
 lib/vol_math.py                 Black-Scholes, implied vol, delta math
-lib/ibit.py                     Cboe IBIT chain parser + shared Deribit/IBIT analytics (pure, tested)
+lib/ibit.py                     Cboe IBIT chain parser, shared Deribit/IBIT analytics, and the
+                                 daily IBIT chain store (OI change / unusual / last-print lean)
 lib/fng.py                      alternative.me Crypto Fear & Greed Index client (pure
                                  functions, no streamlit import — same shape as deribit.py)
 lib/instruments.py, telegram.py instrument parsing; Telegram send integration
@@ -251,6 +253,8 @@ lib/regime.py                   vol-regime data/math/model library for pages/07 
 
 scripts/record_snapshot.py      standalone CLI recorder, run by the GH Action
 .github/workflows/record_snapshots.yml   hourly snapshot recorder (see above)
+.github/workflows/record_ibit_chain.yml  daily IBIT chain close on the same snapshots
+                                 branch; does not touch the vol-surface files
 
 tests/fake_deribit.py           synthetic Deribit feed for offline testing
 tests/test_math.py              numeric assertions
@@ -299,6 +303,36 @@ Keep this updated: when a session makes a non-trivial change, decision, or
 finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
+
+### 2026-11-15 — IBIT large tickets from the free chain snapshot
+
+Cboe still has no prints, so `pages/12_IBIT.py` "Large tickets" does not
+pretend to show blocks. Four snapshot estimates, math in `lib/ibit.py`:
+
+1. **OI change** — one real close per US session in `data/snapshots/IBIT_chain.parquet`
+   on the existing `snapshots` branch (append-only; the vol-surface files are
+   not touched). `.github/workflows/record_ibit_chain.yml` runs at 21:45 and
+   22:30 UTC; the script's gate is 16:45 America/New_York so both crons are
+   after the 16:15 ET options close plus the ~15 min delay in EST and EDT.
+   Weekends and NYSE holidays 2026–2028 are skipped. No backfill. The page
+   says "Collecting history since <date>" until a prior close exists.
+2. **Unusual activity** — premium (volume × price × 100) and delta notional,
+   flagged likely-opening when volume exceeds prior OI and/or OI rose.
+3. **Buyer/seller lean** — last print at/above ask = bought, at/below bid = sold,
+   inside = ambiguous. The whole session's volume is attributed to that print
+   and labelled as an estimate.
+4. **Flow summary** — put/call premium and delta notional, strike × expiry
+   heatmap, and Deribit BTC blocks (size ≥ 12.5) over the same US session.
+   BTC-equivalent uses the IBIT/BTC price ratio, labelled as such.
+
+`tests/test_ibit_flow.py` (wired into `tests/run_all.py`).
+
+The activity "Volume bubbles" chart has a legend (green calls, red puts, sqrt size
+key, dashed line = IBIT spot) plus a top axis and hover in Deribit-contract
+units. BTC per share is iShares bitcoin quantity / shares outstanding
+(`latest-holdings.csv`), with a labelled 13 Nov 2026 fallback. The same ratio
+is used for the bubble key, the large-ticket BTC columns, and the Deribit
+comparison — not the spot-price ratio.
 
 ### 2026-11-15 — Vol term structure lookbacks span every listed expiry
 
