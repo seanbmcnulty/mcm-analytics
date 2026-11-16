@@ -36,6 +36,57 @@ from lib import eco_style as es
 from lib import fx_style
 from lib import strategy_8k
 
+
+def _fresh_lib_modules():
+    """Reload lib modules that are older than the code on disk.
+
+    Streamlit Cloud pulls a new commit into the running process. The page
+    script reruns with the new source, but ``lib.*`` modules already in
+    ``sys.modules`` keep their old code, so a new helper is an
+    AttributeError (16 Nov 2026: ``eco_charts.figure_nasdaq_sma``). Reload
+    when a helper this page needs is missing, or when a module's file changed
+    since this page last saw it. ``importlib.reload`` updates each module in
+    place, so the names imported above stay valid. Order matters: a module is
+    reloaded after the ones it imports.
+    """
+    import importlib
+    import os
+    need = {
+        fx_style: (),
+        eco: ("sma_rows", "rolling_flow_with_price", "daily_closes", "btc_on_nasdaq_down_days",
+              "bucket_stats", "drawdown_episodes", "drawdown_trend", "NASDAQ_BUCKET_LABELS",
+              "price_sma_ratio", "etf_flow_regime", "display_from"),
+        es: ("hack_scatter",),
+        eco_charts: ("figure_nasdaq_sma", "figure_rolling_flow_price", "figure_nasdaq_down_days",
+                     "figure_drawdowns", "figure_strategy_funding", "figure_price_sma_ratio",
+                     "figure_etf_flow_regime"),
+        eco_refresh: ("build_strategy_funding", "build_fred_cache", "summary_caption"),
+        strategy_8k: ("load_result", "from_frame"),
+    }
+    reloaded = []
+    stale = False
+    for mod, attrs in need.items():
+        path = getattr(mod, "__file__", None)
+        try:
+            mtime = os.path.getmtime(path) if path else None
+        except OSError:
+            mtime = None
+        seen = getattr(mod, "_mcm_seen_mtime", None)
+        # Once one module reloads, reload everything after it too, so a
+        # dependent picks up the new names (e.g. eco_charts after eco).
+        if stale or any(not hasattr(mod, a) for a in attrs) or (seen is not None and mtime is not None and mtime != seen):
+            stale = True
+            try:
+                importlib.reload(mod)
+                reloaded.append(mod.__name__)
+            except Exception:
+                pass
+        mod._mcm_seen_mtime = mtime
+    return reloaded
+
+
+_RELOADED = _fresh_lib_modules()
+
 st.set_page_config(page_title="Ecoinometrics Charts", page_icon="📰",
                    layout="wide", initial_sidebar_state="expanded")
 st.title("📰 Ecoinometrics-style charts")
@@ -88,8 +139,10 @@ def _btc_cached():
 
 
 @st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Fetching pre-2018 BTC closes…")
-def _bitstamp_cached():
-    return eco.fetch_bitstamp_daily_result()
+def _bitstamp_cached(start: str = "2013-01-01"):
+    # The start is part of the cache key: entries cached before 16 Nov 2026
+    # began in Dec 2014, too late for the drawdown and Nasdaq down-day tabs.
+    return eco.fetch_bitstamp_daily_result(start=start)
 
 
 @st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Fetching FRED…")
@@ -571,16 +624,19 @@ with tabs[3]:
         if len(gw):
             fig.update_xaxes(range=[gw["date"].min(), gw["date"].max()])
         show(fig)
-    nq_panel = _safe(_load_fred, "NASDAQCOM")
-    if nq_panel is not None:
-        x0 = gw["date"].min() if px is not None and len(gw) else cutoff
-        x1 = gw["date"].max() if px is not None and len(gw) else as_of_date
-        show(eco_charts.figure_nasdaq_sma(eco.sma_rows(nq_panel, 200), x0, x1))
-        st.caption(
-            "Same date range as the Bitcoin panel. FRED's Nasdaq only prints on trading days, so its 200-day "
-            "average spans 200 trading days (about 40 weeks); the Bitcoin average spans 200 daily bars "
-            "including weekends (about 29 weeks)."
-        )
+    try:
+        nq_panel = _safe(_load_fred, "NASDAQCOM")
+        if nq_panel is not None:
+            x0 = gw["date"].min() if px is not None and len(gw) else cutoff
+            x1 = gw["date"].max() if px is not None and len(gw) else as_of_date
+            show(eco_charts.figure_nasdaq_sma(eco.sma_rows(nq_panel, 200), x0, x1))
+            st.caption(
+                "Same date range as the Bitcoin panel. FRED's Nasdaq only prints on trading days, so its 200-day "
+                "average spans 200 trading days (about 40 weeks); the Bitcoin average spans 200 daily bars "
+                "including weekends (about 29 weeks)."
+            )
+    except Exception as ex:
+        st.error(f"The Nasdaq panel could not be drawn: {type(ex).__name__}: {ex}")
 
 # ------------------------------------------------------------ Nasdaq correlation
 with tabs[4]:
@@ -730,112 +786,131 @@ def _btc_closes_since_2013():
         early = _load_bitstamp()
     except Exception as ex:
         st.warning(f"Bitstamp unavailable ({ex}); using Deribit only, from Aug 2018.")
+    if early is not None and len(early):
+        first = pd.to_datetime(early["timestamp"]).min()
+        if first > pd.Timestamp("2014-01-01"):
+            st.warning(
+                f"Bitstamp history in this session starts {first:%d %b %Y}, after 1 Jan 2014. "
+                "Use Refresh data → Bitstamp to load from 2013."
+            )
     return eco.daily_closes(early, px)
 
 
 # --------------------------------------------------- 30-session ETF flow line
 with tabs[8]:
-    st.caption(
-        "Rolling 30-session net flow into US spot BTC ETFs, in BTC, with the line coloured by the BTC price. "
-        "Inspired by the 13 Nov 2026 Ecoinometrics chart in \"Bitcoin's Recovery Has Failed\". "
-        "Ours converts each day's Farside US$ flow at that day's Deribit close; theirs is the change in BTC "
-        "held by the ETFs, so the levels will not match exactly."
-    )
-    flows = _safe(_load_etf)
-    if flows is None or px is None:
-        st.error("Needs the Farside flow table and Deribit BTC-PERP daily closes.")
-    else:
-        rf = eco.rolling_flow_with_price(eco.flows_to_btc(flows, px), px, 30)
-        view = eco.display_from(rf, cutoff)
-        valid = view.dropna(subset=["roll"])
-        if len(valid):
-            last = valid.iloc[-1]
-            c = st.columns(3)
-            c[0].metric("30-session net flow", f"{last['roll']:,.0f} BTC")
-            c[1].metric("Window low", f"{valid['roll'].min():,.0f} BTC")
-            c[2].metric("Window high", f"{valid['roll'].max():,.0f} BTC")
-        show(eco_charts.figure_rolling_flow_price(view, 30))
+    try:
+        st.caption(
+            "Rolling 30-session net flow into US spot BTC ETFs, in BTC, with the line coloured by the BTC price. "
+            "Inspired by the 13 Nov 2026 Ecoinometrics chart in \"Bitcoin's Recovery Has Failed\". "
+            "Ours converts each day's Farside US$ flow at that day's Deribit close; theirs is the change in BTC "
+            "held by the ETFs, so the levels will not match exactly."
+        )
+        flows = _safe(_load_etf)
+        if flows is None or px is None:
+            st.error("Needs the Farside flow table and Deribit BTC-PERP daily closes.")
+        else:
+            rf = eco.rolling_flow_with_price(eco.flows_to_btc(flows, px), px, 30)
+            view = eco.display_from(rf, cutoff)
+            valid = view.dropna(subset=["roll"])
+            if len(valid):
+                last = valid.iloc[-1]
+                c = st.columns(3)
+                c[0].metric("30-session net flow", f"{last['roll']:,.0f} BTC")
+                c[1].metric("Window low", f"{valid['roll'].min():,.0f} BTC")
+                c[2].metric("Window high", f"{valid['roll'].max():,.0f} BTC")
+            show(eco_charts.figure_rolling_flow_price(view, 30))
+    except Exception as ex:
+        st.error(f"The 30-day ETF flow chart could not be drawn: {type(ex).__name__}: {ex}")
 
 # ------------------------------------------------------ Nasdaq down days
 with tabs[9]:
-    st.caption(
-        "Bitcoin's same-day return on every Nasdaq-100 down day since 2014, grouped by how far the Nasdaq-100 fell. "
-        "Inspired by the 9 Nov 2026 Ecoinometrics chart in \"Bitcoin's Recovery Is at Risk as the Nasdaq Weakens\". "
-        "Matching rule: for Nasdaq trading date D (close-to-close, so Monday covers the weekend), the BTC return is "
-        "the UTC daily bar stamped D over the bar stamped D−1. Bitstamp bars (to Jul 2018) run 00:00-24:00 UTC and "
-        "Deribit BTC-PERP bars run 08:00 UTC to 08:00 UTC the next day, so the 13:30-20:00 UTC Nasdaq session falls "
-        "inside the BTC bar either way. Buckets include their lower bound (−4% sits in −4% to −2%). "
-        "This ignores the window lookback; it always uses 2014 onward."
-    )
-    ndx = _safe(_load_fred, "NASDAQ100")
-    if ndx is not None and px is not None:
-        closes = _btc_closes_since_2013()
-        dd_days = eco.btc_on_nasdaq_down_days(ndx, closes, "2014-01-01")
-        stats = eco.bucket_stats(dd_days)
-        show(eco_charts.figure_nasdaq_down_days(dd_days, stats))
-        if not stats.empty:
-            t = stats.copy()
-            t["share_down"] = (t["share_down"] * 100).round(0)
-            st.dataframe(
-                t.rename(columns={"bucket": "Nasdaq-100 day", "n": "Days", "median": "Median BTC %",
-                                  "mean": "Mean BTC %", "share_down": "% of days BTC fell"})
-                 .style.format({"Median BTC %": "{:+.2f}", "Mean BTC %": "{:+.2f}", "% of days BTC fell": "{:.0f}"}),
-                width="stretch", hide_index=True,
-            )
+    try:
+        st.caption(
+            "Bitcoin's same-day return on every Nasdaq-100 down day since 2014, grouped by how far the Nasdaq-100 fell. "
+            "Inspired by the 9 Nov 2026 Ecoinometrics chart in \"Bitcoin's Recovery Is at Risk as the Nasdaq Weakens\". "
+            "Matching rule: for Nasdaq trading date D (close-to-close, so Monday covers the weekend), the BTC return is "
+            "the UTC daily bar stamped D over the bar stamped D−1. Bitstamp bars (to Jul 2018) run 00:00-24:00 UTC and "
+            "Deribit BTC-PERP bars run 08:00 UTC to 08:00 UTC the next day, so the 13:30-20:00 UTC Nasdaq session falls "
+            "inside the BTC bar either way. Buckets include their lower bound (−4% sits in −4% to −2%). "
+            "This ignores the window lookback; it always uses 2014 onward."
+        )
+        ndx = _safe(_load_fred, "NASDAQ100")
+        if ndx is not None and px is not None:
+            closes = _btc_closes_since_2013()
+            dd_days = eco.btc_on_nasdaq_down_days(ndx, closes, "2014-01-01")
+            stats = eco.bucket_stats(dd_days)
+            show(eco_charts.figure_nasdaq_down_days(dd_days, stats))
+            if not stats.empty:
+                t = stats.copy()
+                t["share_down"] = (t["share_down"] * 100).round(0)
+                st.dataframe(
+                    t.rename(columns={"bucket": "Nasdaq-100 day", "n": "Days", "median": "Median BTC %",
+                                      "mean": "Mean BTC %", "share_down": "% of days BTC fell"})
+                     .style.format({"Median BTC %": "{:+.2f}", "Mean BTC %": "{:+.2f}", "% of days BTC fell": "{:.0f}"}),
+                    width="stretch", hide_index=True,
+                )
+    except Exception as ex:
+        st.error(f"The Nasdaq down-day chart could not be drawn: {type(ex).__name__}: {ex}")
 
 # --------------------------------------------------------- Drawdowns
 with tabs[10]:
-    st.caption(
-        "Every Bitcoin drawdown since 2014, duration against depth. Inspired by the 13 Nov 2026 Ecoinometrics chart. "
-        "Rules: daily closes (Bitstamp to Jul 2018, Deribit BTC-PERP after). A drawdown starts at an all-time-high "
-        "close and ends on the first close back at or above that peak; depth is the lowest close in between. "
-        f"Only drawdowns of {dd_min:.0%} or more (sidebar slider) that were still open on or after 1 Jan 2014, so the "
-        "Dec 2013 peak counts. Smaller dips inside a bigger drawdown are part of it. The open drawdown is measured "
-        "to the latest close, including today's unfinished Deribit bar. Ecoinometrics does not publish its rules, so "
-        "our dots will not sit exactly on theirs."
-    )
-    if px is not None:
-        closes = _btc_closes_since_2013()
-        dd = eco.drawdown_episodes(closes, dd_min)
-        show(eco_charts.figure_drawdowns(dd, eco.drawdown_trend(dd), dd_min))
-        if len(dd):
-            t = dd.copy()
-            for col in ("peak_date", "trough_date", "recovered"):
-                t[col] = pd.to_datetime(t[col]).dt.strftime("%d %b %Y").fillna("ongoing")
-            t["depth"] = (t["depth"] * 100).round(1)
-            st.dataframe(
-                t.rename(columns={"peak_date": "Peak", "peak": "Peak close", "trough_date": "Low",
-                                  "trough": "Low close", "recovered": "Recovered", "days": "Days",
-                                  "depth": "Max drawdown %", "ongoing": "Ongoing"}),
-                width="stretch", hide_index=True,
-            )
-    else:
-        st.error("No Deribit BTC-PERP daily history.")
+    try:
+        st.caption(
+            "Every Bitcoin drawdown since 2014, duration against depth. Inspired by the 13 Nov 2026 Ecoinometrics chart. "
+            "Rules: daily closes (Bitstamp to Jul 2018, Deribit BTC-PERP after). A drawdown starts at an all-time-high "
+            "close and ends on the first close back at or above that peak; depth is the lowest close in between. "
+            f"Only drawdowns of {dd_min:.0%} or more (sidebar slider) that were still open on or after 1 Jan 2014, so the "
+            "Dec 2013 peak counts. Smaller dips inside a bigger drawdown are part of it. The open drawdown is measured "
+            "to the latest close, including today's unfinished Deribit bar. Ecoinometrics does not publish its rules, so "
+            "our dots will not sit exactly on theirs."
+        )
+        if px is not None:
+            closes = _btc_closes_since_2013()
+            dd = eco.drawdown_episodes(closes, dd_min)
+            show(eco_charts.figure_drawdowns(dd, eco.drawdown_trend(dd), dd_min))
+            if len(dd):
+                t = dd.copy()
+                for col in ("peak_date", "trough_date", "recovered"):
+                    t[col] = pd.to_datetime(t[col]).dt.strftime("%d %b %Y").fillna("ongoing")
+                t["depth"] = (t["depth"] * 100).round(1)
+                st.dataframe(
+                    t.rename(columns={"peak_date": "Peak", "peak": "Peak close", "trough_date": "Low",
+                                      "trough": "Low close", "recovered": "Recovered", "days": "Days",
+                                      "depth": "Max drawdown %", "ongoing": "Ongoing"}),
+                    width="stretch", hide_index=True,
+                )
+        else:
+            st.error("No Deribit BTC-PERP daily history.")
+    except Exception as ex:
+        st.error(f"The drawdown chart could not be drawn: {type(ex).__name__}: {ex}")
 
 # --------------------------------------------------- Strategy funding
 with tabs[11]:
-    st.caption(
-        "Where Strategy (MSTR) raised money and what it spent it on in the week covered by its latest Monday 8-K. "
-        "Inspired by the 11 Nov 2026 Ecoinometrics chart in \"Bitcoin's Corporate Buyers Are Pulling Back\". "
-        "Parsed live from SEC EDGAR (CIK 0001050446); if EDGAR is unreachable or the format changes, the page falls "
-        "back to the last good parse in data/strategy_funding.csv and says so in Refresh data."
-    )
     try:
-        sf = _load_strategy()
-        funding = strategy_8k.from_frame(sf)
+        st.caption(
+            "Where Strategy (MSTR) raised money and what it spent it on in the week covered by its latest Monday 8-K. "
+            "Inspired by the 11 Nov 2026 Ecoinometrics chart in \"Bitcoin's Corporate Buyers Are Pulling Back\". "
+            "Parsed live from SEC EDGAR (CIK 0001050446); if EDGAR is unreachable or the format changes, the page falls "
+            "back to the last good parse in data/strategy_funding.csv and says so in Refresh data."
+        )
+        try:
+            sf = _load_strategy()
+            funding = strategy_8k.from_frame(sf)
+        except Exception as ex:
+            st.error(f"Could not read Strategy's weekly 8-K: {str(ex).rstrip('.')}. Try Refresh data → Strategy 8-K.")
+            funding = None
+        if funding is not None:
+            c = st.columns(4)
+            c[0].metric("Raised (net, US$)", f"{funding.total_raised:,.1f}M")
+            c[1].metric("BTC bought", f"{funding.btc_bought:,.0f}" if funding.btc_bought is not None else "—")
+            c[2].metric("BTC held", f"{funding.btc_holdings:,.0f}" if funding.btc_holdings is not None else "—")
+            c[3].metric("USD Cash / USD Reserve",
+                        (f"{funding.usd_cash_m:,.0f}M / {funding.usd_reserve_b:,.2f}B"
+                         if funding.usd_cash_m is not None and funding.usd_reserve_b is not None else "—"))
+            show(eco_charts.figure_strategy_funding(funding))
+            st.caption(f"Filing: [{funding.accession}]({funding.url}), filed {funding.filed} (US Eastern date).")
     except Exception as ex:
-        st.error(f"Could not read Strategy's weekly 8-K: {ex}. Try Refresh data → Strategy 8-K.")
-        funding = None
-    if funding is not None:
-        c = st.columns(4)
-        c[0].metric("Raised (net, US$)", f"{funding.total_raised:,.1f}M")
-        c[1].metric("BTC bought", f"{funding.btc_bought:,.0f}" if funding.btc_bought is not None else "—")
-        c[2].metric("BTC held", f"{funding.btc_holdings:,.0f}" if funding.btc_holdings is not None else "—")
-        c[3].metric("USD Cash / USD Reserve",
-                    (f"{funding.usd_cash_m:,.0f}M / {funding.usd_reserve_b:,.2f}B"
-                     if funding.usd_cash_m is not None and funding.usd_reserve_b is not None else "—"))
-        show(eco_charts.figure_strategy_funding(funding))
-        st.caption(f"Filing: [{funding.accession}]({funding.url}), filed {funding.filed} (US Eastern date).")
+        st.error(f"The Strategy funding chart could not be drawn: {type(ex).__name__}: {ex}")
 
 st.divider()
 st.caption(
