@@ -4,7 +4,9 @@ Ecoinometrics-style charts — pure data/analytics helpers (no Streamlit).
 DELIBERATE EXCEPTIONS to "Deribit-only" (requested by the user 2026-11-01):
   * US spot BTC ETF daily flows  -> Farside (scraped HTML) or data/etf_flows.csv
   * Fed press-conference tone    -> data/fed_tone.csv built by tools/build_fed_tone.py
-    from federalreserve.gov transcripts (dictionary score, NOT Ecoinometrics' index)
+    from federalreserve.gov transcripts (dictionary score, NOT Ecoinometrics' index).
+    The page can rebuild it in-session; .github/workflows/update_ecoinometrics_data.yml
+    commits a fresh CSV when someone dispatches it.
 BTC prices for the hack study come from Deribit (lib/deribit.py) in the page.
 
 Charts replicated (Ecoinometrics, 2026-10-30 issue):
@@ -22,6 +24,8 @@ from __future__ import annotations
 
 import io
 import re
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +34,78 @@ import requests
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 FARSIDE_URLS = ("https://farside.co.uk/btc/", "https://farside.co.uk/bitcoin-etf-flow-all-data/")
+FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+FRED_SERIES = ("DFF", "NASDAQCOM", "CPIAUCSL", "DGS10")
+# Hack events before Deribit's perp history (Aug 2018) use Bitstamp spot.
+BITSTAMP_START = "2014-12-01"
+BITSTAMP_END = "2018-08-02"
+BITSTAMP_URL = "https://www.bitstamp.net/api/v2/ohlc/btcusd/"
+DERIBIT_BTC_DAILY_START = "2018-08-01"
+# Bundled data/fed_tone.csv starts in 2019. The in-app rebuild uses this so a
+# refresh does not quietly drop the early meetings. The CLI still defaults to
+# 2022 when no year is passed, and merges into the existing file.
+FED_TONE_START_YEAR = 2019
 UA = {"User-Agent": "Mozilla/5.0 (compatible; mcm-analytics)"}
+
+
+@dataclass
+class FetchResult:
+    """One dataset load, with enough provenance for the refresh panel.
+
+    ``source`` is ``live`` (upstream just responded), ``csv`` (committed or
+    locally written fallback), ``bundled`` (hand-curated file, no live feed),
+    or ``none``. ``fetched_at`` is timezone-aware UTC: the fetch time for a
+    live load, or the file mtime for a disk load. ``as_of`` is the latest
+    observation, not the fetch time.
+    """
+
+    df: pd.DataFrame
+    source: str
+    origin: str
+    fetched_at: pd.Timestamp | None
+    as_of: pd.Timestamp | None
+    ok: bool
+    message: str
+
+    @property
+    def rows(self) -> int:
+        if self.df is None:
+            return 0
+        return int(len(self.df))
+
+
+def _now(now) -> pd.Timestamp:
+    if now is None:
+        return pd.Timestamp.now(tz="UTC")
+    ts = pd.Timestamp(now)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts
+
+
+def file_mtime(path: Path) -> pd.Timestamp | None:
+    """File modification time as timezone-aware UTC, or None if it cannot be read."""
+    try:
+        return pd.Timestamp(path.stat().st_mtime, unit="s", tz="UTC")
+    except OSError:
+        return None
+
+
+def _as_of(df: pd.DataFrame | None, column: str) -> pd.Timestamp | None:
+    if df is None or len(df) == 0 or column not in df.columns:
+        return None
+    values = pd.to_datetime(df[column], errors="coerce", utc=True).dropna()
+    if values.empty:
+        return None
+    return pd.Timestamp(values.max())
+
+
+def _empty(columns) -> pd.DataFrame:
+    return pd.DataFrame(columns=list(columns))
+
+
+def _fail(columns, origin: str, fetched_at, message: str) -> FetchResult:
+    return FetchResult(_empty(columns), "none", origin, fetched_at, None, False, message)
 
 # ---------------------------------------------------------------- ETF flows
 def _num(x) -> float:
@@ -58,21 +133,60 @@ def parse_farside_html(html: str) -> pd.DataFrame:
     raise ValueError("no Farside flow table found")
 
 
+def fetch_etf_flows_result(timeout: int = 20, *, live: bool = True, allow_csv: bool = True,
+                           now=None) -> FetchResult:
+    """Farside totals, with provenance.
+
+    A refresh passes ``allow_csv=False`` so a dead scrape is a failure instead
+    of a silent re-read of the fallback file. Page loads pass the defaults and
+    keep today's behaviour: live first, then ``data/etf_flows.csv``.
+    """
+    fetched_at = _now(now)
+    err = None
+    if live:
+        for url in FARSIDE_URLS:
+            try:
+                r = requests.get(url, headers=UA, timeout=timeout)
+                r.raise_for_status()
+                df = parse_farside_html(r.text)
+                return FetchResult(
+                    df, "live", url, fetched_at, _as_of(df, "date"), True,
+                    f"Farside {len(df)} rows.",
+                )
+            except Exception as e:  # blocked / format change
+                err = e
+    path = DATA_DIR / "etf_flows.csv"
+    if not allow_csv:
+        return _fail(
+            ["date", "flow"], "data/etf_flows.csv", fetched_at,
+            f"Farside unavailable ({err}). CSV fallback was not used.",
+        )
+    if path.exists():
+        try:
+            df = pd.read_csv(path, parse_dates=["date"])
+            df = df[["date", "flow"]].sort_values("date").reset_index(drop=True)
+        except Exception as e:
+            return _fail(
+                ["date", "flow"], "data/etf_flows.csv", file_mtime(path) or fetched_at,
+                f"Farside unavailable ({err}) and data/etf_flows.csv could not be read ({e})",
+            )
+        return FetchResult(
+            df, "csv", "data/etf_flows.csv", file_mtime(path) or fetched_at,
+            _as_of(df, "date"), True,
+            f"Farside unavailable ({err}); using data/etf_flows.csv.",
+        )
+    return _fail(
+        ["date", "flow"], "data/etf_flows.csv", fetched_at,
+        f"Farside unavailable ({err}) and no data/etf_flows.csv",
+    )
+
+
 def fetch_etf_flows(timeout: int = 20) -> pd.DataFrame:
     """Try Farside; fall back to data/etf_flows.csv (date,flow in US$ m)."""
-    err = None
-    for url in FARSIDE_URLS:
-        try:
-            r = requests.get(url, headers=UA, timeout=timeout)
-            r.raise_for_status()
-            return parse_farside_html(r.text)
-        except Exception as e:  # blocked / format change
-            err = e
-    p = DATA_DIR / "etf_flows.csv"
-    if p.exists():
-        df = pd.read_csv(p, parse_dates=["date"])
-        return df[["date", "flow"]].sort_values("date").reset_index(drop=True)
-    raise RuntimeError(f"Farside unavailable ({err}) and no data/etf_flows.csv")
+    result = fetch_etf_flows_result(timeout=timeout)
+    if not result.ok:
+        raise RuntimeError(result.message)
+    return result.df
 
 
 def flow_streaks(df: pd.DataFrame) -> pd.DataFrame:
@@ -95,31 +209,84 @@ def rolling_flow(df: pd.DataFrame, window: int = 30) -> pd.Series:
 
 
 # ----------------------------------------------------------- external helpers
-def fred_series(series_id: str, timeout: int = 15, start: str = "2013-01-01", retries: int = 2,
-                live_only: bool = False) -> pd.DataFrame:
-    """FRED public CSV (no key). Returns DataFrame[date, value].
-    Falls back to data/fred_<ID>.csv (kept fresh by tools/build_fred_cache.py + GH Action)
-    because Streamlit Cloud frequently times out reaching FRED."""
+def _read_fred_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path, parse_dates=["date"])
+    return df.dropna().reset_index(drop=True)
+
+
+def fred_series_result(series_id: str, timeout: int = 15, start: str = "2013-01-01", retries: int = 2,
+                       live_only: bool = False, now=None) -> FetchResult:
+    """FRED public CSV (no key), with provenance.
+
+    Falls back to ``data/fred_<ID>.csv`` unless ``live_only``. Those files are
+    rewritten by ``lib.eco_refresh.build_fred_cache`` and by
+    ``.github/workflows/update_ecoinometrics_data.yml``. Streamlit Cloud often
+    times out reaching FRED, which is why the fallback exists.
+    """
+    fetched_at = _now(now)
+    origin = f"{FRED_URL}?id={series_id}"
     err = None
+    response = None
     for _ in range(retries):
         try:
-            r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
-                             params={"id": series_id, "cosd": start}, headers=UA, timeout=timeout)
-            r.raise_for_status()
+            response = requests.get(
+                FRED_URL, params={"id": series_id, "cosd": start}, headers=UA, timeout=timeout,
+            )
+            response.raise_for_status()
             break
         except requests.RequestException as e:
             err = e
-    else:
-        p = DATA_DIR / f"fred_{series_id}.csv"
-        if live_only or not p.exists():
-            raise err
-        df = pd.read_csv(p, parse_dates=["date"])
-        return df.dropna().reset_index(drop=True)
-    df = pd.read_csv(io.StringIO(r.text))
-    df.columns = ["date", "value"]
-    df["date"] = pd.to_datetime(df["date"])
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    return df.dropna().reset_index(drop=True)
+            response = None
+    if response is not None:
+        try:
+            df = pd.read_csv(io.StringIO(response.text))
+            df.columns = ["date", "value"]
+            df["date"] = pd.to_datetime(df["date"])
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+            df = df.dropna().reset_index(drop=True)
+            return FetchResult(
+                df, "live", origin, fetched_at, _as_of(df, "date"), True,
+                f"FRED {series_id}: {len(df)} rows.",
+            )
+        except Exception as e:
+            err = e
+            response = None
+    path = DATA_DIR / f"fred_{series_id}.csv"
+    if live_only or not path.exists():
+        why = f"FRED {series_id} unavailable ({err})"
+        if live_only:
+            why += " (live only)"
+        else:
+            why += f" and no data/fred_{series_id}.csv"
+        return _fail(["date", "value"], f"data/fred_{series_id}.csv", fetched_at, why)
+    try:
+        df = _read_fred_csv(path)
+    except Exception as e:
+        return _fail(
+            ["date", "value"], f"data/fred_{series_id}.csv", file_mtime(path) or fetched_at,
+            f"FRED {series_id} live fetch failed ({err}) and data/fred_{series_id}.csv could not be read ({e})",
+        )
+    return FetchResult(
+        df, "csv", f"data/fred_{series_id}.csv", file_mtime(path) or fetched_at,
+        _as_of(df, "date"), True,
+        f"FRED {series_id} live fetch failed ({err}); using data/fred_{series_id}.csv.",
+    )
+
+
+def fred_series(series_id: str, timeout: int = 15, start: str = "2013-01-01", retries: int = 2,
+                live_only: bool = False) -> pd.DataFrame:
+    """FRED public CSV (no key). Returns DataFrame[date, value].
+
+    Falls back to data/fred_<ID>.csv (kept fresh by tools/build_fred_cache.py
+    and .github/workflows/update_ecoinometrics_data.yml) because Streamlit
+    Cloud frequently times out reaching FRED.
+    """
+    result = fred_series_result(
+        series_id, timeout=timeout, start=start, retries=retries, live_only=live_only,
+    )
+    if not result.ok:
+        raise RuntimeError(result.message)
+    return result.df
 
 
 def fetch_bitstamp_daily(start: str, end: str, timeout: int = 20) -> pd.DataFrame:
@@ -127,7 +294,7 @@ def fetch_bitstamp_daily(start: str, end: str, timeout: int = 20) -> pd.DataFram
     Used only for hack events before Deribit's perp history (Aug 2018)."""
     out, cur, end_ts = [], int(pd.Timestamp(start, tz="UTC").timestamp()), int(pd.Timestamp(end, tz="UTC").timestamp())
     while cur < end_ts:
-        r = requests.get("https://www.bitstamp.net/api/v2/ohlc/btcusd/", headers=UA, timeout=timeout,
+        r = requests.get(BITSTAMP_URL, headers=UA, timeout=timeout,
                          params={"step": 86400, "limit": 1000, "start": cur})
         r.raise_for_status()
         rows = r.json()["data"]["ohlc"]
@@ -144,6 +311,61 @@ def fetch_bitstamp_daily(start: str, end: str, timeout: int = 20) -> pd.DataFram
     df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="s")
     df["close"] = df["close"].astype(float)
     return df[["timestamp", "close"]].drop_duplicates("timestamp")
+
+
+def fetch_bitstamp_daily_result(start: str = BITSTAMP_START, end: str = BITSTAMP_END,
+                                timeout: int = 20, now=None) -> FetchResult:
+    """Bitstamp daily closes for the pre-2018 hack window. No CSV fallback."""
+    fetched_at = _now(now)
+    try:
+        df = fetch_bitstamp_daily(start, end, timeout=timeout)
+    except Exception as ex:
+        return _fail(
+            ["timestamp", "close"], BITSTAMP_URL, fetched_at,
+            f"Bitstamp unavailable ({ex})",
+        )
+    if df is None or len(df) == 0:
+        return _fail(
+            ["timestamp", "close"], BITSTAMP_URL, fetched_at,
+            "Bitstamp returned no daily closes.",
+        )
+    return FetchResult(
+        df, "live", BITSTAMP_URL, fetched_at, _as_of(df, "timestamp"), True,
+        f"Bitstamp {len(df)} daily closes ({start} to {end}). In-session only; there is no CSV fallback.",
+    )
+
+
+def fetch_deribit_btc_daily(get_ohlc, start: str = DERIBIT_BTC_DAILY_START,
+                            now_ms: int | None = None, now=None) -> FetchResult:
+    """Paginate Deribit BTC-PERPETUAL daily closes.
+
+    ``get_ohlc(instrument, resolution, start_ms, end_ms)`` is
+    ``lib.deribit.get_tradingview_ohlc``. One thousand daily bars per call,
+    matching the page's previous loop. A failure leaves the caller on whatever
+    frame it already had; this function does not write a file.
+    """
+    fetched_at = _now(now)
+    origin = "Deribit tradingview BTC-PERPETUAL 1D"
+    start_ms = int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
+    end = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    out = []
+    cur = start_ms
+    try:
+        while cur < end:
+            nxt = min(cur + 1000 * 86_400_000, end)
+            df = get_ohlc("BTC-PERPETUAL", "1D", cur, nxt)
+            if df is not None and len(df):
+                out.append(df)
+            cur = nxt
+    except Exception as ex:
+        return _fail(["timestamp", "close"], origin, fetched_at, f"Deribit BTC-PERP fetch failed: {ex}")
+    if not out:
+        return _fail(["timestamp", "close"], origin, fetched_at, "No BTC-PERP daily candles returned.")
+    px = pd.concat(out).drop_duplicates("timestamp")[["timestamp", "close"]]
+    return FetchResult(
+        px, "live", origin, fetched_at, _as_of(px, "timestamp"), True,
+        f"Deribit {len(px)} daily closes. In-session only.",
+    )
 
 
 def _utc_calendar_date(series: pd.Series) -> pd.Series:
@@ -456,8 +678,30 @@ def rolling_corr(btc: pd.DataFrame, other: pd.DataFrame, window: int = 90) -> pd
     return c.rename("corr").reset_index()
 
 # ------------------------------------------------------------- Exchange hacks
+def load_hacks_result(now=None) -> FetchResult:
+    """Hand-curated hack list. There is no live feed; a refresh re-reads the file."""
+    path = DATA_DIR / "exchange_hacks.csv"
+    origin = "data/exchange_hacks.csv"
+    fetched_at = file_mtime(path) or _now(now)
+    if not path.exists():
+        return _fail(["date", "exchange", "loss_usd_m", "note"], origin, fetched_at,
+                     "data/exchange_hacks.csv is missing.")
+    try:
+        df = pd.read_csv(path, parse_dates=["date"])
+    except Exception as ex:
+        return _fail(["date", "exchange", "loss_usd_m", "note"], origin, fetched_at,
+                     f"data/exchange_hacks.csv could not be read ({ex})")
+    return FetchResult(
+        df, "bundled", origin, fetched_at, _as_of(df, "date"), True,
+        "Hand-curated list in data/exchange_hacks.csv. There is no live feed.",
+    )
+
+
 def load_hacks() -> pd.DataFrame:
-    return pd.read_csv(DATA_DIR / "exchange_hacks.csv", parse_dates=["date"])
+    result = load_hacks_result()
+    if not result.ok:
+        raise RuntimeError(result.message)
+    return result.df
 
 
 def hack_event_returns(prices: pd.DataFrame, hacks: pd.DataFrame, horizon: int = 5) -> pd.DataFrame:
@@ -498,14 +742,45 @@ def tone_score(text: str) -> dict:
             "net_per_1k": 1000 * (h - d) / n if n else 0.0}
 
 
-def load_fed_tone() -> pd.DataFrame:
-    p = DATA_DIR / "fed_tone.csv"
-    if not p.exists():
+def with_tone_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Add the chart's 0-centred index and six-meeting average. Does not fetch."""
+    if df is None or len(df) == 0:
         return pd.DataFrame(columns=["date", "score", "idx", "avg6"])
-    df = pd.read_csv(p, parse_dates=["date"]).sort_values("date")
-    df["idx"] = df["score"] * 100
-    df["avg6"] = df["idx"].rolling(6, min_periods=1).mean()
-    return df.reset_index(drop=True)
+    out = df.sort_values("date").copy()
+    out["idx"] = out["score"] * 100
+    out["avg6"] = out["idx"].rolling(6, min_periods=1).mean()
+    return out.reset_index(drop=True)
+
+
+def load_fed_tone_result(now=None) -> FetchResult:
+    """Read ``data/fed_tone.csv`` only. Transcript downloads happen in ``build_fed_tone``."""
+    path = DATA_DIR / "fed_tone.csv"
+    origin = "data/fed_tone.csv"
+    fetched_at = file_mtime(path) or _now(now)
+    if not path.exists():
+        return _fail(
+            ["date", "score", "idx", "avg6"], origin, fetched_at,
+            "No data/fed_tone.csv yet.",
+        )
+    try:
+        raw = pd.read_csv(path, parse_dates=["date"])
+    except Exception as ex:
+        return _fail(
+            ["date", "score", "idx", "avg6"], origin, fetched_at,
+            f"data/fed_tone.csv could not be read ({ex})",
+        )
+    df = with_tone_index(raw)
+    return FetchResult(
+        df, "csv", origin, fetched_at, _as_of(df, "date"), True,
+        f"Fed tone from data/fed_tone.csv ({len(df)} meetings).",
+    )
+
+
+def load_fed_tone() -> pd.DataFrame:
+    result = load_fed_tone_result()
+    if not result.ok:
+        return pd.DataFrame(columns=["date", "score", "idx", "avg6"])
+    return result.df
 
 
 def add_fed_funds(ft: pd.DataFrame, dff: pd.DataFrame) -> pd.DataFrame:

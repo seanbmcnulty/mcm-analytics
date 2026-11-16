@@ -1,19 +1,26 @@
-"""Cache FRED series used by pages/13 into data/fred_<ID>.csv (Streamlit Cloud often
-times out reaching fred.stlouisfed.org; lib/ecoinometrics.fred_series falls back to these).
-Usage: python tools/build_fred_cache.py   (needs: requests, pandas)"""
+"""Cache FRED series used by pages/13 into data/fred_<ID>.csv.
+
+Streamlit Cloud often times out reaching fred.stlouisfed.org.
+``lib.ecoinometrics.fred_series`` falls back to these files. The same function
+runs from the Ecoinometrics page's Refresh FRED button and from
+``.github/workflows/update_ecoinometrics_data.yml``.
+
+Usage: python tools/build_fred_cache.py
+Exit 0 when at least one series was fetched, 1 when every series failed.
+"""
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from lib.ecoinometrics import fred_series, DATA_DIR
 
-SERIES = ["DFF", "NASDAQCOM", "CPIAUCSL", "DGS10"]
-bad = 0
-for sid in SERIES:
-    try:
-        df = fred_series(sid, live_only=True)
-        df.to_csv(DATA_DIR / f"fred_{sid}.csv", index=False)
-        print(sid, len(df), df["date"].iloc[-1].date())
-    except Exception as e:
-        bad += 1
-        print("fail", sid, e)
-sys.exit(1 if bad == len(SERIES) else 0)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib.eco_refresh import build_fred_cache
+
+
+def main(argv=None) -> int:
+    results = build_fred_cache(log=print)
+    bad = sum(not result.ok for result in results.values())
+    return 1 if results and bad == len(results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

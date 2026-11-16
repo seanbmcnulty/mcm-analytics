@@ -15,8 +15,6 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import time
-
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -27,6 +25,7 @@ from lib.constants import TTL_SLOW, TTL_DAILY_EXTERNAL
 from lib import cache as cache_lib
 from lib import ecoinometrics as eco
 from lib import eco_charts
+from lib import eco_refresh
 from lib import eco_style as es
 from lib import fx_style
 
@@ -44,7 +43,13 @@ with st.sidebar:
     horizon = st.selectbox("Hack study horizon (days)", [1, 3, 5, 7, 14, 30], index=2)
     corr_win = st.number_input("Correlation window (trading days)", 20, 250, 90)
     st.divider()
-    cache_lib.render_refresh_button()
+    cache_lib.render_refresh_button(
+        help=(
+            "Clears cached fetches across the app, including an in-session "
+            "Ecoinometrics refresh, and reloads this page. "
+            "To re-scrape Farside, FRED, or Fed transcripts, use Refresh data."
+        ),
+    )
 
 LB_DAYS = {"6 months": 183, "1 year": 365, "2 years": 730, "All": 10_000}[lookback]
 # Display window is anchored on the SGT calendar date. The ratio and the
@@ -65,31 +70,255 @@ def show(fig):
 
 
 @st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Fetching ETF flows…")
-def _etf():
-    return eco.fetch_etf_flows()
+def _etf_cached():
+    return eco.fetch_etf_flows_result()
 
 
 @st.cache_data(ttl=TTL_SLOW, show_spinner="Fetching BTC-PERP daily closes…")
-def _btc_daily():
-    start = int(pd.Timestamp("2018-08-01").timestamp() * 1000)
-    out, cur, end = [], start, int(time.time() * 1000)
-    while cur < end:
-        nxt = min(cur + 1000 * 86_400_000, end)
-        df = get_tradingview_ohlc("BTC-PERPETUAL", "1D", cur, nxt)
-        if df is not None and len(df):
-            out.append(df)
-        cur = nxt
-    return pd.concat(out).drop_duplicates("timestamp")[["timestamp", "close"]] if out else None
+def _btc_cached():
+    return eco.fetch_deribit_btc_daily(get_tradingview_ohlc)
 
 
 @st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Fetching pre-2018 BTC closes…")
-def _btc_early():
-    return eco.fetch_bitstamp_daily("2014-12-01", "2018-08-02")
+def _bitstamp_cached():
+    return eco.fetch_bitstamp_daily_result()
 
 
 @st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Fetching FRED…")
-def _fred(sid):
-    return eco.fred_series(sid)
+def _fred_cached(sid):
+    return eco.fred_series_result(sid)
+
+
+@st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner=False)
+def _fed_cached():
+    return eco.load_fed_tone_result()
+
+
+@st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner=False)
+def _hacks_cached():
+    return eco.load_hacks_result()
+
+
+def _paint_status():
+    """Write the source / SGT line. Safe to call before the script finishes."""
+    try:
+        shown = st.session_state.get("eco_shown", {})
+        attempts = st.session_state.get("eco_attempt", {})
+        _summary_slot.caption(eco_refresh.summary_caption(shown, attempts))
+        _detail_slot.markdown(
+            "\n".join(f"- {line}" for line in eco_refresh.detail_lines(shown, attempts))
+        )
+    except Exception as ex:
+        try:
+            _summary_slot.caption(f"Data status unavailable: {ex}")
+        except Exception:
+            pass
+
+
+def _remember_shown(key, result):
+    st.session_state.setdefault("eco_shown", {})[key] = result
+    _paint_status()
+
+
+def _use(key, loader, required=True):
+    """Session refresh wins. Otherwise the TTL cache. Builders are not called."""
+    good = st.session_state.get("eco_good", {}).get(key)
+    if good is not None and getattr(good, "ok", False):
+        _remember_shown(key, good)
+        return good.df
+    try:
+        result = loader()
+    except Exception as ex:
+        result = eco.FetchResult(
+            pd.DataFrame(), "none", "", pd.Timestamp.now(tz="UTC"), None, False, str(ex),
+        )
+    _remember_shown(key, result)
+    if result is None or not getattr(result, "ok", False):
+        if required:
+            message = getattr(result, "message", None) or "Data unavailable."
+            raise RuntimeError(message)
+        return None
+    return result.df
+
+
+def _load_etf():
+    return _use("etf_flows", _etf_cached)
+
+
+def _load_fred(sid):
+    return _use(f"fred:{sid}", lambda: _fred_cached(sid))
+
+
+def _load_btc():
+    return _use("deribit_btc", _btc_cached, required=False)
+
+
+def _load_bitstamp():
+    return _use("bitstamp", _bitstamp_cached)
+
+
+def _load_fed():
+    return _use("fed_tone", _fed_cached)
+
+
+def _load_hacks():
+    return _use("hacks", _hacks_cached)
+
+
+def _clear_loader(key):
+    try:
+        if key == "etf_flows":
+            _etf_cached.clear()
+        elif key.startswith("fred:"):
+            _fred_cached.clear()
+        elif key == "deribit_btc":
+            _btc_cached.clear()
+        elif key == "bitstamp":
+            _bitstamp_cached.clear()
+        elif key == "fed_tone":
+            _fed_cached.clear()
+        elif key == "hacks":
+            _hacks_cached.clear()
+    except Exception:
+        pass
+
+
+def _store(key, result):
+    st.session_state.setdefault("eco_attempt", {})[key] = result
+    if result is not None and getattr(result, "ok", False):
+        st.session_state.setdefault("eco_good", {})[key] = result
+        _clear_loader(key)
+    _paint_status()
+
+
+def _flash(level, text):
+    try:
+        st.toast(text)
+    except Exception:
+        pass
+    {"success": st.success, "warning": st.warning, "error": st.error}.get(level, st.info)(text)
+
+
+def _on_refresh(which: str) -> None:
+    """Live rebuild for one dataset, every dataset, or the GitHub Action.
+
+    Called only from a button. ``run_guarded`` ignores a second refresh while
+    one is still inside this process.
+    """
+    progress = None
+
+    def on_progress(index, total, label):
+        nonlocal progress
+        try:
+            if progress is None:
+                progress = st.progress(0.0, text=label)
+            frac = 0.0 if not total else min(1.0, float(index) / float(total))
+            progress.progress(frac, text=label)
+        except Exception:
+            pass
+
+    def work():
+        if which == "dispatch":
+            return eco_refresh.dispatch_data_refresh()
+        if which == "etf_flows":
+            result = eco_refresh.build_etf_flows()
+            _store("etf_flows", result)
+            return result
+        if which == "fred":
+            results = eco_refresh.build_fred_cache(on_progress=on_progress)
+            for sid, result in results.items():
+                _store(f"fred:{sid}", result)
+            return results
+        if which == "fed_tone":
+            result = eco_refresh.build_fed_tone(on_progress=on_progress)
+            _store("fed_tone", result)
+            return result
+        if which == "bitstamp":
+            result = eco.fetch_bitstamp_daily_result()
+            _store("bitstamp", result)
+            return result
+        if which == "deribit_btc":
+            result = eco.fetch_deribit_btc_daily(get_tradingview_ohlc)
+            _store("deribit_btc", result)
+            return result
+        if which == "hacks":
+            result = eco.load_hacks_result()
+            _store("hacks", result)
+            return result
+        if which == "all":
+            on_progress(0, 6, "ETF flows")
+            etf = eco_refresh.build_etf_flows()
+            _store("etf_flows", etf)
+
+            def fred_progress(index, total, label):
+                frac = 0.0 if not total else index / total
+                on_progress(1 + frac, 6, label)
+
+            fred = eco_refresh.build_fred_cache(on_progress=fred_progress)
+            for sid, result in fred.items():
+                _store(f"fred:{sid}", result)
+
+            def fed_progress(index, total, label):
+                frac = 0.0 if not total else index / total
+                on_progress(2 + frac, 6, label)
+
+            fed = eco_refresh.build_fed_tone(on_progress=fed_progress)
+            _store("fed_tone", fed)
+            on_progress(3, 6, "Bitstamp")
+            bitstamp = eco.fetch_bitstamp_daily_result()
+            _store("bitstamp", bitstamp)
+            on_progress(4, 6, "Deribit BTC-PERP")
+            deribit = eco.fetch_deribit_btc_daily(get_tradingview_ohlc)
+            _store("deribit_btc", deribit)
+            on_progress(5, 6, "Exchange hacks")
+            hacks_result = eco.load_hacks_result()
+            _store("hacks", hacks_result)
+            on_progress(6, 6, "Refresh finished")
+            return {
+                "etf": etf, "fred": fred, "fed": fed,
+                "bitstamp": bitstamp, "deribit": deribit, "hacks": hacks_result,
+            }
+        raise RuntimeError(f"Unknown refresh {which}")
+
+    lock_name = "dispatch" if which == "dispatch" else which
+    try:
+        guarded = eco_refresh.run_guarded(lock_name, work)
+    except Exception as ex:
+        guarded = None
+        _flash("error", f"Refresh failed: {ex}")
+    if progress is not None:
+        try:
+            progress.empty()
+        except Exception:
+            pass
+    if guarded is None:
+        return
+    if guarded.busy:
+        _flash("warning", eco_refresh.BUSY_MESSAGE)
+        return
+    value = guarded.value
+    if which == "dispatch":
+        _flash("success" if value.ok else "error", value.message)
+        return
+    if which == "fred":
+        _flash(*eco_refresh.fred_banner(value))
+        return
+    if which == "all":
+        _flash(*eco_refresh.banner("ETF flows", value["etf"]))
+        _flash(*eco_refresh.fred_banner(value["fred"]))
+        _flash(*eco_refresh.banner("Fed tone", value["fed"]))
+        _flash(*eco_refresh.banner("Bitstamp", value["bitstamp"]))
+        _flash(*eco_refresh.banner("Deribit BTC-PERP", value["deribit"]))
+        _flash(*eco_refresh.banner("Exchange hacks", value["hacks"]))
+        return
+    labels = {
+        "etf_flows": "ETF flows",
+        "fed_tone": "Fed tone",
+        "bitstamp": "Bitstamp",
+        "deribit_btc": "Deribit BTC-PERP",
+        "hacks": "Exchange hacks",
+    }
+    _flash(*eco_refresh.banner(labels.get(which, which), value))
 
 
 def _safe(fn, *a):
@@ -100,14 +329,77 @@ def _safe(fn, *a):
         return None
 
 
+_summary_slot = st.empty()
+with st.expander("Refresh data", expanded=True):
+    _detail_slot = st.empty()
+    st.caption(
+        "Buttons re-fetch that dataset and redraw the charts for this session. "
+        "A click while a refresh is already running is ignored. "
+        "Nothing is downloaded until you click. "
+        "Streamlit Cloud's disk is wiped on redeploy, and this app cannot commit to git, "
+        "so a CSV written here lasts only until the next deploy. "
+        "Rebuild committed CSVs queues `.github/workflows/update_ecoinometrics_data.yml` "
+        "when `[github] dispatch_token` (or env `GITHUB_DISPATCH_TOKEN`) is set: a fine-grained "
+        "PAT for seanbmcnulty/mcm-analytics with Actions: Read and write. Contents can stay "
+        "at No access. Without the token the button says so and does not call GitHub. "
+        "That action commits `data/etf_flows.csv`, `data/fred_*.csv`, and `data/fed_tone.csv` to main, "
+        "which redeploys the app. It does not itself redraw this session."
+    )
+    _token_state = "configured" if eco_refresh.load_dispatch_token() else "not configured"
+    st.caption(f"GitHub dispatch token: {_token_state}.")
+    row1 = st.columns(4)
+    row2 = st.columns(4)
+    if row1[0].button(
+        "ETF flows", key="eco_refresh_etf", width="stretch",
+        help="Re-scrape Farside. A failed scrape does not pretend the old CSV is a fresh pull.",
+    ):
+        _on_refresh("etf_flows")
+    if row1[1].button(
+        "FRED", key="eco_refresh_fred", width="stretch",
+        help="Re-fetch DFF, NASDAQCOM, CPIAUCSL, and DGS10 from FRED.",
+    ):
+        _on_refresh("fred")
+    if row1[2].button(
+        "Fed tone", key="eco_refresh_fed", width="stretch",
+        help="Download FOMC press-conference PDFs and rescore them. Often a few minutes. "
+             "Meetings that fail to download keep their previous scores.",
+    ):
+        _on_refresh("fed_tone")
+    if row1[3].button(
+        "Bitstamp", key="eco_refresh_bitstamp", width="stretch",
+        help="Re-fetch pre-2018 daily BTC closes used by the hack study. No CSV fallback.",
+    ):
+        _on_refresh("bitstamp")
+    if row2[0].button(
+        "Deribit BTC", key="eco_refresh_deribit", width="stretch",
+        help="Re-fetch BTC-PERPETUAL daily closes. In-session only.",
+    ):
+        _on_refresh("deribit_btc")
+    if row2[1].button(
+        "Hacks CSV", key="eco_refresh_hacks", width="stretch",
+        help="Re-read data/exchange_hacks.csv. Hand-curated; there is no live feed.",
+    ):
+        _on_refresh("hacks")
+    if row2[2].button(
+        "Refresh all", key="eco_refresh_all", width="stretch",
+        help="Re-fetch every dataset above, including Fed transcripts. Fed tone can take a few minutes.",
+    ):
+        _on_refresh("all")
+    if row2[3].button(
+        "Rebuild committed CSVs", key="eco_refresh_dispatch", width="stretch",
+        help="Queue the GitHub Action that commits Farside, FRED, and Fed tone CSVs to main. "
+             "Needs [github] dispatch_token. Does not redraw these charts by itself.",
+    ):
+        _on_refresh("dispatch")
+
 tabs = st.tabs(["ETF flow streaks", "Exchange hacks", "Fed tone", "BTC vs 200DMA",
                 "BTC–Nasdaq correlation", "Inflation & yields",
                 "BTC / 200DMA ratio", "ETF flow regime"])
-px = _btc_daily()
+px = _load_btc()
 
 # ------------------------------------------------------------------ ETF flows
 with tabs[0]:
-    flows = _safe(_etf)
+    flows = _safe(_load_etf)
     if flows is not None and px is not None:
         fb = eco.flows_to_btc(flows, px)
         fb = fb[fb["date"] >= cutoff]
@@ -141,8 +433,12 @@ with tabs[0]:
 
 # ----------------------------------------------------------------- Hacks study
 with tabs[1]:
-    hacks = eco.load_hacks()
-    early = _safe(_btc_early) if (hacks["date"] < "2018-08-02").any() else None
+    try:
+        hacks = _load_hacks()
+    except Exception as ex:
+        st.error(f"Exchange hacks CSV unavailable: {ex}")
+        hacks = pd.DataFrame(columns=["date"])
+    early = _safe(_load_bitstamp) if len(hacks) and (hacks["date"] < "2018-08-02").any() else None
     parts = [d for d in (early, px) if d is not None and len(d)]
     if not parts:
         st.error("No BTC price history available.")
@@ -173,12 +469,23 @@ with tabs[1]:
 
 # --------------------------------------------------------------------- Fed tone
 with tabs[2]:
-    ft = eco.load_fed_tone()
-    if ft.empty:
-        st.info("No data/fed_tone.csv yet. Run `python tools/build_fed_tone.py 2019` locally "
-                "(needs `pip install pypdf requests`), then push.")
+    try:
+        ft = _load_fed()
+    except Exception as ex:
+        ft = pd.DataFrame()
+        _fed_load_error = ex
     else:
-        dff = _safe(_fred, "DFF")
+        _fed_load_error = None
+    if ft.empty:
+        detail = f" ({_fed_load_error})" if _fed_load_error else ""
+        st.info(
+            "No data/fed_tone.csv yet. Use Refresh data → Fed tone "
+            "(downloads federalreserve.gov transcripts; needs pypdf), "
+            "or run `python tools/build_fed_tone.py 2019` locally and push."
+            + detail
+        )
+    else:
+        dff = _safe(_load_fred, "DFF")
         if dff is not None:
             ft = eco.add_fed_funds(ft, dff)
         fig = go.Figure()
@@ -244,7 +551,7 @@ with tabs[3]:
 
 # ------------------------------------------------------------ Nasdaq correlation
 with tabs[4]:
-    nq = _safe(_fred, "NASDAQCOM")
+    nq = _safe(_load_fred, "NASDAQCOM")
     if nq is not None and px is not None:
         c = eco.rolling_corr(px, nq, int(corr_win))
         cw = c[c["date"] >= cutoff]
@@ -260,7 +567,7 @@ with tabs[4]:
 
 # ------------------------------------------------------------- Inflation / yields
 with tabs[5]:
-    cpi, y10 = _safe(_fred, "CPIAUCSL"), _safe(_fred, "DGS10")
+    cpi, y10 = _safe(_load_fred, "CPIAUCSL"), _safe(_load_fred, "DGS10")
     if cpi is not None:
         cpi = cpi.assign(yoy=cpi["value"].pct_change(12) * 100).dropna()
         cw = cpi[cpi["date"] >= cutoff - pd.Timedelta(days=365)]
@@ -324,7 +631,7 @@ with tabs[7]:
         "The regime is our approximation, not their unpublished model. "
         f"As of {_now_sgt:%d %b %Y %H:%M} SGT."
     )
-    flows = _safe(_etf)
+    flows = _safe(_load_etf)
     if flows is None or px is None:
         st.error("The flow regime needs the Farside total and Deribit BTC-PERP daily closes.")
     else:
@@ -387,3 +694,4 @@ st.caption(
     "Our own charts inspired by the Ecoinometrics newsletter, built from public data. "
     "The ETF regime colours are an MCM approximation, not their model or their data. No trading advice."
 )
+_paint_status()
