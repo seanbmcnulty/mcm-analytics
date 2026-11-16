@@ -704,15 +704,97 @@ def load_hacks() -> pd.DataFrame:
     return result.df
 
 
+def _hack_bar_dates(series: pd.Series) -> pd.Series:
+    """UTC calendar date of each timestamp, as naive midnight.
+
+    Naive values are already UTC (Deribit tradingview stamps, Bitstamp daily
+    stamps, and the dates in ``exchange_hacks.csv``). Tz-aware values are
+    converted to UTC before the date is taken, so a bar at 20:00 UTC does not
+    roll onto the next Asia/Singapore calendar date.
+    """
+    t = pd.to_datetime(series, errors="coerce")
+    if getattr(t.dt, "tz", None) is not None:
+        t = t.dt.tz_convert("UTC").dt.tz_localize(None)
+    return t.dt.normalize()
+
+
 def hack_event_returns(prices: pd.DataFrame, hacks: pd.DataFrame, horizon: int = 5) -> pd.DataFrame:
-    """Return from close of hack day to close `horizon` days later.
-    prices: DataFrame[timestamp, close] daily. Events outside price history dropped."""
-    px = prices.assign(d=pd.to_datetime(prices["timestamp"]).dt.normalize()).set_index("d")["close"]
+    """Forward return from the event-date daily close over ``horizon`` calendar days.
+
+    ``prices`` is ``DataFrame[timestamp, close]``, one row per daily bar. The
+    bar is keyed by the UTC calendar date of its timestamp. The start price is
+    the **close of the bar stamped on the event date**, not the next calendar
+    date's bar and not the previous day's close.
+
+    That matches a late-UTC-evening hack. Deribit 1D bars are stamped at
+    08:00 UTC and close at 08:00 UTC the next morning, so a theft at 20:05 UTC
+    (Binance, 29 Oct 2026) or 18:31 UTC (Bitget, 24 Sep 2026) falls inside the
+    bar stamped that date. Its close is the first daily settlement after the
+    theft, about 12 hours later. Bitstamp daily bars (pre-2018 only) are
+    stamped at 00:00 UTC and close at the end of that UTC date, so the same
+    rule is the first settlement after an evening event, a few hours later.
+    Rolling the anchor forward an extra day would skip that settlement.
+
+    The end price is the close of the bar stamped ``horizon`` calendar days
+    after the event date. That exact date has to be in the series.
+
+    * Both bars present: ``complete`` is True and ``ret`` is the full-window
+      return. ``partial`` equals ``ret``.
+    * The end date is after the last bar (the window is not finished):
+      ``complete`` is False, ``ret`` is NaN so it cannot enter an average,
+      and ``partial`` is the return from the anchor close to the latest bar
+      strictly after the anchor. ``elapsed`` is how many calendar days that
+      partial window actually covers. The chart draws these as open circles.
+    * The end date is missing while a later bar exists (a hole, not an
+      unfinished window): the event is dropped. A nearby close is not used
+      as a stand-in for the horizon.
+    * No anchor bar, a non-finite or zero anchor close, or no close after
+      the anchor: the event is dropped.
+
+    A still-forming last bar is used as-is once it is in the series. It only
+    becomes the end of a *complete* window when the horizon date is that bar.
+    """
+    if prices is None or hacks is None or len(prices) == 0 or len(hacks) == 0:
+        return pd.DataFrame()
+    ts = pd.to_datetime(prices["timestamp"], utc=True, errors="coerce")
+    bars = pd.DataFrame({
+        "d": _hack_bar_dates(prices["timestamp"]),
+        "close": pd.to_numeric(prices["close"], errors="coerce"),
+        "ts": ts,
+    }).dropna(subset=["d"])
+    bars = bars[np.isfinite(bars["close"].to_numpy())]
+    if bars.empty:
+        return pd.DataFrame()
+    bars = bars.sort_values("ts").drop_duplicates("d", keep="last")
+    px = bars.set_index("d")["close"].sort_index()
+    last = px.index.max()
+    horizon = int(horizon)
     rows = []
-    for _, h in hacks.iterrows():
-        d0, d1 = h["date"].normalize(), h["date"].normalize() + pd.Timedelta(days=horizon)
-        if d0 in px.index and d1 in px.index:
-            rows.append({**h.to_dict(), "ret": px[d1] / px[d0] - 1})
+    for rec, d0 in zip(hacks.to_dict("records"), _hack_bar_dates(hacks["date"])):
+        if pd.isna(d0) or d0 not in px.index:
+            continue
+        start = float(px.loc[d0])
+        if not np.isfinite(start) or start == 0:
+            continue
+        after = px.loc[px.index > d0]
+        if after.empty:
+            continue
+        d1 = d0 + pd.Timedelta(days=horizon)
+        if d1 in px.index and np.isfinite(float(px.loc[d1])):
+            ret = float(px.loc[d1]) / start - 1.0
+            rec.update(ret=ret, partial=ret, complete=True, elapsed=horizon, anchor=d0)
+        elif d1 > last:
+            end_dt = after.index.max()
+            rec.update(
+                ret=np.nan,
+                partial=float(after.loc[end_dt]) / start - 1.0,
+                complete=False,
+                elapsed=int((end_dt - d0).days),
+                anchor=d0,
+            )
+        else:
+            continue
+        rows.append(rec)
     return pd.DataFrame(rows)
 
 # ------------------------------------------------------------------ Fed tone

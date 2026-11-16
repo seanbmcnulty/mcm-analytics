@@ -332,6 +332,40 @@ calls the same functions.
   transcripts leave the file untouched). The bare CLI still defaults to 2022
   and now merges rather than truncating.
 
+### 2026-11-15 — Exchange hacks: 2026 Bitget and Binance, coloured by year
+
+Added Bitget (2026-09-24, $387.5m; detection ~18:31 UTC) and Binance
+(2026-10-29, $6.34bn; ~20:05 UTC) to `data/exchange_hacks.csv`.
+`hack_event_returns` still anchors on the close of the daily bar stamped on
+the UTC event date. Deribit 1D bars open at 08:00 UTC, so a late-evening hack
+starts at the next morning's 08:00 print — the first settlement after the
+theft — not the previous close and not the next calendar date's bar. A
+horizon that runs past the last bar leaves `ret` as NaN (out of the average)
+and is drawn as an open circle at the return so far, with "(incomplete)" in
+the hover. Dots are coloured by year (`es.hack_scatter`); the zero line still
+shows the sign of the return.
+
+### 2026-11-15 — Vol term structure lookbacks span every listed expiry
+
+`cmd_vol_term_structure` used the per-expiry snapshot for a whole lookback
+whenever one fell inside the tolerance, and `_at` on an `ExactMap` is NaN for
+any expiry that was not listed then. On 15 Nov 2026 that dropped BTC and ETH
+16–19 Nov plus 4 Dec from "1 Week Ago", and 19 Nov from "24h Ago".
+`connectgaps` hid a one-expiry hole; the unlisted front of the curve simply
+never started. Skew and butterfly already interpolate the fixed-tenor grid
+onto every current expiry, so they did not have the gap and were left alone.
+
+Recorded per-expiry IV is still kept where that expiry was listed (so a
+Friday bump is not smoothed away). A missing tenor inside the snapshot's
+range is linearly interpolated between the recorded expiries beside it — the
+1/7-day fixed-tenor pillars notched the 24h 19-Nov point by ~3 vol against
+those prints. Off either end of the recorded range (new dailies) the point
+comes from the same smoothed fixed-tenor grid the full "(est.)" line uses.
+Open markers plus the subtitle mark those points "(est.)". A lookback with
+no per-expiry history at all is unchanged ("1 Month Ago (est.)"). The
+command is shared by every asset. `tests/test_vol_term_structure.py`.
+
+
 ### 2026-11-09 — Ecoinometrics: close/200DMA ratio and MCM ETF flow regime
 
 Two extra tabs on `pages/13_Ecoinometrics_Charts.py`, inspired by the 6 Nov 2026
