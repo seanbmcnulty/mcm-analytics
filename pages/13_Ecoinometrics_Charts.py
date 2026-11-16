@@ -371,8 +371,7 @@ with st.expander("Refresh data", expanded=True):
         "when `[github] dispatch_token` (or env `GITHUB_DISPATCH_TOKEN`) is set: a fine-grained "
         "PAT for seanbmcnulty/mcm-analytics with Actions: Read and write. Contents can stay "
         "at No access. Without the token the button says so and does not call GitHub. "
-        "That action commits `data/etf_flows.csv`, `data/fred_*.csv`, `data/fed_tone.csv`, and "
-        "`data/strategy_funding.csv` to main, "
+        "That action commits `data/etf_flows.csv`, `data/fred_*.csv`, and `data/fed_tone.csv` to main, "
         "which redeploys the app. It does not itself redraw this session."
     )
     _token_state = "configured" if eco_refresh.load_dispatch_token() else "not configured"
