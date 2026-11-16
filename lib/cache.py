@@ -49,6 +49,11 @@ def clear_all_caches() -> None:
     deribit.clear_cache()
     surface.clear_cache()
     history.clear_cache()
+    # lib.ecoinometrics / lib.eco_charts keep no process-wide cache. The
+    # Ecoinometrics page stores Farside and Deribit daily fetches in
+    # st.cache_data (TTL_DAILY_EXTERNAL and TTL_SLOW), which the clear
+    # above already drops. The ratio and the flow regime are recomputed
+    # from those frames on each run.
 
 
 def expire_stale_auto_pipeline(
