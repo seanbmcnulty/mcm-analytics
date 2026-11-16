@@ -32,7 +32,7 @@ from lib import fx_style
 
 GITHUB_REPO = "seanbmcnulty/mcm-analytics"
 WORKFLOW_FILE = "update_ecoinometrics_data.yml"
-DISPATCH_DATASETS = ("all", "etf_flows", "fred", "fed_tone")
+DISPATCH_DATASETS = ("all", "etf_flows", "fred", "fed_tone", "strategy")
 FRED_SERIES = eco.FRED_SERIES
 FED_BASE = "https://www.federalreserve.gov"
 _PRESCONF = re.compile(r"presconf(\d{8})\.(?:htm|pdf)")
@@ -54,6 +54,7 @@ DATASET_LABELS = {
     "bitstamp": "Bitstamp BTC",
     "deribit_btc": "Deribit BTC-PERP",
     "hacks": "Exchange hacks",
+    "strategy": "Strategy 8-K",
 }
 
 NO_TOKEN_MESSAGE = (
@@ -239,6 +240,25 @@ def build_fred_cache(series=FRED_SERIES, *, write: bool = True, data_dir: Path |
         out[sid] = result
     _progress(on_progress, total, total, "FRED done")
     return out
+
+
+def build_strategy_funding(*, write: bool = True, data_dir: Path | None = None, get=None,
+                           now=None, log=None) -> eco.FetchResult:
+    """Parse Strategy's latest weekly 8-K from SEC EDGAR. No CSV fallback on refresh.
+
+    On success, rewrites ``data/strategy_funding.csv`` (the page's fallback).
+    """
+    from lib import strategy_8k
+    result = strategy_8k.load_result(live=True, allow_csv=False, get=get, now=now)
+    if not result.ok:
+        _log(log, result.message)
+        return result
+    note = "In-session only (file write skipped)."
+    if write:
+        note = write_dataset_csv(result.df, _dir(data_dir) / "strategy_funding.csv")
+    result.message = f"{result.message} {note}"
+    _log(log, result.message)
+    return result
 
 
 def _default_get(url: str, timeout: int):
@@ -640,7 +660,7 @@ def summary_caption(shown: dict | None, attempts: dict | None) -> str:
     """One line for the top of the page. Times are SGT."""
     bits = [_short("ETF flows", *_pair("etf_flows", shown, attempts))]
     bits.append(_fred_summary(shown, attempts)[0])
-    for key in ("fed_tone", "bitstamp", "deribit_btc", "hacks"):
+    for key in ("fed_tone", "bitstamp", "deribit_btc", "hacks", "strategy"):
         bits.append(_short(DATASET_LABELS[key], *_pair(key, shown, attempts)))
     return " · ".join(bits)
 
@@ -651,7 +671,7 @@ def detail_lines(shown: dict | None, attempts: dict | None) -> list[str]:
     lines.append(_fred_summary(shown, attempts)[1])
     for sid, attempt, show in _fred_members(shown, attempts):
         lines.append(_detail_line(f"FRED {sid}", attempt, show))
-    for key in ("fed_tone", "bitstamp", "deribit_btc", "hacks"):
+    for key in ("fed_tone", "bitstamp", "deribit_btc", "hacks", "strategy"):
         lines.append(_detail_line(DATASET_LABELS[key], *_pair(key, shown, attempts)))
     return lines
 

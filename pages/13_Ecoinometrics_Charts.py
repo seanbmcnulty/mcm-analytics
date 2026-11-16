@@ -10,6 +10,12 @@ The "BTC / 200DMA ratio" and "ETF flow regime" tabs (2026-11-09) are extra views
 inspired by the 6 Nov 2026 Ecoinometrics issue. The ratio is the Deribit daily
 close over a 200-calendar-day average. The flow colours are MCM's own regime,
 not the unpublished Ecoinometrics model. Both are drawn with fx_style.
+
+Added 2026-11-16 from the 9/11/13 Nov 2026 issues (Sean approved all five):
+a Nasdaq panel under BTC vs 200DMA, the 30-session ETF flow line coloured by
+price, BTC returns on Nasdaq-100 down days, BTC drawdown duration vs depth,
+and Strategy's weekly funding breakdown parsed from its SEC 8-K
+(lib/strategy_8k.py; SEC EDGAR is one more approved external source).
 """
 import sys
 from pathlib import Path
@@ -28,12 +34,13 @@ from lib import eco_charts
 from lib import eco_refresh
 from lib import eco_style as es
 from lib import fx_style
+from lib import strategy_8k
 
 st.set_page_config(page_title="Ecoinometrics Charts", page_icon="📰",
                    layout="wide", initial_sidebar_state="expanded")
 st.title("📰 Ecoinometrics-style charts")
 st.caption("Our own versions of recurring Ecoinometrics charts, plus extras. Sources: Farside, "
-           "Deribit BTC-PERP, Bitstamp (pre-2018), FRED, federalreserve.gov. "
+           "Deribit BTC-PERP, Bitstamp (pre-2018), FRED, federalreserve.gov, SEC EDGAR. "
            "The flow-regime colours are an MCM approximation, not the Ecoinometrics model.")
 
 with st.sidebar:
@@ -42,6 +49,7 @@ with st.sidebar:
     min_streak = st.number_input("Min streak length (days)", 1, 10, 1)
     horizon = st.selectbox("Hack study horizon (days)", [1, 3, 5, 7, 14, 30], index=2)
     corr_win = st.number_input("Correlation window (trading days)", 20, 250, 90)
+    dd_min = st.slider("Drawdown study: minimum depth (%)", 10, 50, 20, step=5) / 100
     st.divider()
     cache_lib.render_refresh_button(
         help=(
@@ -97,6 +105,11 @@ def _fed_cached():
 @st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner=False)
 def _hacks_cached():
     return eco.load_hacks_result()
+
+
+@st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Reading Strategy's latest 8-K from SEC EDGAR…")
+def _strategy_cached():
+    return strategy_8k.load_result()
 
 
 def _paint_status():
@@ -165,6 +178,10 @@ def _load_hacks():
     return _use("hacks", _hacks_cached)
 
 
+def _load_strategy():
+    return _use("strategy", _strategy_cached)
+
+
 def _clear_loader(key):
     try:
         if key == "etf_flows":
@@ -179,6 +196,8 @@ def _clear_loader(key):
             _fed_cached.clear()
         elif key == "hacks":
             _hacks_cached.clear()
+        elif key == "strategy":
+            _strategy_cached.clear()
     except Exception:
         pass
 
@@ -245,14 +264,18 @@ def _on_refresh(which: str) -> None:
             result = eco.load_hacks_result()
             _store("hacks", result)
             return result
+        if which == "strategy":
+            result = eco_refresh.build_strategy_funding()
+            _store("strategy", result)
+            return result
         if which == "all":
-            on_progress(0, 6, "ETF flows")
+            on_progress(0, 7, "ETF flows")
             etf = eco_refresh.build_etf_flows()
             _store("etf_flows", etf)
 
             def fred_progress(index, total, label):
                 frac = 0.0 if not total else index / total
-                on_progress(1 + frac, 6, label)
+                on_progress(1 + frac, 7, label)
 
             fred = eco_refresh.build_fred_cache(on_progress=fred_progress)
             for sid, result in fred.items():
@@ -260,23 +283,27 @@ def _on_refresh(which: str) -> None:
 
             def fed_progress(index, total, label):
                 frac = 0.0 if not total else index / total
-                on_progress(2 + frac, 6, label)
+                on_progress(2 + frac, 7, label)
 
             fed = eco_refresh.build_fed_tone(on_progress=fed_progress)
             _store("fed_tone", fed)
-            on_progress(3, 6, "Bitstamp")
+            on_progress(3, 7, "Bitstamp")
             bitstamp = eco.fetch_bitstamp_daily_result()
             _store("bitstamp", bitstamp)
-            on_progress(4, 6, "Deribit BTC-PERP")
+            on_progress(4, 7, "Deribit BTC-PERP")
             deribit = eco.fetch_deribit_btc_daily(get_tradingview_ohlc)
             _store("deribit_btc", deribit)
-            on_progress(5, 6, "Exchange hacks")
+            on_progress(5, 7, "Exchange hacks")
             hacks_result = eco.load_hacks_result()
             _store("hacks", hacks_result)
-            on_progress(6, 6, "Refresh finished")
+            on_progress(6, 7, "Strategy 8-K (SEC EDGAR)")
+            strategy = eco_refresh.build_strategy_funding()
+            _store("strategy", strategy)
+            on_progress(7, 7, "Refresh finished")
             return {
                 "etf": etf, "fred": fred, "fed": fed,
                 "bitstamp": bitstamp, "deribit": deribit, "hacks": hacks_result,
+                "strategy": strategy,
             }
         raise RuntimeError(f"Unknown refresh {which}")
 
@@ -310,6 +337,7 @@ def _on_refresh(which: str) -> None:
         _flash(*eco_refresh.banner("Bitstamp", value["bitstamp"]))
         _flash(*eco_refresh.banner("Deribit BTC-PERP", value["deribit"]))
         _flash(*eco_refresh.banner("Exchange hacks", value["hacks"]))
+        _flash(*eco_refresh.banner("Strategy 8-K", value["strategy"]))
         return
     labels = {
         "etf_flows": "ETF flows",
@@ -317,6 +345,7 @@ def _on_refresh(which: str) -> None:
         "bitstamp": "Bitstamp",
         "deribit_btc": "Deribit BTC-PERP",
         "hacks": "Exchange hacks",
+        "strategy": "Strategy 8-K",
     }
     _flash(*eco_refresh.banner(labels.get(which, which), value))
 
@@ -342,13 +371,15 @@ with st.expander("Refresh data", expanded=True):
         "when `[github] dispatch_token` (or env `GITHUB_DISPATCH_TOKEN`) is set: a fine-grained "
         "PAT for seanbmcnulty/mcm-analytics with Actions: Read and write. Contents can stay "
         "at No access. Without the token the button says so and does not call GitHub. "
-        "That action commits `data/etf_flows.csv`, `data/fred_*.csv`, and `data/fed_tone.csv` to main, "
+        "That action commits `data/etf_flows.csv`, `data/fred_*.csv`, `data/fed_tone.csv`, and "
+        "`data/strategy_funding.csv` to main, "
         "which redeploys the app. It does not itself redraw this session."
     )
     _token_state = "configured" if eco_refresh.load_dispatch_token() else "not configured"
     st.caption(f"GitHub dispatch token: {_token_state}.")
     row1 = st.columns(4)
     row2 = st.columns(4)
+    row3 = st.columns(4)
     if row1[0].button(
         "ETF flows", key="eco_refresh_etf", width="stretch",
         help="Re-scrape Farside. A failed scrape does not pretend the old CSV is a fresh pull.",
@@ -356,7 +387,7 @@ with st.expander("Refresh data", expanded=True):
         _on_refresh("etf_flows")
     if row1[1].button(
         "FRED", key="eco_refresh_fred", width="stretch",
-        help="Re-fetch DFF, NASDAQCOM, CPIAUCSL, and DGS10 from FRED.",
+        help="Re-fetch DFF, NASDAQCOM, CPIAUCSL, DGS10, and NASDAQ100 from FRED.",
     ):
         _on_refresh("fred")
     if row1[2].button(
@@ -367,7 +398,7 @@ with st.expander("Refresh data", expanded=True):
         _on_refresh("fed_tone")
     if row1[3].button(
         "Bitstamp", key="eco_refresh_bitstamp", width="stretch",
-        help="Re-fetch pre-2018 daily BTC closes used by the hack study. No CSV fallback.",
+        help="Re-fetch 2013 to mid-2018 daily BTC closes (hack study, drawdowns, Nasdaq down days). No CSV fallback.",
     ):
         _on_refresh("bitstamp")
     if row2[0].button(
@@ -382,7 +413,7 @@ with st.expander("Refresh data", expanded=True):
         _on_refresh("hacks")
     if row2[2].button(
         "Refresh all", key="eco_refresh_all", width="stretch",
-        help="Re-fetch every dataset above, including Fed transcripts. Fed tone can take a few minutes.",
+        help="Re-fetch every dataset here, including Fed transcripts and the Strategy 8-K. Fed tone can take a few minutes.",
     ):
         _on_refresh("all")
     if row2[3].button(
@@ -391,10 +422,17 @@ with st.expander("Refresh data", expanded=True):
              "Needs [github] dispatch_token. Does not redraw these charts by itself.",
     ):
         _on_refresh("dispatch")
+    if row3[0].button(
+        "Strategy 8-K", key="eco_refresh_strategy", width="stretch",
+        help="Parse Strategy's latest weekly 8-K from SEC EDGAR. No token needed. "
+             "A failed parse leaves the previous table on screen.",
+    ):
+        _on_refresh("strategy")
 
 tabs = st.tabs(["ETF flow streaks", "Exchange hacks", "Fed tone", "BTC vs 200DMA",
                 "BTC–Nasdaq correlation", "Inflation & yields",
-                "BTC / 200DMA ratio", "ETF flow regime"])
+                "BTC / 200DMA ratio", "ETF flow regime",
+                "30-day ETF flow", "Nasdaq down days", "Drawdowns", "Strategy funding"])
 px = _load_btc()
 
 # ------------------------------------------------------------------ ETF flows
@@ -531,7 +569,19 @@ with tabs[3]:
                  f"Bitcoin trades {last['gap']:+.1%} versus its 200-day moving average ({last['close']:,.0f} vs {last['sma']:,.0f}).",
                  "Notes: Deribit BTC-PERPETUAL daily closes. Source: Deribit.", yfmt=",.0f")
         fig.update_layout(showlegend=True, legend=dict(orientation="h", y=1.04, x=0.6))
+        if len(gw):
+            fig.update_xaxes(range=[gw["date"].min(), gw["date"].max()])
         show(fig)
+    nq_panel = _safe(_load_fred, "NASDAQCOM")
+    if nq_panel is not None:
+        x0 = gw["date"].min() if px is not None and len(gw) else cutoff
+        x1 = gw["date"].max() if px is not None and len(gw) else as_of_date
+        show(eco_charts.figure_nasdaq_sma(eco.sma_rows(nq_panel, 200), x0, x1))
+        st.caption(
+            "Same date range as the Bitcoin panel. FRED's Nasdaq only prints on trading days, so its 200-day "
+            "average spans 200 trading days (about 40 weeks); the Bitcoin average spans 200 daily bars "
+            "including weekends (about 29 weeks)."
+        )
 
 # ------------------------------------------------------------ Nasdaq correlation
 with tabs[4]:
@@ -672,6 +722,121 @@ with tabs[7]:
             show(eco_charts.figure_etf_flow_regime(regime_view))
     with st.expander("How the flow regime is calculated"):
         st.markdown(eco.flow_regime_methodology())
+
+
+def _btc_closes_since_2013():
+    """Bitstamp (2013 to Jul 2018) spliced with Deribit BTC-PERP; Deribit wins on overlap."""
+    early = None
+    try:
+        early = _load_bitstamp()
+    except Exception as ex:
+        st.warning(f"Bitstamp unavailable ({ex}); using Deribit only, from Aug 2018.")
+    return eco.daily_closes(early, px)
+
+
+# --------------------------------------------------- 30-session ETF flow line
+with tabs[8]:
+    st.caption(
+        "Rolling 30-session net flow into US spot BTC ETFs, in BTC, with the line coloured by the BTC price. "
+        "Inspired by the 13 Nov 2026 Ecoinometrics chart in \"Bitcoin's Recovery Has Failed\". "
+        "Ours converts each day's Farside US$ flow at that day's Deribit close; theirs is the change in BTC "
+        "held by the ETFs, so the levels will not match exactly."
+    )
+    flows = _safe(_load_etf)
+    if flows is None or px is None:
+        st.error("Needs the Farside flow table and Deribit BTC-PERP daily closes.")
+    else:
+        rf = eco.rolling_flow_with_price(eco.flows_to_btc(flows, px), px, 30)
+        view = eco.display_from(rf, cutoff)
+        valid = view.dropna(subset=["roll"])
+        if len(valid):
+            last = valid.iloc[-1]
+            c = st.columns(3)
+            c[0].metric("30-session net flow", f"{last['roll']:,.0f} BTC")
+            c[1].metric("Window low", f"{valid['roll'].min():,.0f} BTC")
+            c[2].metric("Window high", f"{valid['roll'].max():,.0f} BTC")
+        show(eco_charts.figure_rolling_flow_price(view, 30))
+
+# ------------------------------------------------------ Nasdaq down days
+with tabs[9]:
+    st.caption(
+        "Bitcoin's same-day return on every Nasdaq-100 down day since 2014, grouped by how far the Nasdaq-100 fell. "
+        "Inspired by the 9 Nov 2026 Ecoinometrics chart in \"Bitcoin's Recovery Is at Risk as the Nasdaq Weakens\". "
+        "Matching rule: for Nasdaq trading date D (close-to-close, so Monday covers the weekend), the BTC return is "
+        "the UTC daily bar stamped D over the bar stamped D−1. Bitstamp bars (to Jul 2018) run 00:00-24:00 UTC and "
+        "Deribit BTC-PERP bars run 08:00 UTC to 08:00 UTC the next day, so the 13:30-20:00 UTC Nasdaq session falls "
+        "inside the BTC bar either way. Buckets include their lower bound (−4% sits in −4% to −2%). "
+        "This ignores the window lookback; it always uses 2014 onward."
+    )
+    ndx = _safe(_load_fred, "NASDAQ100")
+    if ndx is not None and px is not None:
+        closes = _btc_closes_since_2013()
+        dd_days = eco.btc_on_nasdaq_down_days(ndx, closes, "2014-01-01")
+        stats = eco.bucket_stats(dd_days)
+        show(eco_charts.figure_nasdaq_down_days(dd_days, stats))
+        if not stats.empty:
+            t = stats.copy()
+            t["share_down"] = (t["share_down"] * 100).round(0)
+            st.dataframe(
+                t.rename(columns={"bucket": "Nasdaq-100 day", "n": "Days", "median": "Median BTC %",
+                                  "mean": "Mean BTC %", "share_down": "% of days BTC fell"})
+                 .style.format({"Median BTC %": "{:+.2f}", "Mean BTC %": "{:+.2f}", "% of days BTC fell": "{:.0f}"}),
+                width="stretch", hide_index=True,
+            )
+
+# --------------------------------------------------------- Drawdowns
+with tabs[10]:
+    st.caption(
+        "Every Bitcoin drawdown since 2014, duration against depth. Inspired by the 13 Nov 2026 Ecoinometrics chart. "
+        "Rules: daily closes (Bitstamp to Jul 2018, Deribit BTC-PERP after). A drawdown starts at an all-time-high "
+        "close and ends on the first close back at or above that peak; depth is the lowest close in between. "
+        f"Only drawdowns of {dd_min:.0%} or more (sidebar slider) that were still open on or after 1 Jan 2014, so the "
+        "Dec 2013 peak counts. Smaller dips inside a bigger drawdown are part of it. The open drawdown is measured "
+        "to the latest close, including today's unfinished Deribit bar. Ecoinometrics does not publish its rules, so "
+        "our dots will not sit exactly on theirs."
+    )
+    if px is not None:
+        closes = _btc_closes_since_2013()
+        dd = eco.drawdown_episodes(closes, dd_min)
+        show(eco_charts.figure_drawdowns(dd, eco.drawdown_trend(dd), dd_min))
+        if len(dd):
+            t = dd.copy()
+            for col in ("peak_date", "trough_date", "recovered"):
+                t[col] = pd.to_datetime(t[col]).dt.strftime("%d %b %Y").fillna("ongoing")
+            t["depth"] = (t["depth"] * 100).round(1)
+            st.dataframe(
+                t.rename(columns={"peak_date": "Peak", "peak": "Peak close", "trough_date": "Low",
+                                  "trough": "Low close", "recovered": "Recovered", "days": "Days",
+                                  "depth": "Max drawdown %", "ongoing": "Ongoing"}),
+                width="stretch", hide_index=True,
+            )
+    else:
+        st.error("No Deribit BTC-PERP daily history.")
+
+# --------------------------------------------------- Strategy funding
+with tabs[11]:
+    st.caption(
+        "Where Strategy (MSTR) raised money and what it spent it on in the week covered by its latest Monday 8-K. "
+        "Inspired by the 11 Nov 2026 Ecoinometrics chart in \"Bitcoin's Corporate Buyers Are Pulling Back\". "
+        "Parsed live from SEC EDGAR (CIK 0001050446); if EDGAR is unreachable or the format changes, the page falls "
+        "back to the last good parse in data/strategy_funding.csv and says so in Refresh data."
+    )
+    try:
+        sf = _load_strategy()
+        funding = strategy_8k.from_frame(sf)
+    except Exception as ex:
+        st.error(f"Could not read Strategy's weekly 8-K: {ex}. Try Refresh data → Strategy 8-K.")
+        funding = None
+    if funding is not None:
+        c = st.columns(4)
+        c[0].metric("Raised (net, US$)", f"{funding.total_raised:,.1f}M")
+        c[1].metric("BTC bought", f"{funding.btc_bought:,.0f}" if funding.btc_bought is not None else "—")
+        c[2].metric("BTC held", f"{funding.btc_holdings:,.0f}" if funding.btc_holdings is not None else "—")
+        c[3].metric("USD Cash / USD Reserve",
+                    (f"{funding.usd_cash_m:,.0f}M / {funding.usd_reserve_b:,.2f}B"
+                     if funding.usd_cash_m is not None and funding.usd_reserve_b is not None else "—"))
+        show(eco_charts.figure_strategy_funding(funding))
+        st.caption(f"Filing: [{funding.accession}]({funding.url}), filed {funding.filed} (US Eastern date).")
 
 st.divider()
 st.caption(

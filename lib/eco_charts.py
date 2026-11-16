@@ -278,3 +278,223 @@ def figure_etf_flow_regime(df: pd.DataFrame) -> go.Figure:
         ))
     fig.add_hline(y=0, line_color="#888888", line_width=1)
     return _theme(fig, _FLOW_NOTE)
+
+
+# ----------------------------------------------------------------------------
+# Added 2026-11-16, inspired by the 9/11/13 Nov 2026 Ecoinometrics issues.
+# These copy the newsletter look (lib/eco_style.style), like the original
+# replicas on the page, rather than the white fx_style card above.
+from lib import eco_style as es  # noqa: E402
+
+
+def _empty_note(fig: go.Figure, text: str) -> go.Figure:
+    fig.add_annotation(text=text, xref="paper", yref="paper", x=0.5, y=0.5,
+                       showarrow=False, font=dict(color=es.INK, size=15))
+    return fig
+
+
+def figure_nasdaq_sma(nq: pd.DataFrame, start=None, end=None) -> go.Figure:
+    """Nasdaq Composite with its 200-trading-day SMA. ``nq`` is ``eco.sma_rows`` output."""
+    fig = go.Figure()
+    notes = ("Notes: FRED NASDAQCOM daily closes. The average is 200 trading days (FRED prints), "
+             "while the Bitcoin panel above uses 200 daily bars including weekends. Source: FRED.")
+    view = nq if start is None else nq[nq["date"] >= pd.Timestamp(start)]
+    valid = view.dropna(subset=["sma"])
+    if valid.empty:
+        es.style(fig, "The Nasdaq vs Its 200-Day Average", "Nasdaq", "No Nasdaq data in this window.", notes, height=520)
+        return _empty_note(fig, "No Nasdaq data")
+    last = valid.iloc[-1]
+    fig.add_trace(go.Scatter(x=view["date"], y=view["sma"], line=dict(color=es.ORANGE, width=3), name="200-day average"))
+    fig.add_trace(go.Scatter(x=view["date"], y=view["value"], line=dict(color=es.INK, width=2), name="Nasdaq Composite",
+                             hovertemplate="%{x|%d %b %Y}: %{y:,.0f}<extra></extra>"))
+    es.style(fig, "The Nasdaq vs Its 200-Day Average", "Nasdaq",
+             f"The Nasdaq trades {last['gap']:+.2%} versus its 200-day average "
+             f"({last['value']:,.0f} vs {last['sma']:,.0f}) as of {pd.Timestamp(last['date']):%d %b %Y}.",
+             notes, height=520, yfmt=",.0f")
+    fig.update_layout(showlegend=True, legend=dict(orientation="h", y=1.04, x=0.55))
+    if start is not None:
+        fig.update_xaxes(range=[pd.Timestamp(start), pd.Timestamp(end) if end is not None else view["date"].max()])
+    return fig
+
+
+def figure_rolling_flow_price(df: pd.DataFrame, window: int = 30) -> go.Figure:
+    """30-session rolling ETF flow (BTC) as a line coloured by the BTC close."""
+    fig = go.Figure()
+    notes = (f"Notes: sum of the last {window} Farside sessions, each converted from US$ to BTC at that UTC "
+             "day's Deribit close. Ecoinometrics uses the change in BTC held by the ETFs, so levels differ. "
+             "Source: Farside, Deribit.")
+    view = df.dropna(subset=["roll", "close"]) if df is not None and len(df) else pd.DataFrame()
+    if view.empty:
+        es.style(fig, "Bitcoin ETF Flows Over 30 Days", "Bitcoin", "Not enough aligned sessions yet.", notes)
+        return _empty_note(fig, f"Needs {window} aligned sessions")
+    x = view["date"].tolist()
+    y = view["roll"].to_numpy(dtype=float)
+    close = view["close"].to_numpy(dtype=float)
+    lo, hi = float(close.min()), float(close.max())
+    span = hi - lo
+    n_bins = 12
+    bins = np.zeros(len(y), dtype=int) if span <= 0 else np.clip(
+        np.floor((close - lo) / span * n_bins), 0, n_bins - 1).astype(int)
+    runs: list[tuple[int, list, list]] = []
+    for i in range(1, len(y)):
+        b = int(bins[i])
+        if runs and runs[-1][0] == b:
+            runs[-1][1].append(x[i]); runs[-1][2].append(float(y[i]))
+        else:
+            runs.append((b, [x[i - 1], x[i]], [float(y[i - 1]), float(y[i])]))
+    for b, rx, ry in runs:
+        fig.add_trace(go.Scatter(x=rx, y=ry, mode="lines", hoverinfo="skip", showlegend=False,
+                                 line=dict(color=_price_hex((b + 0.5) / n_bins if span > 0 else 0.5), width=3)))
+    fig.add_trace(go.Scatter(
+        x=x, y=y, mode="markers", showlegend=False,
+        marker=dict(size=5, color=close, colorscale=PRICE_COLORSCALE, cmin=lo, cmax=hi if span > 0 else lo + 1,
+                    colorbar=dict(title=dict(text="BTC close", font=dict(color=es.INK, size=12)),
+                                  tickfont=dict(color=es.INK, size=11), tickformat="$,.0f", thickness=12)),
+        customdata=close,
+        hovertemplate="%{x|%d %b %Y}<br>30-session flow %{y:,.0f} BTC<br>Close %{customdata:,.0f} USD<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_color=es.INK, line_width=1.5)
+    last = view.iloc[-1]
+    word = "inflow" if last["roll"] >= 0 else "outflow"
+    es.style(fig, "Bitcoin ETF Flows Over 30 Days", "Bitcoin",
+             f"Net {word} of {abs(last['roll']):,.0f} BTC over the last {window} sessions "
+             f"to {pd.Timestamp(last['date']):%d %b %Y}. Line colour is the Bitcoin price.",
+             notes, yfmt=",.0f")
+    fig.update_yaxes(title_text=f"{window}-session net flow (BTC)")
+    fig.update_layout(margin=dict(r=110))
+    return fig
+
+
+def figure_nasdaq_down_days(df: pd.DataFrame, stats: pd.DataFrame) -> go.Figure:
+    """Box plots of BTC same-date returns per Nasdaq-100 down-day bucket."""
+    fig = go.Figure()
+    notes = ("Notes: Nasdaq-100 (FRED NASDAQ100) close-to-close return on its trading date D; each bucket includes its lower bound. "
+             "BTC return is the daily bar stamped D over the bar stamped D−1 (Bitstamp 00:00 UTC bars to Jul 2018, "
+             "Deribit BTC-PERP 08:00 UTC bars after); the 13:30-20:00 UTC Nasdaq session sits inside both. "
+             "Since 2014. Source: FRED, Bitstamp, Deribit.")
+    if df is None or len(df) == 0 or stats is None or stats.empty:
+        es.style(fig, "Bitcoin on Nasdaq Down Days", "Bitcoin", "No overlapping data.", notes)
+        return _empty_note(fig, "No overlapping data")
+    order = stats["bucket"].tolist()
+    colours = [es.RED, "#B3123F", es.ORANGE, es.YELLOW, es.TEAL]
+    cmap = {lab: colours[i % len(colours)] for i, lab in enumerate(eco.NASDAQ_BUCKET_LABELS)}
+    for lab in order:
+        g = df[df["bucket"] == lab]
+        fig.add_trace(go.Box(
+            x=[lab] * len(g), y=g["btc_ret"], name=lab, marker_color=cmap[lab],
+            boxpoints="all" if len(g) < 10 else "outliers", pointpos=0 if len(g) < 10 else None,
+            line=dict(width=2), fillcolor=cmap[lab], opacity=0.75,
+            customdata=np.column_stack([g["date"].dt.strftime("%d %b %Y"), g["ndx_ret"]]),
+            hovertemplate="%{customdata[0]}<br>Nasdaq-100 %{customdata[1]:.1f}%<br>BTC %{y:.1f}%<extra></extra>",
+        ))
+    def _pct(v):
+        return f"{0.0 if abs(v) < 0.005 else v:+.2f}%"
+    ticktext = [f"<b>{r['bucket']}</b><br>median {_pct(r['median'])}<br>n = {int(r['n'])}"
+                for _, r in stats.iterrows()]
+    worst = stats.iloc[0] if len(stats) else None
+    mild = stats[stats["bucket"] == "−2% to 0%"]
+    sub = "Bitcoin's median daily return by size of the Nasdaq-100's down day"
+    if worst is not None and len(mild):
+        sub += f" ({_pct(worst['median'])} in the {worst['bucket']} bucket vs {_pct(mild.iloc[0]['median'])} on −2% to 0% days)."
+    else:
+        sub += "."
+    es.style(fig, "Bitcoin on Nasdaq Down Days", "Bitcoin", sub, notes)
+    fig.update_yaxes(ticksuffix="%", title_text="BTC return on the same date")
+    fig.update_xaxes(title_text="", categoryorder="array", categoryarray=order,
+                     tickmode="array", tickvals=order, ticktext=ticktext)
+    fig.update_layout(margin=dict(b=175))
+    return fig
+
+
+def figure_drawdowns(dd: pd.DataFrame, trend: tuple[float, float] | None, min_depth: float) -> go.Figure:
+    """Duration (log x) vs max drawdown for each BTC drawdown; ongoing one highlighted."""
+    fig = go.Figure()
+    notes = (f"Notes: daily closes (Bitstamp to Jul 2018, Deribit BTC-PERP after). A drawdown runs from an all-time-high "
+             f"close to the first close back at or above it; only drawdowns of {min_depth:.0%} or more that were still "
+             "open on or after 1 Jan 2014. Trend: least squares of depth on log duration, finished drawdowns only. "
+             "Source: Bitstamp, Deribit.")
+    if dd is None or dd.empty:
+        es.style(fig, "Bitcoin Drawdowns: Duration vs Depth", "Bitcoin", "No drawdowns at this threshold.", notes)
+        return _empty_note(fig, "No drawdowns")
+    done = dd[~dd["ongoing"]]
+    cur = dd[dd["ongoing"]]
+    fig.add_trace(go.Scatter(
+        x=done["days"], y=done["depth"] * 100, mode="markers+text", name="Finished",
+        text=pd.to_datetime(done["peak_date"]).dt.strftime("%b %Y"), textposition="top center",
+        textfont=dict(family="Arial", size=11, color=es.INK),
+        marker=dict(size=13, color=es.TEAL, line=dict(color=es.INK, width=0.6)),
+        customdata=np.column_stack([pd.to_datetime(done["peak_date"]).dt.strftime("%d %b %Y"),
+                                    pd.to_datetime(done["trough_date"]).dt.strftime("%d %b %Y"),
+                                    pd.to_datetime(done["recovered"]).dt.strftime("%d %b %Y")]),
+        hovertemplate="Peak %{customdata[0]}<br>Trough %{customdata[1]}<br>Recovered %{customdata[2]}"
+                      "<br>%{x} days, %{y:.1f}%<extra></extra>",
+    ))
+    if trend is not None:
+        a, b = trend
+        xs = np.logspace(np.log10(max(1, dd["days"].min() * 0.8)), np.log10(dd["days"].max() * 1.3), 50)
+        fig.add_trace(go.Scatter(x=xs, y=np.clip(a + b * np.log10(xs), -100, 0), mode="lines", name="Trend",
+                                 line=dict(color=es.MUTED, width=2, dash="dash"), hoverinfo="skip"))
+    sub = f"{len(done)} finished drawdowns of {min_depth:.0%} or more since 2014."
+    if len(cur):
+        c = cur.iloc[0]
+        fig.add_trace(go.Scatter(
+            x=[c["days"]], y=[c["depth"] * 100], mode="markers", name="Current (ongoing)",
+            marker=dict(size=20, color=es.ORANGE, symbol="star", line=dict(color=es.INK, width=1)),
+            hovertemplate=f"Current: peak {pd.Timestamp(c['peak_date']):%d %b %Y} ({c['peak']:,.0f})"
+                          f"<br>Low {pd.Timestamp(c['trough_date']):%d %b %Y} ({c['trough']:,.0f})"
+                          "<br>%{x} days so far, max %{y:.1f}%<extra></extra>",
+        ))
+        es.note(fig, np.log10(c["days"]), c["depth"] * 100,
+                f"Current: {int(c['days'])} days,<br>{c['depth']:.0%} max", color=es.ORANGE, ax=-70, ay=40,
+                xref="x", yref="y")
+        sub += (f" The current one is {int(c['days'])} days old with a {c['depth']:.0%} maximum drawdown "
+                f"(peak {pd.Timestamp(c['peak_date']):%d %b %Y}).")
+        if trend is not None:
+            sub += f" The trend line implies {trend[0] + trend[1] * np.log10(c['days']):.0f}% at that duration."
+    es.style(fig, "Bitcoin Drawdowns: Duration vs Depth", "Bitcoin", sub, notes)
+    fig.update_xaxes(type="log", title_text="Duration, peak to recovery (calendar days, log scale)",
+                     tickvals=[5, 10, 30, 60, 100, 200, 365, 730, 1000, 1500],
+                     ticktext=["5", "10", "30", "60", "100", "200", "1y", "2y", "1,000", "1,500"])
+    fig.update_yaxes(ticksuffix="%", title_text="Maximum drawdown from peak", range=[-100, 0])
+    fig.update_layout(showlegend=True, legend=dict(orientation="h", y=1.04, x=0.55))
+    return fig
+
+
+def figure_strategy_funding(f) -> go.Figure:
+    """Horizontal bars: where Strategy's money came from and went in its latest weekly 8-K."""
+    period = ""
+    if f.period_start is not None and f.period_end is not None:
+        period = f"{f.period_start:%d %b} to {f.period_end:%d %b %Y}"
+    notes = (f"Notes: parsed from Strategy's 8-K filed {f.filed} (SEC EDGAR, accession {f.accession}). "
+             "Sources are ATM net proceeds. Uses come from the 8-K footnotes, BTC table and repurchase table; "
+             "a buyback can be paid from existing USD Cash, so uses need not equal sources. Source: SEC EDGAR.")
+    rows = [("Raised", k, v) for k, v in sorted(f.sources.items(), key=lambda kv: kv[1])]
+    rows += [("Used", k, v) for k, v in sorted(f.uses.items(), key=lambda kv: kv[1])]
+    fig = go.Figure()
+    if not rows:
+        es.style(fig, "Strategy's Weekly Funding", "Strategy", "Nothing raised or spent this week.", notes, height=520)
+        return _empty_note(fig, "No amounts in this 8-K")
+    colour = {"Raised": es.INK}
+    use_col = {"BTC purchases": es.ORANGE, "USD Cash": es.TEAL, "USD Reserve": "#1B4F72"}
+    labels = [f"{k}" for _, k, _ in rows]
+    cols = [colour.get(g) or use_col.get(k, es.RED) for g, k, _ in rows]
+    fig.add_trace(go.Bar(
+        y=[[g for g, _, _ in rows], labels], x=[v for _, _, v in rows], orientation="h",
+        marker_color=cols, text=[f"${v:,.1f}M" for _, _, v in rows], textposition="outside",
+        textfont=dict(family=es.SERIF, size=13, color=es.INK),
+        hovertemplate="%{y}: $%{x:,.1f}M<extra></extra>",
+    ))
+    raised = f.total_raised
+    parts = []
+    for k in ("BTC purchases",) + tuple(k for k in f.uses if k.endswith("buyback")):
+        if k in f.uses and raised:
+            parts.append(f"{f.uses[k] / raised:.0%} to {k.replace('BTC purchases', 'bitcoin')}")
+    # "&#36;" not "$": two dollar signs in one string switch Plotly to LaTeX.
+    sub = f"Week {period}: raised &#36;{raised:,.1f}M" + (f" ({', '.join(parts)} of that)" if parts else "") + "."
+    if f.btc_bought:
+        sub += f" Bought {f.btc_bought:,.0f} BTC at &#36;{f.btc_avg_price:,.0f}; holds {f.btc_holdings:,.0f} BTC."
+    es.style(fig, "Strategy's Weekly Funding", "Strategy", sub, notes, height=560)
+    fig.update_xaxes(title_text="US$ millions", tickprefix="$", range=[0, max(v for _, _, v in rows) * 1.25])
+    fig.update_yaxes(gridcolor="rgba(0,0,0,0)", zeroline=False)
+    fig.update_layout(margin=dict(l=190))
+    return fig

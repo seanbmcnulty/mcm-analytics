@@ -35,9 +35,11 @@ import requests
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 FARSIDE_URLS = ("https://farside.co.uk/btc/", "https://farside.co.uk/bitcoin-etf-flow-all-data/")
 FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
-FRED_SERIES = ("DFF", "NASDAQCOM", "CPIAUCSL", "DGS10")
+FRED_SERIES = ("DFF", "NASDAQCOM", "CPIAUCSL", "DGS10", "NASDAQ100")
 # Hack events before Deribit's perp history (Aug 2018) use Bitstamp spot.
-BITSTAMP_START = "2014-12-01"
+# 2013 start so the drawdown study sees the Nov/Dec 2013 peak and the
+# Nasdaq down-day study has all of 2014. The earliest hack is Jan 2015.
+BITSTAMP_START = "2013-01-01"
 BITSTAMP_END = "2018-08-02"
 BITSTAMP_URL = "https://www.bitstamp.net/api/v2/ohlc/btcusd/"
 DERIBIT_BTC_DAILY_START = "2018-08-01"
@@ -869,3 +871,176 @@ def add_fed_funds(ft: pd.DataFrame, dff: pd.DataFrame) -> pd.DataFrame:
     """Attach the effective fed funds rate (FRED DFF) on/before each meeting date."""
     m = pd.merge_asof(ft.sort_values("date"), dff.rename(columns={"value": "ffr"}).sort_values("date"), on="date")
     return m
+
+
+# ------------------------------------------- added 2026-11-16 (13 Nov issue)
+# Nasdaq panel, 30-session flow line, BTC on Nasdaq down days, drawdown
+# duration vs depth. Strategy's 8-K breakdown lives in lib/strategy_8k.py.
+def sma_rows(series: pd.DataFrame, window: int = 200) -> pd.DataFrame:
+    """FRED-style ``DataFrame[date, value]`` plus a ``window``-observation SMA.
+
+    FRED equity indices only print on trading days, so 200 rows is a
+    200-trading-day average (about 40 calendar weeks). Blank until full.
+    """
+    d = series[["date", "value"]].copy()
+    d["date"] = pd.to_datetime(d["date"])
+    d = d.dropna().sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    d["sma"] = d["value"].rolling(window, min_periods=window).mean()
+    d["gap"] = d["value"] / d["sma"] - 1
+    return d
+
+
+def rolling_flow_with_price(flows_btc: pd.DataFrame, px: pd.DataFrame, window: int = 30) -> pd.DataFrame:
+    """``flows_to_btc`` output -> DataFrame[date, flow, roll, close].
+
+    ``roll`` is the sum of the last ``window`` aligned Farside sessions
+    (blank until ``window`` sessions exist). ``close`` is the Deribit close on
+    that UTC date, the same close the dollar flow was converted at.
+    """
+    cols = ["date", "flow", "roll", "close"]
+    if flows_btc is None or px is None or len(flows_btc) == 0 or len(px) == 0:
+        return pd.DataFrame(columns=cols)
+    d = flows_btc[["date", "flow"]].copy()
+    d["date"] = _utc_calendar_date(d["date"])
+    d = d.sort_values("date").reset_index(drop=True)
+    d["roll"] = d["flow"].rolling(window, min_periods=window).sum()
+    p = pd.DataFrame({"date": _utc_calendar_date(px["timestamp"]),
+                      "close": pd.to_numeric(px["close"], errors="coerce")})
+    p = p.dropna().drop_duplicates("date", keep="first").set_index("date")["close"]
+    d["close"] = d["date"].map(p)
+    return d[cols]
+
+
+def daily_closes(*frames: pd.DataFrame) -> pd.Series:
+    """Splice ``DataFrame[timestamp, close]`` frames into one close per UTC date.
+
+    Later frames win on an overlapping date (pass Bitstamp first, Deribit
+    second). Non-finite or non-positive closes are dropped, never filled.
+    """
+    parts = []
+    for rank, f in enumerate(frames):
+        if f is None or len(f) == 0:
+            continue
+        parts.append(pd.DataFrame({
+            "date": _utc_calendar_date(f["timestamp"]),
+            "close": pd.to_numeric(f["close"], errors="coerce"),
+            "rank": rank,
+        }))
+    if not parts:
+        return pd.Series(dtype=float)
+    d = pd.concat(parts).dropna(subset=["date"])
+    d = d[np.isfinite(d["close"].to_numpy()) & (d["close"].to_numpy() > 0)]
+    d = d.sort_values(["date", "rank"]).drop_duplicates("date", keep="last")
+    return d.set_index("date")["close"].sort_index()
+
+
+NASDAQ_BUCKETS = ((-np.inf, -8.0), (-8.0, -6.0), (-6.0, -4.0), (-4.0, -2.0), (-2.0, 0.0))
+NASDAQ_BUCKET_LABELS = ("Below −8%", "−8% to −6%", "−6% to −4%", "−4% to −2%", "−2% to 0%")
+
+
+def nasdaq_bucket(ret_pct: float) -> str | None:
+    """Bucket label for a Nasdaq daily % return. ``lo <= r < hi``; 0% and up is None."""
+    if ret_pct is None or not np.isfinite(ret_pct) or ret_pct >= 0:
+        return None
+    for (lo, hi), label in zip(NASDAQ_BUCKETS, NASDAQ_BUCKET_LABELS):
+        if lo <= ret_pct < hi:
+            return label
+    return None
+
+
+def btc_on_nasdaq_down_days(ndx: pd.DataFrame, btc_close: pd.Series, start: str = "2014-01-01") -> pd.DataFrame:
+    """Same-date BTC daily return on every Nasdaq-100 down day.
+
+    ``ndx`` is FRED ``DataFrame[date, value]``; its return is close-to-close
+    over consecutive FRED prints (Friday to Monday over a weekend).
+    ``btc_close`` is one close per UTC date (``daily_closes``). The BTC return
+    for Nasdaq date D is close(D) / close(D - 1 calendar day) - 1, using the
+    bar stamped D. Both of those bars must exist; nothing is carried.
+    """
+    cols = ["date", "ndx_ret", "btc_ret", "bucket"]
+    if ndx is None or len(ndx) == 0 or btc_close is None or len(btc_close) == 0:
+        return pd.DataFrame(columns=cols)
+    n = ndx[["date", "value"]].copy()
+    n["date"] = pd.to_datetime(n["date"]).dt.normalize()
+    n = n.dropna().sort_values("date").drop_duplicates("date")
+    n["ndx_ret"] = n["value"].pct_change() * 100
+    n = n[n["date"] >= pd.Timestamp(start)]
+    prev = btc_close.copy()
+    prev.index = prev.index + pd.Timedelta(days=1)
+    n["btc_ret"] = (n["date"].map(btc_close) / n["date"].map(prev) - 1) * 100
+    n["bucket"] = n["ndx_ret"].map(nasdaq_bucket)
+    n = n.dropna(subset=["ndx_ret", "btc_ret", "bucket"])
+    return n[cols].reset_index(drop=True)
+
+
+def bucket_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """n, median and mean BTC return per bucket, in bucket order (empty buckets dropped)."""
+    rows = []
+    for label in NASDAQ_BUCKET_LABELS:
+        g = df.loc[df["bucket"] == label, "btc_ret"] if len(df) else pd.Series(dtype=float)
+        if len(g):
+            rows.append({"bucket": label, "n": int(len(g)), "median": float(g.median()),
+                         "mean": float(g.mean()), "share_down": float((g < 0).mean())})
+    return pd.DataFrame(rows, columns=["bucket", "n", "median", "mean", "share_down"])
+
+
+DRAWDOWN_FROM = "2014-01-01"
+
+
+def drawdown_episodes(close: pd.Series, min_depth: float = 0.20, active_from: str = DRAWDOWN_FROM) -> pd.DataFrame:
+    """Peak-to-recovery drawdowns of a daily close series.
+
+    An episode starts at a running all-time-high close (``peak``) when the
+    next close is below it, and ends on the first later close at or above
+    that peak (``recovered``). ``depth`` is the lowest close in between over
+    the peak, minus one (negative). ``days`` is peak to recovery in calendar
+    days; for the open episode it is peak to the latest close and
+    ``ongoing`` is True. Episodes shallower than ``min_depth`` are dropped,
+    as are episodes that recovered before ``active_from``.
+    """
+    cols = ["peak_date", "peak", "trough_date", "trough", "recovered", "days", "depth", "ongoing"]
+    s = close.dropna().sort_index()
+    s = s[s > 0]
+    if len(s) < 2:
+        return pd.DataFrame(columns=cols)
+    vals, dates = s.to_numpy(dtype=float), s.index
+    rows = []
+    peak_i, trough_i, in_dd = 0, 0, False
+    for i in range(1, len(vals)):
+        if vals[i] >= vals[peak_i]:
+            if in_dd:
+                rows.append((peak_i, trough_i, i))
+                in_dd = False
+            peak_i = i
+        else:
+            if not in_dd:
+                in_dd, trough_i = True, i
+            elif vals[i] < vals[trough_i]:
+                trough_i = i
+    if in_dd:
+        rows.append((peak_i, trough_i, None))
+    out = []
+    last = dates[-1]
+    for p, t, r in rows:
+        depth = vals[t] / vals[p] - 1
+        end = dates[r] if r is not None else last
+        out.append({
+            "peak_date": dates[p], "peak": vals[p], "trough_date": dates[t], "trough": vals[t],
+            "recovered": dates[r] if r is not None else pd.NaT,
+            "days": int((end - dates[p]).days), "depth": float(depth), "ongoing": r is None,
+        })
+    df = pd.DataFrame(out, columns=cols)
+    df = df[df["depth"] <= -abs(min_depth)]
+    keep = df["ongoing"] | (pd.to_datetime(df["recovered"]) >= pd.Timestamp(active_from))
+    return df[keep].reset_index(drop=True)
+
+
+def drawdown_trend(dd: pd.DataFrame) -> tuple[float, float] | None:
+    """Least-squares depth (%) = a + b * log10(days) on finished episodes. None if fewer than 3."""
+    done = dd[~dd["ongoing"].astype(bool)] if len(dd) else dd
+    if len(done) < 3:
+        return None
+    x = np.log10(done["days"].clip(lower=1).to_numpy(dtype=float))
+    y = done["depth"].to_numpy(dtype=float) * 100
+    b, a = np.polyfit(x, y, 1)
+    return float(a), float(b)
