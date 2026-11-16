@@ -300,6 +300,38 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-11-15 — Ecoinometrics page can refresh its own external data
+
+The charts page had a cache-clear button and otherwise waited on whatever
+`st.cache_data` still held. Farside, FRED, and the Fed-tone CSV could not be
+rebuilt from the app. `lib/eco_refresh.py` is now the shared builder:
+`tools/build_fred_cache.py`, `tools/build_fed_tone.py`, and
+`tools/refresh_ecoinometrics_data.py` are thin CLIs over it, and the page
+calls the same functions.
+
+- **Click only.** Page load still uses the existing TTL fetches (live, then
+  CSV). PDF downloads, CSV rewrites, and the GitHub dispatch run inside
+  `_on_refresh`, which the buttons call. A process-wide lock ignores a second
+  refresh while one is running.
+- **In-session first.** A successful refresh is stored on `st.session_state`
+  (`eco_good`) and the charts redraw from it. The CSV write is best-effort.
+  Streamlit Cloud's disk is wiped on redeploy, and the app does not push to
+  git, so that file is not the durable copy.
+- **Optional durable path.** "Rebuild committed CSVs" POSTs `workflow_dispatch`
+  for `.github/workflows/update_ecoinometrics_data.yml` only when
+  `[github] dispatch_token` (or `GITHUB_DISPATCH_TOKEN`) is set. The token is a
+  fine-grained PAT for this repo with Actions: Read and write; Contents can
+  stay No access, because the workflow commits with its own `GITHUB_TOKEN`.
+  No token: the button explains that and does not call GitHub. The workflow
+  also runs Sunday 07:15 UTC. It has to be on `main` before dispatch works.
+- **Status line.** Each dataset shows live vs CSV fallback vs bundled, the
+  last-updated time in SGT (`fx_style.to_local_ts`), and the latest success or
+  failure. A failed refresh leaves the previous good frame on the charts.
+- `clear_all_caches()` drops the session frames. Fed tone merges into
+  `data/fed_tone.csv` (a date that was not rescored is kept; zero new
+  transcripts leave the file untouched). The bare CLI still defaults to 2022
+  and now merges rather than truncating.
+
 ### 2026-11-15 — Exchange hacks: 2026 Bitget and Binance, coloured by year
 
 Added Bitget (2026-09-24, $387.5m; detection ~18:31 UTC) and Binance
@@ -332,6 +364,7 @@ comes from the same smoothed fixed-tenor grid the full "(est.)" line uses.
 Open markers plus the subtitle mark those points "(est.)". A lookback with
 no per-expiry history at all is unchanged ("1 Month Ago (est.)"). The
 command is shared by every asset. `tests/test_vol_term_structure.py`.
+
 
 ### 2026-11-09 — Ecoinometrics: close/200DMA ratio and MCM ETF flow regime
 
