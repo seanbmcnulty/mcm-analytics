@@ -51,6 +51,18 @@ def clear_all_caches() -> None:
     surface.clear_cache()
     history.clear_cache()
     ibit.clear_cache()
+    # Ecoinometrics keeps refreshed frames in st.session_state (eco_good /
+    # eco_attempt / eco_shown) plus the page's st.cache_data loaders, which
+    # the clear above already drops. The session keys have to go too, or the
+    # next rerun would keep showing the refresh and ignore the cache clear.
+    # The in-process refresh lock is not a cache and is not touched. The
+    # ratio and the flow regime are still recomputed from those frames.
+    try:
+        from lib import eco_refresh
+        eco_refresh.clear_cache()
+    except Exception:
+        pass
+
 
 
 def expire_stale_auto_pipeline(

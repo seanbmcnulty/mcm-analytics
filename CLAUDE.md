@@ -334,6 +334,52 @@ units. BTC per share is iShares bitcoin quantity / shares outstanding
 is used for the bubble key, the large-ticket BTC columns, and the Deribit
 comparison — not the spot-price ratio.
 
+### 2026-11-15 — Ecoinometrics page can refresh its own external data
+
+The charts page had a cache-clear button and otherwise waited on whatever
+`st.cache_data` still held. Farside, FRED, and the Fed-tone CSV could not be
+rebuilt from the app. `lib/eco_refresh.py` is now the shared builder:
+`tools/build_fred_cache.py`, `tools/build_fed_tone.py`, and
+`tools/refresh_ecoinometrics_data.py` are thin CLIs over it, and the page
+calls the same functions.
+
+- **Click only.** Page load still uses the existing TTL fetches (live, then
+  CSV). PDF downloads, CSV rewrites, and the GitHub dispatch run inside
+  `_on_refresh`, which the buttons call. A process-wide lock ignores a second
+  refresh while one is running.
+- **In-session first.** A successful refresh is stored on `st.session_state`
+  (`eco_good`) and the charts redraw from it. The CSV write is best-effort.
+  Streamlit Cloud's disk is wiped on redeploy, and the app does not push to
+  git, so that file is not the durable copy.
+- **Optional durable path.** "Rebuild committed CSVs" POSTs `workflow_dispatch`
+  for `.github/workflows/update_ecoinometrics_data.yml` only when
+  `[github] dispatch_token` (or `GITHUB_DISPATCH_TOKEN`) is set. The token is a
+  fine-grained PAT for this repo with Actions: Read and write; Contents can
+  stay No access, because the workflow commits with its own `GITHUB_TOKEN`.
+  No token: the button explains that and does not call GitHub. The workflow
+  also runs Sunday 07:15 UTC. It has to be on `main` before dispatch works.
+- **Status line.** Each dataset shows live vs CSV fallback vs bundled, the
+  last-updated time in SGT (`fx_style.to_local_ts`), and the latest success or
+  failure. A failed refresh leaves the previous good frame on the charts.
+- `clear_all_caches()` drops the session frames. Fed tone merges into
+  `data/fed_tone.csv` (a date that was not rescored is kept; zero new
+  transcripts leave the file untouched). The bare CLI still defaults to 2022
+  and now merges rather than truncating.
+
+### 2026-11-15 — Exchange hacks: 2026 Bitget and Binance, coloured by year
+
+Added Bitget (2026-09-24, $387.5m; detection ~18:31 UTC) and Binance
+(2026-10-29, $6.34bn; ~20:05 UTC) to `data/exchange_hacks.csv`.
+`hack_event_returns` still anchors on the close of the daily bar stamped on
+the UTC event date. Deribit 1D bars open at 08:00 UTC, so a late-evening hack
+starts at the next morning's 08:00 print — the first settlement after the
+theft — not the previous close and not the next calendar date's bar. A
+horizon that runs past the last bar leaves `ret` as NaN (out of the average)
+and is drawn as an open circle at the return so far, with "(incomplete)" in
+the hover. Dots are coloured by year (`es.hack_scatter`); the zero line still
+shows the sign of the return.
+
+
 ### 2026-11-15 — Vol term structure lookbacks span every listed expiry
 
 `cmd_vol_term_structure` used the per-expiry snapshot for a whole lookback
@@ -353,6 +399,33 @@ comes from the same smoothed fixed-tenor grid the full "(est.)" line uses.
 Open markers plus the subtitle mark those points "(est.)". A lookback with
 no per-expiry history at all is unchanged ("1 Month Ago (est.)"). The
 command is shared by every asset. `tests/test_vol_term_structure.py`.
+
+
+### 2026-11-09 — Ecoinometrics: close/200DMA ratio and MCM ETF flow regime
+
+Two extra tabs on `pages/13_Ecoinometrics_Charts.py`, inspired by the 6 Nov 2026
+Ecoinometrics issue. Existing streak, price-vs-200DMA, hack, Fed, Nasdaq, and
+CPI/yields views are unchanged.
+
+- **BTC / 200DMA ratio.** `lib/ecoinometrics.py:price_sma_ratio` is the Deribit
+  BTC-PERPETUAL daily close divided by a 200-**calendar**-day mean. The series
+  is reindexed onto every UTC day; a gap stays blank (no fill, no Bitstamp
+  splice). A ratio exists only when all 200 days have a real close. This is
+  separate from `sma_gap`, which still averages the last 200 observations for
+  the older "BTC vs 200DMA" tab. The line is coloured by that day's close.
+- **ETF flow regime.** Farside US$ millions converted with the existing
+  `flows_to_btc` rule (× 1,000,000 / same-UTC-date Deribit perp close; sessions
+  without a positive close are dropped). `etf_flow_regime` labels each session
+  from the trailing 5-session sum versus the trailing 63-session median of
+  absolute flow: mild at 2×, strong at 5×. Warmup sessions are `unclassified`,
+  not neutral. Zero scale does not use "strong". This is MCM's rule, documented
+  in the tab, and was not fitted to the Ecoinometrics model (unpublished).
+- Charts go through `lib/eco_charts.py` → `fx_style.apply_theme(..., "light")`
+  and `finalize`, so axis text is dark on white. Display window uses
+  `fx_style.local_now()` (SGT). No new process cache; the page's existing
+  `st.cache_data` fetches are already cleared by `clear_all_caches`.
+- Compute on the full history, then `display_from`. Slicing first would treat
+  the left edge of the lookback as warmup.
 
 ### 2026-10-21 - IBIT page (Cboe delayed chain vs Deribit BTC)
 

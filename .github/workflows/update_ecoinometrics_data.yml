@@ -1,0 +1,83 @@
+name: Update Ecoinometrics data
+
+# Rebuild the CSVs pages/13 falls back to when Farside, FRED, or
+# federalreserve.gov is unreachable from Streamlit Community Cloud:
+#   data/etf_flows.csv
+#   data/fred_DFF.csv, data/fred_NASDAQCOM.csv, data/fred_CPIAUCSL.csv, data/fred_DGS10.csv
+#   data/fed_tone.csv
+#
+# The Ecoinometrics page can also rebuild these in the current session without
+# this workflow. That disk is wiped on the next deploy, and the app cannot
+# push to git. This workflow is the durable path. A push to main redeploys
+# the app, same as .github/workflows/update_macro_calendar.yml.
+#
+# The page queues a run with workflow_dispatch when Streamlit secrets contain
+# [github] dispatch_token (or env GITHUB_DISPATCH_TOKEN): a fine-grained PAT
+# for this repo with Actions: Read and write. That token is not stored in
+# GitHub Actions. The commit below uses the workflow's own GITHUB_TOKEN, so
+# the PAT does not need Contents permission.
+#
+# Weekly schedule is a backstop. GitHub's scheduler is best-effort; the button
+# on the page is the on-demand path. Sunday 07:15 UTC is after the US data
+# week and not the Saturday 06:00 slot used by the macro calendar.
+
+on:
+  schedule:
+    - cron: '15 7 * * 0'
+  workflow_dispatch:
+    inputs:
+      datasets:
+        description: Which datasets to rebuild
+        type: choice
+        options:
+          - all
+          - etf_flows
+          - fred
+          - fed_tone
+        default: all
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-ecoinometrics-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check requests pandas lxml pypdf
+
+      - name: Rebuild datasets
+        env:
+          DATASETS: ${{ github.event.inputs.datasets || 'all' }}
+        run: python tools/refresh_ecoinometrics_data.py --datasets "$DATASETS"
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "mcm-ecoinometrics-data-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -- data/fred_DFF.csv data/fred_NASDAQCOM.csv data/fred_CPIAUCSL.csv data/fred_DGS10.csv data/fed_tone.csv
+          if [ -f data/etf_flows.csv ]; then
+            git add -- data/etf_flows.csv
+          fi
+          if git diff --cached --quiet; then
+            echo "Ecoinometrics CSVs unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "ecoinometrics data: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git push origin HEAD:refs/heads/main
