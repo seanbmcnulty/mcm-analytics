@@ -9,9 +9,10 @@ Every page reads through some combination of:
     responses, already shared across every page and user, since Streamlit
     Community Cloud runs one process for the whole multi-page app),
   * ``lib.surface``'s computed-vol-surface cache, and
-  * ``lib.history``'s historical-IV reconstruction caches.
+  * ``lib.history``'s historical-IV reconstruction caches, and
+  * ``lib.ibit``'s remote daily-chain cache (IBIT open-interest history).
 
-``clear_all_caches()`` is the one place that knows about all four, so
+``clear_all_caches()`` is the one place that knows about every layer, so
 "refresh" means the same thing wherever a page offers it. Before this,
 ``pages/01_MCM_Bot.py`` hand-rolled the full clear (correctly), while
 ``pages/06_Time_Based_Realized_Vol.py`` only cleared ``st.cache_data`` plus
@@ -31,7 +32,7 @@ from datetime import datetime, timezone
 
 import streamlit as st
 
-from lib import deribit, history, surface
+from lib import deribit, history, ibit, surface
 
 # Whole Home→MCM Bot→Block Trades→TBRV Telegram pipeline should finish well
 # under this; if a step dies mid-switch_page the flag would otherwise stick
@@ -49,6 +50,7 @@ def clear_all_caches() -> None:
     deribit.clear_cache()
     surface.clear_cache()
     history.clear_cache()
+    ibit.clear_cache()
     # Ecoinometrics keeps refreshed frames in st.session_state (eco_good /
     # eco_attempt / eco_shown) plus the page's st.cache_data loaders, which
     # the clear above already drops. The session keys have to go too, or the
@@ -60,6 +62,7 @@ def clear_all_caches() -> None:
         eco_refresh.clear_cache()
     except Exception:
         pass
+
 
 
 def expire_stale_auto_pipeline(

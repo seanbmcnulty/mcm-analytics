@@ -6,7 +6,12 @@ Chain analytics from Cboe's free ~15-min-delayed option-chain snapshot
 The headline view is a like-for-like Deribit-vs-IBIT comparison of the vol
 surface, skew, term structure, open interest and market-implied distribution;
 the remaining tabs go deep on IBIT alone (surface, positioning, gamma, max
-pain, activity) and expose the raw data.
+pain, activity, large tickets) and expose the raw data.
+
+The large-tickets view is still not a trade tape.  Cboe does not publish
+prints.  Open-interest change uses only daily closes this app has recorded;
+unusual volume, last-print side and the Deribit comparison are estimates
+built from the snapshot.
 
 IBIT only trades in US hours, so outside them the snapshot is the last close
 while Deribit is live -- the banner at the top says how old the data is.
@@ -29,7 +34,7 @@ import html
 from lib import cache as cache_lib
 from lib import fx_style
 from lib import ibit as L
-from lib.constants import TTL_LONG, TTL_SLOW
+from lib.constants import TTL_DAILY_EXTERNAL, TTL_LONG, TTL_MEDIUM, TTL_SLOW
 
 st.set_page_config(page_title="IBIT", page_icon="🪙", layout="wide",
                    initial_sidebar_state="expanded")
@@ -122,12 +127,45 @@ def usd(x):
     return f"${x:,.0f}"
 
 
+def susd(x):
+    """``usd`` with the sign in front of the dollar (``-$23.61M``)."""
+    if x is None or not np.isfinite(x):
+        return "–"
+    return ("-" if x < 0 else "") + usd(abs(float(x)))
+
+
 def show(fig, key):
     th = _chart_theme()
     fx_style.apply_chart_theme(fig, th)
     fx_style.add_watermark(fig)
     st.plotly_chart(fig, theme=fx_style.streamlit_chart_theme(th), width="stretch", key=key,
                     config={"displaylogo": False})
+
+
+def _share_phrase(info: dict) -> str:
+    """One line naming where the BTC-per-share ratio came from."""
+    if info.get("fallback"):
+        return (f"iShares holdings fallback as of {info['asof']} "
+                "(live file unavailable)")
+    return f"iShares holdings as of {info['asof']}"
+
+
+def _ticket_name(row) -> str:
+    exp = pd.to_datetime(row["expiry"], utc=True, errors="coerce")
+    when = exp.strftime("%d %b %y") if pd.notna(exp) else "?"
+    strike = row["strike"]
+    k = f"{float(strike):g}" if pd.notna(strike) and np.isfinite(strike) else "?"
+    return f"{when} {k}{row['type']}"
+
+
+def _oi_bars(frame, title, color):
+    if frame is None or len(frame) == 0:
+        return sty(go.Figure(), 380, title)
+    names = frame.apply(_ticket_name, axis=1)
+    f = go.Figure(go.Bar(
+        y=names[::-1], x=frame["oi_change"][::-1], orientation="h", marker_color=color,
+        hovertemplate="%{y}<br>%{x:+,.0f}<extra></extra>"))
+    return sty(f, 420, title).update_layout(hovermode="closest")
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +180,51 @@ def load_ibit():
 @st.cache_data(ttl=TTL_LONG, show_spinner=False)
 def load_deribit():
     return L.deribit_chain(datetime.now(timezone.utc))
+
+
+@st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner=False)
+def load_share_ratio():
+    # iShares publishes the holdings file once a day.  The fallback inside
+    # lib.ibit is used when that fetch fails, and is labelled with its date.
+    return L.btc_per_share_ratio()
+
+
+@st.cache_data(ttl=TTL_SLOW, show_spinner=False)
+def load_ibit_history():
+    # Daily closes.  Same 5-minute remote TTL as the vol snapshots so a close
+    # recorded this evening shows up without waiting out an hour-long cache.
+    return L.load_chain_history()
+
+
+@st.cache_data(ttl=TTL_MEDIUM, show_spinner=False)
+def load_btc_blocks(start_ms: int, end_ms: int):
+    from lib.flow_summary import DERIBIT_MIN_SIZES, deribit_blocks
+    return deribit_blocks(int(start_ms), int(end_ms),
+                          min_sizes={"BTC": DERIBIT_MIN_SIZES["BTC"]})
+
+
+@st.cache_data(ttl=TTL_MEDIUM, show_spinner=False)
+def load_btc_comparison(session_start_ms: int, session_end_ms: int, now_ms: int):
+    """Session blocks when the public tape still has them, else the last 24h.
+
+    Returns ``(payload, used_fallback)``.  A session with trades but no
+    size-threshold blocks is not a fallback — the tape covered the window.
+    """
+    from lib import deribit
+    from lib.flow_summary import DERIBIT_MIN_SIZES, deribit_blocks
+    mins = {"BTC": DERIBIT_MIN_SIZES["BTC"]}
+    primary = deribit_blocks(int(session_start_ms), int(session_end_ms), min_sizes=mins)
+    frame = (primary.get("frames") or {}).get("BTC")
+    covered = frame is not None and len(frame) > 0
+    if not covered:
+        probe = deribit.get_last_trades_by_currency_and_time(
+            "BTC", kind="option", start_ms=int(session_start_ms), end_ms=int(session_end_ms),
+            count=1, sorting="desc", ttl=TTL_MEDIUM)
+        covered = bool(probe and probe.get("trades"))
+    if covered:
+        return primary, False
+    fallback = deribit_blocks(int(now_ms) - 24 * 3600 * 1000, int(now_ms), min_sizes=mins)
+    return fallback, True
 
 
 with st.sidebar:
@@ -165,6 +248,7 @@ with st.expander("What each view shows"):
 | **IBIT positioning** | OI by strike / expiry, volume by expiry, put/call by expiry, strike × expiry OI heatmap, cumulative OI. |
 | **Gamma & max pain** | Dealer-gamma proxy by strike and expiry, gamma flip, vega by expiry, max pain per expiry. |
 | **Activity** | Most active contracts, vol/OI turnover, volume bubbles and volume by strike. |
+| **Large tickets** | Recorded day-over-day OI change, unusual volume, last-print buyer/seller lean, and a snapshot flow summary next to Deribit BTC blocks. Not a trade tape. |
 | **Data & notes** | Normalised chains (CSV download) and methodology. |
 
 IBIT trades only in US hours, so outside them the snapshot is the last close while Deribit is live — the age pill shows how stale it is.
@@ -185,6 +269,10 @@ with _tb3:
                  help="Re-fetch Cboe and Deribit option chains (clears cached data)."):
         load_ibit.clear()
         load_deribit.clear()
+        load_ibit_history.clear()
+        load_share_ratio.clear()
+        load_btc_blocks.clear()
+        load_btc_comparison.clear()
         st.rerun()
 
 try:
@@ -231,7 +319,8 @@ zI = L.surface_grid(ib, KG)
 if HAS_D:
     mD = L.expiry_metrics(der)
     zD = L.surface_grid(der, KG)
-btc_per_share = ibm["spot"] / derm["spot"] if HAS_D else np.nan
+share_ratio = load_share_ratio()
+btc_per_share = float(share_ratio["btc_per_share"])
 
 # ---------------------------------------------------------------------------
 # KPI strip
@@ -260,8 +349,8 @@ if HAS_D:
 kpis(k)
 
 _VIEWS = ["⚔️ Deribit vs IBIT", "🌋 IBIT surface", "📊 IBIT positioning",
-          "🧲 Gamma & max pain", "🔥 Activity", "🗂 Data & notes"]
-# Only the selected view renders (like MCM Bot): ~30 charts across six views.
+          "🧲 Gamma & max pain", "🔥 Activity", "🧱 Large tickets", "🗂 Data & notes"]
+# Only the selected view renders (like MCM Bot).
 _view = st.radio("View", _VIEWS, key="ibit_view", horizontal=True, label_visibility="collapsed")
 _cur_badge = "IBIT×BTC" if _view == _VIEWS[0] else "IBIT"
 
@@ -507,8 +596,9 @@ if _view == _VIEWS[0]:
             f.add_bar(x=[nm], y=[df_.oi_usd.sum()], marker_color=cc, showlegend=False, row=1, col=1)
             f.add_bar(x=[nm], y=[df_.vol_usd.sum()], marker_color=cc, showlegend=False, row=1, col=2)
         show(sty(f, 320).update_layout(hovermode="closest"), "size")
-        st.caption(f"1 IBIT share ≈ {btc_per_share:.6f} BTC (ratio of spot prices). Deribit volume is rolling 24h; "
-                   "IBIT volume is the latest US session.")
+        st.caption(f"1 IBIT share = {btc_per_share:.6f} BTC ({_share_phrase(share_ratio)}). "
+                   "1 IBIT option = 100 shares, so that many BTC is one Deribit contract. "
+                   "Deribit volume is rolling 24h; IBIT volume is the latest US session.")
 
 # ===========================================================================
 # TAB 2 — IBIT surface
@@ -718,15 +808,84 @@ if _view == _VIEWS[4]:
         with c1:
             show(sty(f, 440, "Top 15 by notional volume (USD)").update_layout(hovermode="closest"), "act_bar")
         with c2:
-            b = act[act.dte <= 200]
-            f = go.Figure(go.Scattergl(
-                x=b.strike, y=b.dte, mode="markers", text=b.volume,
-                marker=dict(size=np.clip(np.sqrt(b.volume) / 4, 5, 40), color=np.where(b.type == "C", CALL, PUT),
-                            opacity=.65, line=dict(width=0)),
-                hovertemplate="K %{x} · %{y:.0f}d<br>%{text:,.0f} contracts<extra></extra>"))
-            f.add_vline(x=ibm["spot"], line=dict(color=MUTED, dash="dash"))
-            show(sty(f, 440, "Volume bubbles: strike × DTE", "Strike", "Days to expiry")
-                 .update_layout(hovermode="closest"), "act_bub")
+            size_by = st.radio(
+                "Bubble size", ["IBIT contracts", "BTC equivalent"], horizontal=True,
+                key="ibit_bub_size",
+                help="BTC equivalent = contracts × 100 × iShares BTC per share. "
+                     "That is the Deribit size (1 Deribit BTC option = 1 BTC). "
+                     "The two choices draw the same marks; the key changes units.")
+            b = act[act.dte <= 200].copy()
+            if b.empty:
+                st.info("No contracts inside 200 days at this volume floor.")
+                b = None
+            if b is not None:
+                unit = "btc" if size_by.startswith("BTC") else "contracts"
+                b["btc_eq"] = L.contracts_to_btc(b["volume"], btc_per_share)
+                b["k_btc"] = L.strike_btc_equivalent(b["strike"], btc_per_share)
+                divisor = L.bubble_size_divisor(unit, btc_per_share)
+                qty = b["btc_eq"] if unit == "btc" else b["volume"]
+                b["mark"] = L.bubble_marker_size(qty, divisor)
+                # Bottom row is the size key. Plotly draws every legend marker at one
+                # size, so the key has to be real marks. xaxis2 belongs to that row;
+                # the BTC-equivalent strike scale is xaxis3 over the bubbles.
+                f = make_subplots(rows=2, cols=1, row_heights=[0.70, 0.30], vertical_spacing=0.12)
+                for typ, name, color in (("C", "Calls", CALL), ("P", "Puts", PUT)):
+                    s = b[b["type"] == typ]
+                    if s.empty:
+                        continue
+                    custom = np.column_stack([s["k_btc"], s["volume"], s["btc_eq"], s["vol_usd"]])
+                    f.add_scatter(
+                        x=s["strike"], y=s["dte"], mode="markers", name=name, row=1, col=1,
+                        marker=dict(size=s["mark"], color=color, opacity=0.65, line=dict(width=0)),
+                        customdata=custom,
+                        hovertemplate=("IBIT strike %{x:.2f} · BTC-eq strike %{customdata[0]:,.0f}<br>"
+                                       "%{y:.0f} days<br>"
+                                       "%{customdata[1]:,.0f} IBIT contracts<br>"
+                                       "%{customdata[2]:.2f} BTC equiv (Deribit contracts)<br>"
+                                       "USD notional %{customdata[3]:,.0f}<extra>" + name + "</extra>"))
+                f.add_scatter(x=[None, None], y=[None, None], mode="lines", name="IBIT spot",
+                              line=dict(color=MUTED, dash="dash", width=2), hoverinfo="skip",
+                              row=1, col=1)
+                keys = L.bubble_size_key(btc_per_share, unit)
+                f.add_scatter(
+                    x=list(range(1, len(keys) + 1)), y=[0] * len(keys),
+                    mode="markers+text", showlegend=False, hoverinfo="skip", row=2, col=1,
+                    text=[f"{k['contracts']:,.0f} contracts<br>{k['btc']:.0f} BTC" for k in keys],
+                    textposition="top center",
+                    marker=dict(size=[k["size"] for k in keys], color=MUTED, opacity=0.8,
+                                line=dict(width=0)))
+                f.add_vline(x=float(ibm["spot"]), line=dict(color=MUTED, dash="dash"),
+                            annotation_text="spot", annotation_position="top", row=1, col=1)
+                xmin, xmax = float(b["strike"].min()), float(b["strike"].max())
+                pad = max((xmax - xmin) * 0.04, 0.5)
+                x0, x1 = xmin - pad, xmax + pad
+                f.add_scatter(x=[x0 / btc_per_share, x1 / btc_per_share],
+                              y=[float(b["dte"].min())] * 2,
+                              xaxis="x3", yaxis="y", mode="lines", line=dict(width=0),
+                              opacity=0, showlegend=False, hoverinfo="skip")
+                fig = sty(f, 640, None, "IBIT strike (USD)", "Days to expiry")
+                fig.update_xaxes(range=[x0, x1], row=1, col=1)
+                fig.update_xaxes(visible=False, range=[0.35, len(keys) + 0.65], row=2, col=1)
+                fig.update_yaxes(visible=False, range=[-0.6, 2.2], row=2, col=1)
+                fig.update_layout(
+                    hovermode="closest",
+                    xaxis3=dict(overlaying="x", side="top", anchor="y", showgrid=False,
+                                tickformat=",.0f", range=[x0 / btc_per_share, x1 / btc_per_share],
+                                title="BTC-equivalent strike (USD per BTC)"),
+                    legend=dict(orientation="h", y=1.08, x=0, xanchor="left"),
+                    margin=dict(l=50, r=20, t=56, b=24))
+                show(fig, "act_bub")
+                bits = L.bubble_size_key(btc_per_share, "contracts")
+                key_txt = " · ".join(
+                    f"{k['contracts']:,.0f} contracts = {k['btc']:.1f} BTC" for k in bits)
+                st.caption(
+                    "Green = calls, red = puts. The dashed line is IBIT spot. "
+                    "Bubble area follows the square root of size and is capped, so a large print is not "
+                    f"to scale with a small one. Size key: {key_txt}. "
+                    f"1 contract = 100 shares × {btc_per_share:.6f} BTC ({_share_phrase(share_ratio)}), "
+                    "which is the Deribit-contract equivalent. "
+                    "The top axis is the IBIT strike divided by that BTC-per-share. "
+                    "USD notional is contracts × 100 × the IBIT share price.")
         tbl = top.assign(IV=top.iv * 100)[["Contract", "dte", "volume", "oi", "vol_oi", "IV", "vol_usd",
                                            "spread_pct"]].rename(columns={
             "dte": "DTE", "volume": "Volume", "oi": "OI", "vol_oi": "Vol/OI",
@@ -754,9 +913,348 @@ if _view == _VIEWS[4]:
     show(sty(f, 380, xt="Strike", yt="Volume (contracts)"), "vol_k")
 
 # ===========================================================================
-# TAB 6 — Data & notes
+# TAB 6 — Large tickets (snapshot, not a tape)
 # ===========================================================================
 if _view == _VIEWS[5]:
+    sec("Large tickets and estimated flow",
+        "Cboe's free feed is one delayed chain snapshot per contract: bid, ask, last, "
+        "volume and open interest. It is not a trade tape, so these are not exchange "
+        "block prints (that tape is OPRA, which is paid). Open-interest changes use "
+        "only closes this app has recorded — nothing is backfilled.",
+        "#FF8A5C")
+
+    snap_ts = ibm.get("snapshot_ny") or now
+    session = L.session_date_of(snap_ts)
+    session_s = session.isoformat()
+    try:
+        store = load_ibit_history()
+    except Exception as e:  # noqa: BLE001
+        store = None
+        st.caption(f"Recorded OI history could not be read ({e}). Volume screens still run.")
+    notice = L.history_notice(store, session_s)
+    if notice["ready"]:
+        st.caption(notice["text"])
+    else:
+        st.info(notice["text"])
+
+    _fc1, _fc2, _fc3 = st.columns(3)
+    with _fc1:
+        min_premium = st.selectbox(
+            "Min premium", [10_000, 25_000, 50_000, 100_000, 250_000], index=1,
+            format_func=lambda v: usd(v), key="ibit_flow_premium",
+            help="Premium = contracts × price × 100. Price is the last print, or the mid when there is no last.")
+    with _fc2:
+        min_contracts = st.selectbox(
+            "Min contracts", [10, 25, 50, 100, 250, 500], index=2, key="ibit_flow_contracts",
+            help="Day volume on the contract. The flow summary below still uses the whole chain.")
+    with _fc3:
+        rank_by = st.selectbox("Rank unusual by", ["Premium", "|Delta notional|"], index=0,
+                               key="ibit_flow_rank")
+    opening_only = st.checkbox("Only likely-opening contracts", value=False, key="ibit_flow_opening")
+
+    prior_day, prior_rows = L.prior_chain(store, session_s)
+    screen = L.unusual_activity(ib, prior_rows, min_premium=min_premium, min_contracts=min_contracts)
+    if opening_only and len(screen):
+        screen = screen[screen["likely_opening"]].reset_index(drop=True)
+    if len(screen) and rank_by.startswith("|"):
+        screen = screen.reindex(screen["delta_usd"].abs().sort_values(ascending=False).index).reset_index(drop=True)
+    split = L.premium_split(ib)
+    lean = L.lean_table(ib).set_index("side")
+    n_open = int(screen["likely_opening"].sum()) if len(screen) else 0
+    call_share = split["call_premium"] / split["premium"] if split["premium"] else np.nan
+
+    kpis([
+        ("Session premium", usd(split["premium"]), "volume × price × 100, whole chain", IB),
+        ("Call share", pct(call_share) if np.isfinite(call_share) else "–", "of session premium", CALL,
+         "up" if np.isfinite(call_share) and call_share >= 0.5 else "dn"),
+        ("Est. net premium", susd(lean.loc["Total", "net_premium"]),
+         "last print's side × the whole session's volume", VIO,
+         "up" if lean.loc["Total", "net_premium"] >= 0 else "dn"),
+        ("Est. net delta", susd(lean.loc["Total", "net_delta_usd"]),
+         "same last-print estimate, share delta × spot", DER,
+         "up" if lean.loc["Total", "net_delta_usd"] >= 0 else "dn"),
+        ("Unusual", f"{len(screen):,}  ·  {n_open:,} opening",
+         f"≥ {usd(min_premium)} and ≥ {min_contracts:g} contracts", "#FF8A5C"),
+        ("OI history", f"{notice['n_sessions']} close{'s' if notice['n_sessions'] != 1 else ''}",
+         f"since {notice['since']}" if notice["since"] else "none stored yet", MUTED),
+    ])
+
+    # -- open-interest change ------------------------------------------------
+    sec("Open-interest change",
+        "Where published open interest increased or decreased versus the previous recorded close. "
+        "Cboe updates OI overnight, so a change is the prior session's net opening and closing, "
+        "not today's prints. Contracts that expired and left the chain are excluded.",
+        CALL)
+    if not notice["ready"]:
+        st.caption("No prior close to diff against yet — this block fills in once the next session is stored.")
+    else:
+        changes = L.oi_change(ib, prior_rows, asof=snap_ts if ibm.get("snapshot_ny") is not None else now)
+        up, down = L.largest_oi_moves(changes, n=12)
+        n_expired = int((changes["status"] == "expired").sum())
+        net_oi = float(changes.loc[changes["status"] != "expired", "oi_change"].sum())
+        kpis([
+            ("Versus", prior_day, f"history since {notice['since']}", IB),
+            ("Net OI change", f"{net_oi:+,.0f} contracts", "excludes expirations", VIO,
+             "up" if net_oi >= 0 else "dn"),
+            ("Largest increase", f"{up['oi_change'].iloc[0]:+,.0f}" if len(up) else "–",
+             _ticket_name(up.iloc[0]) if len(up) else "", CALL),
+            ("Largest decrease", f"{down['oi_change'].iloc[0]:+,.0f}" if len(down) else "–",
+             _ticket_name(down.iloc[0]) if len(down) else "", PUT),
+        ])
+        c1, c2 = st.columns(2)
+        with c1:
+            show(_oi_bars(up, "Biggest OI increases (contracts)", CALL), "oi_up")
+        with c2:
+            show(_oi_bars(down, "Biggest OI decreases (contracts)", PUT), "oi_dn")
+        movers = pd.concat([up, down], ignore_index=True)
+        if len(movers):
+            show_m = pd.DataFrame({
+                "Contract": movers.apply(_ticket_name, axis=1),
+                "Status": movers["status"],
+                "OI": movers["oi"],
+                "Prior OI": movers["oi_prev"],
+                "Change": movers["oi_change"],
+                "Change BTC": movers["oi_change"] * L.IBIT_MULT * btc_per_share,
+                "Change USD": movers["oi_change_usd"],
+                "Volume": movers["volume"],
+            })
+            st.dataframe(show_m, hide_index=True, width="stretch",
+                         column_config={
+                             "OI": st.column_config.NumberColumn(format="%.0f"),
+                             "Prior OI": st.column_config.NumberColumn(format="%.0f"),
+                             "Change": st.column_config.NumberColumn(format="%+d"),
+                             "Change BTC": st.column_config.NumberColumn(format="%+.2f"),
+                             "Change USD": st.column_config.NumberColumn(format="$%d"),
+                             "Volume": st.column_config.NumberColumn(format="%.0f"),
+                         })
+        if n_expired:
+            st.caption(f"{n_expired:,} contract{'s' if n_expired != 1 else ''} expired and left the chain. "
+                       "Those drops are not counted as closing trades.")
+
+    # -- unusual activity ----------------------------------------------------
+    sec("Unusual activity",
+        "High volume relative to open interest, among contracts above the premium and size floors. "
+        "Likely opening: today's volume exceeds prior OI (a new listing counts as zero) and/or "
+        "published OI rose. With no prior close, the flag is volume greater than the OI on the chain. "
+        "Delta notional = volume × delta × 100 shares × IBIT spot.",
+        "#FF8A5C")
+    if screen.empty:
+        st.info("No contracts above those floors.")
+    else:
+        screen = screen.copy()
+        screen["Contract"] = screen.apply(_ticket_name, axis=1)
+        top = screen.head(15)
+        f = go.Figure(go.Bar(
+            y=top["Contract"][::-1],
+            x=(top["delta_usd"].abs() if rank_by.startswith("|") else top["premium"])[::-1],
+            orientation="h",
+            marker_color=np.where(top["type"][::-1] == "C", CALL, PUT),
+            hovertemplate="%{y}<br>%{x:,.0f}<extra></extra>"))
+        show(sty(f, 440, f"Top 15 by {'|delta notional|' if rank_by.startswith('|') else 'premium'} (USD)")
+             .update_layout(hovermode="closest"), "unusual_bar")
+        tbl = pd.DataFrame({
+            "Contract": screen["Contract"],
+            "DTE": screen["dte"],
+            "Volume": screen["volume"],
+            "OI": screen["oi"],
+            "Prior OI": screen["oi_prev"],
+            "OI change": screen["oi_change"],
+            "Vol/OI": screen["vol_oi"],
+            "Premium": screen["premium"],
+            "BTC equiv": L.contracts_to_btc(screen["volume"], btc_per_share),
+            "Delta shares": screen["delta_shares"],
+            "Delta BTC": L.ibit_btc_equivalent(screen["delta_shares"], btc_per_share),
+            "Delta USD": screen["delta_usd"],
+            "Last": screen["last"] if "last" in screen.columns else np.nan,
+            "Bid": screen["bid"],
+            "Ask": screen["ask"],
+            "Side": screen["side"],
+            "Flag": np.where(screen["likely_opening"], "likely opening", ""),
+        })
+        st.dataframe(
+            tbl, hide_index=True, width="stretch",
+            column_config={
+                "DTE": st.column_config.NumberColumn(format="%.0f"),
+                "Volume": st.column_config.NumberColumn(format="%.0f"),
+                "OI": st.column_config.NumberColumn(format="%.0f"),
+                "Prior OI": st.column_config.NumberColumn(format="%.0f"),
+                "OI change": st.column_config.NumberColumn(format="%+.0f"),
+                "Vol/OI": st.column_config.NumberColumn(format="%.2f"),
+                "Premium": st.column_config.NumberColumn(format="$%.0f"),
+                "BTC equiv": st.column_config.NumberColumn(format="%.2f"),
+                "Delta shares": st.column_config.NumberColumn(format="%+.0f"),
+                "Delta BTC": st.column_config.NumberColumn(format="%+.2f"),
+                "Delta USD": st.column_config.NumberColumn(format="$%+.0f"),
+                "Last": st.column_config.NumberColumn(format="%.2f"),
+                "Bid": st.column_config.NumberColumn(format="%.2f"),
+                "Ask": st.column_config.NumberColumn(format="%.2f"),
+            })
+        st.caption("Side is where the last print sat versus the current bid/ask "
+                   "(at/above ask = bought, at/below bid = sold, inside = ambiguous). "
+                   "It is the last print only — the premium column is the whole session's volume.")
+
+    # -- buyer / seller lean -------------------------------------------------
+    sec("Buyer / seller lean (last print)",
+        "Estimate only. Each contract's entire session volume is signed by where its last "
+        "trade printed versus the current bid and ask: at or above the ask counts as bought, "
+        "at or below the bid as sold, inside the spread or a locked market as ambiguous and "
+        "left out of the nets. This is not the aggressor on each fill.",
+        VIO)
+    total_vol = float(lean.loc["Total", "volume"])
+    mix = []
+    for lab, col in (("bought", "volume_bought"), ("sold", "volume_sold"),
+                     ("ambiguous", "volume_ambiguous"), ("unknown", "volume_unknown")):
+        v = float(lean.loc["Total", col])
+        mix.append(f"{lab} {v / total_vol * 100:.0f}%" if total_vol > 0 else lab)
+    st.caption("Session volume by last-print bucket: " + " · ".join(mix) + ".")
+    c1, c2 = st.columns(2)
+    with c1:
+        f = go.Figure()
+        f.add_bar(x=["Calls", "Puts"], y=[lean.loc["Calls", "bought_premium"], lean.loc["Puts", "bought_premium"]],
+                  name="Bought (paid)", marker_color=CALL)
+        f.add_bar(x=["Calls", "Puts"], y=[-lean.loc["Calls", "sold_premium"], -lean.loc["Puts", "sold_premium"]],
+                  name="Sold (received)", marker_color=PUT)
+        f.add_hline(y=0, line=dict(color=MUTED, dash="dot"))
+        show(sty(f, 380, "Premium by last-print side", None, "USD"), "lean_prem")
+    with c2:
+        f = go.Figure(go.Bar(
+            x=["Calls", "Puts", "Total"],
+            y=[lean.loc[s, "net_delta_usd"] for s in ("Calls", "Puts", "Total")],
+            marker_color=[CALL, PUT, VIO],
+            hovertemplate="%{x}<br>%{y:,.0f}<extra></extra>"))
+        f.add_hline(y=0, line=dict(color=MUTED, dash="dot"))
+        show(sty(f, 380, "Estimated net delta (USD)", None, "USD")
+             .update_layout(hovermode="closest"), "lean_delta")
+    st.caption("Bought premium is what the last-print rule calls customer buying; sold premium is "
+               "shown negative. Net delta uses the same sign × Black-Scholes delta × 100 × spot. "
+               "Ambiguous and unknown prints are omitted from both charts.")
+
+    # -- flow summary + Deribit blocks --------------------------------------
+    sec("Flow summary",
+        "Put/call split of the session snapshot, a strike × expiry cluster of that premium, "
+        "and the same clock window on Deribit BTC blocks (a block is a trade at or above "
+        "the Deribit minimum, 12.5 BTC). "
+        f"IBIT sizes use {btc_per_share:.6f} BTC per share ({_share_phrase(share_ratio)}): "
+        "1 contract = 100 × that ratio, in Deribit BTC.",
+        DER)
+    c1, c2 = st.columns(2)
+    with c1:
+        f = go.Figure()
+        f.add_bar(x=["Calls", "Puts"], y=[split["call_premium"], split["put_premium"]],
+                  name="Premium", marker_color=[CALL, PUT])
+        show(sty(f, 360, "Premium by put/call", None, "USD"), "flow_prem")
+    with c2:
+        f = go.Figure()
+        f.add_bar(x=["Calls", "Puts"],
+                  y=[split["call_abs_delta_usd"], split["put_abs_delta_usd"]],
+                  name="|Delta| notional", marker_color=[CALL, PUT])
+        show(sty(f, 360, "Absolute delta notional by put/call", None, "USD"), "flow_dd")
+    st.caption(f"Signed delta notional (puts carry negative delta): calls {susd(split['call_delta_usd'])}, "
+               f"puts {susd(split['put_delta_usd'])}, net {susd(split['delta_usd'])}. "
+               f"Share delta {split['delta_shares']:+,.0f}.")
+
+    heat = L.flow_heatmap_frame(ib)
+    if heat.empty:
+        st.info("No session volume inside 120 days and ±30% of spot to cluster.")
+    else:
+        exp_order = sorted(heat["expiry"].unique())
+        strikes = sorted(heat["strike"].unique())
+        pivot = heat.pivot(index="strike", columns="expiry", values="net_premium").reindex(
+            index=strikes, columns=exp_order)
+        call_p = heat.pivot(index="strike", columns="expiry", values="call_premium").reindex(
+            index=strikes, columns=exp_order)
+        put_p = heat.pivot(index="strike", columns="expiry", values="put_premium").reindex(
+            index=strikes, columns=exp_order)
+        labels = [f"{pd.Timestamp(e):%d %b}" for e in exp_order]
+        finite = np.abs(pivot.to_numpy())
+        finite = finite[np.isfinite(finite)]
+        lim = float(np.percentile(finite, 95)) if len(finite) else 1.0
+        if not np.isfinite(lim) or lim <= 0:
+            lim = 1.0
+        f = go.Figure(go.Heatmap(
+            z=pivot.to_numpy(), x=labels, y=strikes, colorscale="RdBu", zmid=0,
+            zmin=-lim, zmax=lim, colorbar=dict(title="USD"),
+            customdata=np.dstack([call_p.to_numpy(), put_p.to_numpy()]),
+            hovertemplate="%{x} · K=%{y}<br>call premium %{customdata[0]:,.0f}"
+                          "<br>put premium %{customdata[1]:,.0f}<br>net %{z:,.0f}<extra></extra>"))
+        f.add_hline(y=ibm["spot"], line=dict(color="white", dash="dash"))
+        show(sty(f, 460, "Session premium by strike × expiry (≤120d, ±30% of spot) — blue calls, red puts",
+                 None, "Strike").update_layout(hovermode="closest"), "flow_heat")
+
+    start, end = L.cash_session_bounds(session, now)
+    now_ms = int(pd.Timestamp(now).timestamp() * 1000)
+    now_ms -= now_ms % 60_000
+    der_blocks = None
+    blocks_err = None
+    used_fallback = False
+    try:
+        with st.spinner("Loading Deribit BTC blocks…"):
+            der_blocks, used_fallback = load_btc_comparison(
+                int(start.timestamp() * 1000), int(end.timestamp() * 1000), now_ms)
+    except Exception as e:  # noqa: BLE001
+        blocks_err = str(e)
+    asof = datetime.fromtimestamp(now_ms / 1000, timezone.utc)
+    cmp_start, cmp_end, fallback_note = L.deribit_compare_window(
+        start, end, asof, session_has_trades=not used_fallback)
+    cst, cen = cmp_start.astimezone(L.NY), cmp_end.astimezone(L.NY)
+    sst, sen = fx_style.to_local_ts(cmp_start), fx_style.to_local_ts(cmp_end)
+    if fallback_note:
+        st.caption(fallback_note + f" Window: {cst:%d %b %H:%M}–{cen:%d %b %H:%M} ET "
+                   f"({sst:%d %b %H:%M}–{sen:%d %b %H:%M} SGT).")
+    else:
+        st.caption(f"Deribit window matches the IBIT session the chain describes: "
+                   f"{cst:%d %b %H:%M}–{cen:%d %b %H:%M} ET "
+                   f"({sst:%d %b %H:%M}–{sen:%d %b %H:%M} SGT).")
+    if blocks_err:
+        st.warning(f"Deribit block tape unavailable ({blocks_err}). IBIT figures above still stand.")
+    else:
+        frame = (der_blocks or {}).get("frames", {}).get("BTC")
+        der_label = "Deribit BTC blocks (last 24h)" if used_fallback else "Deribit BTC blocks"
+        der_sum = L.summarize_deribit_blocks(frame)
+        ibit_btc = L.ibit_btc_equivalent(float(lean.loc["Total", "net_delta_shares"]), btc_per_share)
+        ibit_col, der_col = "IBIT session (snapshot)", der_label
+        cmp = pd.DataFrame([
+            {"Metric": "Gross premium", ibit_col: usd(split["premium"]), der_col: usd(der_sum["premium"])},
+            {"Metric": "Call premium", ibit_col: usd(split["call_premium"]), der_col: usd(der_sum["call_premium"])},
+            {"Metric": "Put premium", ibit_col: usd(split["put_premium"]), der_col: usd(der_sum["put_premium"])},
+            {"Metric": "Net premium", ibit_col: susd(lean.loc["Total", "net_premium"]),
+             der_col: susd(der_sum["net_premium"])},
+            {"Metric": "Net delta USD", ibit_col: susd(lean.loc["Total", "net_delta_usd"]),
+             der_col: susd(der_sum["net_delta_usd"])},
+            {"Metric": "Net delta BTC",
+             ibit_col: f"{ibit_btc:+,.1f} BTC" if np.isfinite(ibit_btc) else "–",
+             der_col: (f"{der_sum['net_delta_btc']:+,.1f} BTC"
+                       if np.isfinite(der_sum["net_delta_btc"]) else "–")},
+            {"Metric": "Prints", ibit_col: "not on the free feed",
+             der_col: f"{der_sum['blocks']:,} blocks"},
+        ])
+        st.dataframe(cmp, hide_index=True, width="stretch")
+        f = go.Figure()
+        f.add_bar(name="IBIT session", x=["Call premium", "Put premium"],
+                  y=[split["call_premium"], split["put_premium"]], marker_color=IB)
+        f.add_bar(name="Deribit blocks", x=["Call premium", "Put premium"],
+                  y=[der_sum["call_premium"], der_sum["put_premium"]], marker_color=DER)
+        f.update_layout(barmode="group")
+        cmp_title = ("Call vs put premium — IBIT session and Deribit last 24h"
+                     if used_fallback else
+                     "Call vs put premium — IBIT session and Deribit blocks")
+        show(sty(f, 360, cmp_title, None, "USD"), "flow_cmp")
+        der_when = "over the last 24 hours" if used_fallback else "in that US session"
+        st.caption(
+            "IBIT net premium and net delta attribute every contract's session volume to the side of its "
+            "last print. Deribit nets are the actual taker side on trades at or above the block minimum, "
+            f"{der_when}. The BTC-equivalent column is share delta × {btc_per_share:.6f} "
+            f"({_share_phrase(share_ratio)}); 1 IBIT contract = 100 shares = "
+            f"{100 * btc_per_share:.4f} BTC, and 1 Deribit BTC option = 1 BTC. "
+            "The two venues settle differently (IBIT American, share-delivered, 16:00 ET; Deribit European, "
+            "cash-settled, 08:00 UTC), so the comparison is positioning context, not a matched tape.")
+        if (der_blocks or {}).get("meta", {}).get("truncated"):
+            st.caption("Deribit hit the page-fetch cap for this window — those block totals are a lower bound.")
+
+# ===========================================================================
+# TAB 7 — Data & notes
+# ===========================================================================
+if _view == _VIEWS[6]:
     sec("Chains", "Normalised schema, identical for both venues", MUTED)
     which = st.radio("Dataset", ["IBIT", "Deribit BTC"] if HAS_D else ["IBIT"], horizontal=True)
     d = ib if which == "IBIT" else der
@@ -768,8 +1266,12 @@ if _view == _VIEWS[5]:
     sec("Methodology & caveats", "", MUTED)
     st.markdown(f"""
 - **Source:** Cboe free delayed option-chain JSON — a snapshot (≈15 min delayed during the US session, last close otherwise).
-  It has **no per-trade tape**; OPRA trade data is licensed. This page is therefore *chain* analytics, not block-flow analytics.
+  It has **no per-trade tape**; OPRA trade data is licensed. Large-ticket figures are snapshot estimates, not block prints.
+  Day-over-day open interest comes only from closes recorded after the US session (`IBIT_chain.parquet` on the `snapshots` branch). Nothing is backfilled.
   This is a deliberate exception to the app's Deribit-only rule (like the Fear & Greed page).
+- **Last-print side:** at or above the ask = bought, at or below the bid = sold, inside the spread = ambiguous.
+  The whole session's volume is then attributed to that one print. It is an estimate.
+- **BTC-equivalent:** iShares bitcoin quantity ÷ shares outstanding ({_share_phrase(share_ratio)}, {btc_per_share:.6f} BTC/share). 1 IBIT option = 100 shares, so contracts × 100 × that ratio is the Deribit-contract equivalent (1 Deribit BTC option = 1 BTC). A BTC-equivalent strike is the IBIT strike divided by the same ratio. The dated fallback is the 13 Nov 2026 holdings file and is used only when the live CSV cannot be fetched.
 - **Greeks / IV:** IV is each venue's own (Cboe mid-quote IV; Deribit mark IV). Delta & gamma are **recomputed** with Black-Scholes
   (r = 0) from that IV on both sides so they are strictly comparable. IBIT forward = spot; Deribit forward = each expiry's underlying price.
 - **IBIT IV is only used where there is a live two-sided quote.** Deep ITM / illiquid strikes show IV = 0 at Cboe and are excluded.
@@ -777,7 +1279,7 @@ if _view == _VIEWS[5]:
 - **Skew:** RR25 = IV(25Δ call) − IV(25Δ put); Fly25 = ½(IV25c + IV25p) − ATM. Compared at fixed tenors by interpolating between listed expiries.
 - **Settlement differs:** IBIT options are American-style, physically settled in shares, expire 16:00 ET; Deribit options are European,
   cash-settled in BTC at 08:00 UTC. Early-exercise value and ETF premium/discount are ignored.
-- **Notional:** IBIT OI × 100 × share price; Deribit OI (BTC) × index. 1 share ≈ {btc_per_share:.6f} BTC.
+- **Notional:** IBIT OI × 100 × share price; Deribit OI (BTC) × index. 1 share = {btc_per_share:.6f} BTC ({_share_phrase(share_ratio)}).
 - **GEX** assumes customers are net long options — an assumption, not observed dealer inventory.
 - **Implied distribution** is risk-neutral and approximated by a quartic fit of the smile; treat tail probabilities as indicative.
 - IBIT trades only in US hours; Deribit is 24/7, so comparisons outside those hours mix a stale IBIT snapshot with live Deribit data.

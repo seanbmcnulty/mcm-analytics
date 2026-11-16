@@ -1,0 +1,161 @@
+name: Record IBIT chain snapshot
+
+# One IBIT option-chain close per US session, on the snapshots branch (never
+# main — a commit here must not redeploy Streamlit).  The vol-surface files
+# on that branch are not read, deleted, or staged.
+#
+# Cron is UTC and cannot name America/New_York.  The script's gate is 16:45
+# ET, after the 16:15 ET options close and the ~15 min Cboe delay:
+#   21:45 UTC = 16:45 EST (winter) and 17:45 EDT (summer)
+#   22:30 UTC = 17:30 EST and 18:30 EDT, a retry if the first run failed
+# Both instants are past 16:45 ET in both daylight-saving offsets.  Weekends
+# and NYSE holidays exit 0 without writing.  A session already stored is
+# skipped.  Push is a normal fast-forward, never --force; a rejected push
+# re-appends onto the new tip instead of replacing the file.
+
+on:
+  schedule:
+    - cron: '45 21 * * *'
+    - cron: '30 22 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: record-ibit-chain
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        timeout-minutes: 3
+        run: pip install --disable-pip-version-check requests pandas numpy scipy pyarrow
+
+      - name: Check out snapshots branch
+        timeout-minutes: 2
+        # ls-remote exit 2 = branch confirmed absent.  Anything else non-zero
+        # means we could not tell, and starting fresh (or publishing) could
+        # destroy the vol history that already lives on this branch.
+        run: |
+          echo "PUB=$RUNNER_TEMP/pub" >> "$GITHUB_ENV"
+          echo "BASELINE=$RUNNER_TEMP/published" >> "$GITHUB_ENV"
+          PUB="$RUNNER_TEMP/pub"
+          BASELINE="$RUNNER_TEMP/published"
+          git config --global user.name "mcm-snapshot-bot"
+          git config --global user.email "actions@users.noreply.github.com"
+          set +e
+          git ls-remote --exit-code --heads origin snapshots >/dev/null 2>&1
+          rc=$?
+          set -e
+          mkdir -p "$BASELINE" data/snapshots
+          if [ "$rc" -eq 0 ]; then
+            git fetch --depth=1 origin snapshots
+            git worktree add -B snapshots "$PUB" FETCH_HEAD
+            if [ -f "$PUB/data/snapshots/IBIT_chain.parquet" ]; then
+              cp "$PUB/data/snapshots/IBIT_chain.parquet" "$BASELINE/IBIT_chain.parquet"
+              cp "$PUB/data/snapshots/IBIT_chain.parquet" data/snapshots/IBIT_chain.parquet
+            fi
+          elif [ "$rc" -eq 2 ]; then
+            echo "::error::snapshots branch is absent. Refusing to create it from the IBIT job."
+            exit 1
+          else
+            echo "::error::Could not reach the snapshots branch (exit $rc). Not publishing."
+            exit 1
+          fi
+
+      - name: Record IBIT chain
+        timeout-minutes: 4
+        # Exit 2 = stale chain, empty chain, or fetch failure.  Remember it
+        # and refuse to publish; the file on disk was not modified.
+        run: |
+          set +e
+          python scripts/record_ibit_chain.py
+          echo "REC_RC=$?" >> "$GITHUB_ENV"
+
+      - name: Validate and publish (append-only, this file only)
+        timeout-minutes: 2
+        run: |
+          set -e
+          if [ "${REC_RC}" != "0" ]; then
+            echo "::error::record_ibit_chain.py exited ${REC_RC}; not publishing."
+            exit 1
+          fi
+          python scripts/record_ibit_chain.py validate --published "$BASELINE" --candidate data/snapshots
+          if [ ! -f data/snapshots/IBIT_chain.parquet ]; then
+            echo "No IBIT chain file (market closed or nothing stored yet). Nothing to publish."
+            exit 0
+          fi
+          if [ -f "$BASELINE/IBIT_chain.parquet" ] && cmp -s data/snapshots/IBIT_chain.parquet "$BASELINE/IBIT_chain.parquet"; then
+            echo "No new IBIT rows; nothing to publish."
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            if [ "$attempt" -gt 1 ]; then
+              git -C "$PUB" fetch --depth=1 origin snapshots
+              git -C "$PUB" reset --hard FETCH_HEAD
+              rm -rf "$BASELINE" && mkdir -p "$BASELINE" data/snapshots
+              rm -f data/snapshots/IBIT_chain.parquet
+              if [ -f "$PUB/data/snapshots/IBIT_chain.parquet" ]; then
+                cp "$PUB/data/snapshots/IBIT_chain.parquet" "$BASELINE/IBIT_chain.parquet"
+                cp "$PUB/data/snapshots/IBIT_chain.parquet" data/snapshots/IBIT_chain.parquet
+              fi
+              set +e
+              python scripts/record_ibit_chain.py
+              rec=$?
+              set -e
+              if [ "$rec" != "0" ]; then
+                echo "::error::record_ibit_chain.py exited $rec on retry; not publishing."
+                exit 1
+              fi
+              python scripts/record_ibit_chain.py validate --published "$BASELINE" --candidate data/snapshots
+            fi
+            mkdir -p "$PUB/data/snapshots"
+            cp data/snapshots/IBIT_chain.parquet "$PUB/data/snapshots/IBIT_chain.parquet"
+            # This path only.  git add -A would be able to stage a deletion of
+            # the vol-surface files if the worktree were ever incomplete.
+            git -C "$PUB" add -f -- data/snapshots/IBIT_chain.parquet
+            if git -C "$PUB" diff --cached --quiet; then
+              echo "No new IBIT rows; nothing to publish."
+              exit 0
+            fi
+            git -C "$PUB" commit -q -m "ibit chain: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            if git -C "$PUB" push origin HEAD:refs/heads/snapshots; then
+              echo "Published IBIT chain."
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt); retrying on the new tip..."
+            sleep $((attempt * 5))
+          done
+          echo "::error::Could not publish the IBIT chain after 3 attempts."
+          exit 1
+
+      - name: Telegram alert on failure
+        if: failure()
+        timeout-minutes: 1
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+            echo "Telegram secrets not set; skipping alert."; exit 0
+          fi
+          curl -sS -m 20 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=⚠️ IBIT chain snapshot FAILED ($(date -u +'%Y-%m-%d %H:%M') UTC). ${RUN_URL}" >/dev/null \
+            || echo "Telegram send failed (ignored)."
