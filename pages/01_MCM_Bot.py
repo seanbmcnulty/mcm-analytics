@@ -28,6 +28,60 @@ from lib import fx_style, surface, telegram
 from lib.constants import ASSETS, ASSET_COLORS
 from lib.telegram_caption import caption_from_title
 
+
+def _process_start() -> float | None:
+    """Epoch seconds this process started (Linux /proc), else None."""
+    try:
+        import os
+        with open("/proc/stat") as fh:
+            btime = next(float(ln.split()[1]) for ln in fh if ln.startswith("btime"))
+        with open("/proc/self/stat") as fh:
+            ticks = float(fh.read().rsplit(")", 1)[1].split()[19])
+        return btime + ticks / os.sysconf("SC_CLK_TCK")
+    except Exception:
+        return None
+
+
+def _fresh_lib_modules() -> list[str]:
+    """Reload the command modules when their code on disk is newer.
+
+    Streamlit Cloud pulls a new commit into the running process: this page
+    reruns with the new source, but ``lib.*`` modules already imported keep
+    their old code (18 Nov 2026: the Vol Term Structure note removed in #9
+    still showed, in the app and in the Telegram blast). Same fix as the
+    Ecoinometrics page. A module is stale when its file changed since this
+    page last saw it, or (first look) was written after the process started.
+    ``importlib.reload`` updates modules in place, so the names imported
+    above stay valid; once one reloads, the ones that import it reload too.
+    """
+    import importlib
+    import os
+    from lib import cmd_market, cmd_vol, history, telegram_caption
+    started = _process_start()
+    reloaded, stale = [], False
+    for mod in (fx_style, telegram_caption, surface, history, cmd_vol, cmd_market, cmdreg):
+        path = getattr(mod, "__file__", None)
+        try:
+            mtime = os.path.getmtime(path) if path else None
+        except OSError:
+            mtime = None
+        seen = getattr(mod, "_mcm_seen_mtime", None)
+        changed = mtime is not None and (
+            (seen is not None and mtime != seen)
+            or (seen is None and started is not None and mtime > started + 5))
+        if stale or changed:
+            stale = True
+            try:
+                importlib.reload(mod)
+                reloaded.append(mod.__name__)
+            except Exception:
+                logging.getLogger("mcm_bot").exception("reload %s failed", mod.__name__)
+        mod._mcm_seen_mtime = mtime
+    return reloaded
+
+
+_RELOADED = _fresh_lib_modules()
+
 st.set_page_config(page_title="MCM Bot", page_icon="🤖", layout="wide",
                    initial_sidebar_state="expanded")
 
