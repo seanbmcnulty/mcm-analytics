@@ -216,14 +216,11 @@ def test_lookback_lines_span_every_listed_expiry():
         day_cd = list(by_name["24h Ago"].customdata)
         assert "(est.)" in str(day_cd[3]) and "(est.)" not in str(day_cd[0])
 
-        # finalize() inserts <br> (and may break on the hyphen in "16-Nov").
-        title = re.sub(r"<br\s*/?>", " ", fig.layout.title.text)
-        title = re.sub(r"<[^>]+>", "", title)
-        title = re.sub(r"\s+", " ", title)
-        assert "1 Month Ago" in title
-        assert "24h Ago (19-Nov)" in title
-        assert "1 Week Ago (16-Nov, 17-Nov, 18-Nov, 19-Nov, 04-Dec)" in title
-        assert "Open markers are (est.)" in title
+        # Title only: no explanatory note in the chart or the Telegram caption.
+        title = fig.layout.title.text
+        assert re.fullmatch(r"[A-Z]+ Vol Term Structure", title), title
+        from lib.telegram_caption import caption_from_title
+        assert caption_from_title(title, "X /vol_term_structure") == title
 
 
 def test_full_grid_fallback_keeps_honest_elapsed_label():
