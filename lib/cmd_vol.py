@@ -227,10 +227,6 @@ def cmd_vol_term_structure(asset: str, **kwargs):
     # (legend name, style key, decimal IV per dte, per-point estimated flag)
     series: list[tuple[str, str, list[float], list[bool]]] = [(
         "Current", "Current", [_at(live, d) for d in dtes], [False] * len(dtes))]
-    # Whole line is the smoothed grid (no per-expiry history that far back).
-    full_est: list[str] = []
-    # Some tenors on an otherwise recorded line were not listed yet.
-    partial: list[tuple[str, list[str]]] = []
     lookbacks = [("24h Ago", timedelta(hours=24), 3.0),
                  ("1 Week Ago", timedelta(days=7), 6.0),
                  ("1 Month Ago", timedelta(days=30), 12.0)]
@@ -254,13 +250,8 @@ def cmd_vol_term_structure(asset: str, **kwargs):
         # A pure grid fallback uses the honest elapsed-time label.
         display = label if exact is not None else grid_label
         n_est = sum(1 for i in finite if flags[i])
-        if n_est == len(finite):
-            name = f"{display} (est.)"
-            full_est.append(display)
-        else:
-            name = display
-            if n_est:
-                partial.append((display, [x_cat[i] for i in finite if flags[i]]))
+        # Whole line from the smoothed grid -> "(est.)" in the legend.
+        name = f"{display} (est.)" if n_est == len(finite) else display
         series.append((name, label, ys, flags))
 
     for name, style_key, ys, flags in series:
@@ -305,32 +296,10 @@ def cmd_vol_term_structure(asset: str, **kwargs):
         height=450, template=TEMPLATE, xaxis=dict(type="category"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
     )
-    note = _term_structure_est_note(full_est, partial)
-    # The filled-tenor sentence adds a subtitle line. The shared header
-    # estimate is a few pixels short of clearing the legend once that
-    # line is there.
-    finalize(fig, note=note, legend_rows=1, extra_top=20 if partial else 0)
+    # No explanatory subtitle (Sean, 18 Nov 2026): the "(est.)" legend labels
+    # and open markers carry the estimate flag on their own.
+    finalize(fig, legend_rows=1)
     return fig, None, None
-
-
-def _term_structure_est_note(full_est: list[str],
-                             partial: list[tuple[str, list[str]]]) -> str | None:
-    """Subtitle for estimated vol-term lines and for filled points on mixed lines."""
-    parts = []
-    if full_est:
-        parts.append(
-            "(est.) lines use smoothed fixed-tenor history until per-expiry history "
-            f"reaches back far enough: {', '.join(full_est)}"
-        )
-    if partial:
-        bits = [f"{lab} ({', '.join(dates)})" for lab, dates in partial]
-        parts.append(
-            "Open markers are (est.) tenors not listed then: "
-            + "; ".join(bits)
-        )
-    if not parts:
-        return None
-    return ". ".join(parts) + "."
 
 
 # ===========================================================================
