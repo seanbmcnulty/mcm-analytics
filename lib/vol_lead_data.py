@@ -330,3 +330,193 @@ def merge_panel(frames: dict[str, pd.DataFrame], ndx_extra: pd.Series | None = N
         else:
             panel = panel.join(ndx_extra.rename("NDX"), how="outer")
     return panel
+
+
+# ================================================================ intraday
+# Two small committed stores, topped up live by the page (TTL cache):
+#   vl_intraday_5m.csv  5-minute bars, US cash session (obs 09:35-16:00 NY).
+#                       VIX from Yahoo ^VIX 5m (Yahoo keeps ~60 days), DVOL
+#                       from Deribit 1-minute candles (kept ~3-4 months).
+#                       The file keeps growing past Yahoo's window (capped 2y).
+#   vl_intraday_1h.csv  hourly, obs 10:00-16:00 NY (on the hour; Yahoo ^VIX
+#                       1h bars and Deribit hourly DVOL both start on the hour).
+# ``obs`` is the bar END time in UTC (a value observed at that instant), so
+# a 5m bar stamped 10:00 by Yahoo is the 10:05 observation.
+INTRADAY = {
+    "5m": {"file": "vl_intraday_5m.csv", "label": "Intraday 5-min (Yahoo ^VIX + Deribit 1-min DVOL)",
+           "freq": pd.Timedelta(minutes=5), "first": (9, 35), "last": (16, 0)},
+    "1h": {"file": "vl_intraday_1h.csv", "label": "Intraday hourly (Yahoo ^VIX + Deribit hourly DVOL)",
+           "freq": pd.Timedelta(hours=1), "first": (10, 0), "last": (16, 0)},
+}
+INTRADAY_COLS = ["VIX", "DVOL_BTC", "DVOL_ETH"]
+INTRADAY_MAX_DAYS = 730
+
+
+def cash_session_mask(obs_utc: pd.DatetimeIndex, first=(9, 35), last=(16, 0)) -> np.ndarray:
+    """True for observations inside the US cash session (NY wall clock), Mon-Fri."""
+    ny = obs_utc.tz_convert("America/New_York")
+    mins = ny.hour * 60 + ny.minute
+    return ((mins >= first[0] * 60 + first[1]) & (mins <= last[0] * 60 + last[1])
+            & (ny.dayofweek < 5) & (ny.second == 0))
+
+
+def parse_yahoo_intraday(payload: dict, interval: pd.Timedelta, now=None) -> pd.Series:
+    """Yahoo chart JSON -> close at bar END (UTC index). Unfinished bars dropped."""
+    res = ((payload.get("chart") or {}).get("result") or [None])[0]
+    if not res:
+        raise ValueError("Yahoo intraday: empty result")
+    ts = res.get("timestamp") or []
+    closes = ((res.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+    start = pd.to_datetime(ts, unit="s", utc=True)
+    obs = start + interval
+    s = pd.Series(pd.to_numeric(pd.Series(closes), errors="coerce").values, index=obs).dropna()
+    s = s[(s.index.second == 0)]
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    s = s[s.index <= now]
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    s.index.name = "obs"
+    return s
+
+
+def fetch_yahoo_intraday(sym: str, interval: str, rng: str, get=None, timeout: int = 12) -> pd.Series:
+    get = get or requests.get
+    r = get(YAHOO_URL.format(sym=sym), params={"range": rng, "interval": interval},
+            headers={"User-Agent": CBOE_HEADERS["User-Agent"]}, timeout=timeout)
+    r.raise_for_status()
+    iv = pd.Timedelta(minutes=5) if interval == "5m" else pd.Timedelta(hours=1)
+    return parse_yahoo_intraday(r.json(), iv)
+
+
+def _deribit_candles(currency: str, resolution: str, start_ms: int, end_ms: int, get=None,
+                     max_pages: int = 40, timeout: int = 12) -> pd.DataFrame:
+    get = get or requests.get
+    rows: list = []
+    for _ in range(max_pages):
+        r = get(DERIBIT_URL, params={"currency": currency, "resolution": resolution,
+                                     "start_timestamp": start_ms, "end_timestamp": end_ms}, timeout=timeout)
+        r.raise_for_status()
+        res = r.json().get("result") or {}
+        data = res.get("data") or []
+        rows.extend(data)
+        cont = res.get("continuation")
+        if not data or not cont or cont <= start_ms or cont >= end_ms:
+            break
+        end_ms = int(cont)
+    return pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close"]).drop_duplicates("ts")
+
+
+def dvol_at_obs(candles: pd.DataFrame, bar: pd.Timedelta, obs: pd.DatetimeIndex) -> pd.Series:
+    """DVOL observed exactly at each ``obs`` = close of the candle ENDING there.
+
+    Candle ``ts`` covers [ts, ts+bar); its close is the value at ts+bar.
+    No interpolation and no later value: a missing candle stays missing.
+    """
+    if candles is None or candles.empty:
+        return pd.Series(np.nan, index=obs)
+    end = pd.to_datetime(candles["ts"], unit="ms", utc=True) + bar
+    s = pd.Series(candles["close"].astype(float).values, index=end)
+    s = s[~s.index.duplicated(keep="last")]
+    return s.reindex(obs)
+
+
+def _sessions_ny(obs: pd.DatetimeIndex) -> pd.Index:
+    return obs.tz_convert("America/New_York").normalize().tz_localize(None)
+
+
+def build_intraday(kind: str, existing: pd.DataFrame | None = None, get=None, now=None,
+                   max_days: int = INTRADAY_MAX_DAYS, pause: float = 0.05) -> pd.DataFrame:
+    """Fetch the intraday store ``kind`` ("5m" or "1h"), merging into ``existing``.
+
+    Only sessions not already complete in ``existing`` are fetched from
+    Deribit (one 1-minute window per session for 5m). The latest stored
+    session is always re-fetched so an unfinished day fills in.
+    """
+    spec = INTRADAY[kind]
+    freq = spec["freq"]
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    old = existing.copy() if existing is not None and not existing.empty else pd.DataFrame(columns=INTRADAY_COLS)
+    if not old.empty:
+        old.index = pd.DatetimeIndex(old.index).tz_convert("UTC") if pd.DatetimeIndex(old.index).tz else \
+            pd.DatetimeIndex(old.index).tz_localize("UTC")
+    if kind == "5m":
+        rng = "60d" if old.empty or (now - old.index.max()) > pd.Timedelta(days=4) else "5d"
+        vix = fetch_yahoo_intraday("^VIX", "5m", rng, get)
+    else:
+        rng = "730d" if old.empty or (now - old.index.max()) > pd.Timedelta(days=25) else "1mo"
+        vix = fetch_yahoo_intraday("^VIX", "1h", rng, get)
+    vix = vix[cash_session_mask(vix.index, spec["first"], spec["last"])]
+    if vix.empty:
+        raise RuntimeError(f"Yahoo ^VIX {kind}: no cash-session bars")
+    sessions = _sessions_ny(vix.index)
+    latest_old = _sessions_ny(old.index).max() if not old.empty else None
+    need = sorted({d for d in sessions if latest_old is None or d >= latest_old})
+    new = pd.DataFrame({"VIX": vix})
+    new = new[_sessions_ny(new.index).isin(need)]
+    for cur in ("BTC", "ETH"):
+        vals = []
+        if kind == "5m":
+            for d in need:
+                o = new.index[_sessions_ny(new.index) == d]
+                if len(o) == 0:
+                    continue
+                s_ms = int((o.min() - pd.Timedelta(minutes=2)).timestamp() * 1000)
+                e_ms = int(o.max().timestamp() * 1000)
+                c = _deribit_candles(cur, "60", s_ms, e_ms, get)
+                vals.append(dvol_at_obs(c, pd.Timedelta(minutes=1), o))
+                time.sleep(pause)
+        else:
+            if len(new):
+                s_ms = int((new.index.min() - pd.Timedelta(hours=2)).timestamp() * 1000)
+                e_ms = int(new.index.max().timestamp() * 1000)
+                c = _deribit_candles(cur, "3600", s_ms, e_ms, get)
+                vals.append(dvol_at_obs(c, pd.Timedelta(hours=1), new.index))
+        new[f"DVOL_{cur}"] = pd.concat(vals).reindex(new.index) if vals else np.nan
+    keep_old = old[~_sessions_ny(old.index).isin(need)] if not old.empty else old
+    out = pd.concat([keep_old, new]).sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    out = out[out.index >= now - pd.Timedelta(days=max_days)]
+    out.index.name = "obs"
+    return out[INTRADAY_COLS].astype(float)
+
+
+def intraday_path(kind: str, data_dir: Path | None = None) -> Path:
+    return (data_dir or DATA_DIR) / INTRADAY[kind]["file"]
+
+
+def load_intraday(kind: str, data_dir: Path | None = None) -> pd.DataFrame:
+    p = intraday_path(kind, data_dir)
+    if not p.exists():
+        return pd.DataFrame(columns=INTRADAY_COLS)
+    df = pd.read_csv(p)
+    idx = pd.to_datetime(df["obs"], utc=True)
+    out = df.drop(columns="obs").set_index(idx).astype(float)
+    out.index.name = "obs"
+    return out
+
+
+def write_intraday(df: pd.DataFrame, path: Path) -> None:
+    out = df.copy()
+    out.index = pd.DatetimeIndex(out.index).tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+    out.index.name = "obs"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(path, float_format="%.3f")
+
+
+def refresh_intraday(kind: str, *, write: bool = True, data_dir: Path | None = None, get=None,
+                     now=None) -> Result:
+    label = INTRADAY[kind]["label"]
+    old = load_intraday(kind, data_dir)
+    try:
+        df = build_intraday(kind, old, get=get, now=now)
+    except Exception as ex:
+        msg = f"{label}: live top-up failed ({ex}); using the stored file ({len(old)} rows)."
+        return Result(old, not old.empty, "csv" if not old.empty else "none", msg,
+                      old.index.max() if not old.empty else None)
+    msg = (f"{label}: live, {len(df)} rows, {_sessions_ny(df.index).nunique()} sessions to "
+           f"{df.index.max().tz_convert('Asia/Singapore'):%d %b %H:%M} SGT")
+    if write:
+        try:
+            write_intraday(df, intraday_path(kind, data_dir))
+        except Exception as ex:
+            msg += f"; in-session only ({ex})"
+    return Result(df, True, "live", msg, df.index.max())

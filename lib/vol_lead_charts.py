@@ -147,3 +147,125 @@ def ranking_heatmap(rank: pd.DataFrame, asset: str, spec_label: str = "daily cha
     fig.update_layout(hovermode="closest")
     return _done(fig, f"Gain in out-of-sample R² over a DVOL-only model from adding the predictor's {spec_label} "
                       "(expanding window). * = Clark-West p < 0.05.")
+
+
+# ================================================================ intraday
+def _sgt(idx) -> pd.DatetimeIndex:
+    return pd.DatetimeIndex(idx).tz_convert(fx.DISPLAY_TZ).tz_localize(None)
+
+
+def _gap_breaks(x: pd.DatetimeIndex, bar: pd.Timedelta) -> list:
+    """Plotly rangebreaks that hide the overnight / weekend gaps between sessions."""
+    out = []
+    if len(x) < 2:
+        return out
+    xs = x.sort_values()
+    gaps = xs[1:] - xs[:-1]
+    for a, g in zip(xs[:-1], gaps):
+        if g > bar * 3:
+            out.append(dict(values=[(a + bar).strftime("%Y-%m-%d %H:%M:%S")], dvalue=int((g - bar * 2) / pd.Timedelta(milliseconds=1))))
+    return out
+
+
+def intraday_overlay(df: pd.DataFrame, asset: str, bar: pd.Timedelta, title: str) -> go.Figure:
+    x = _sgt(df.index)
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_scatter(x=x, y=df[f"DVOL_{asset}"], name=f"{asset} DVOL", line=dict(color=ASSET_COLOR.get(asset, fx.NAVY), width=1.8))
+    fig.add_scatter(x=x, y=df["VIX"], name="VIX (right)", line=dict(color=fx.NAVY, width=1.4), secondary_y=True)
+    _base(fig, title)
+    fig.update_xaxes(title_text=fx.XAXIS_TIME, rangebreaks=_gap_breaks(x, bar), tickformat=fx.TIME_TICKFORMAT)
+    fig.update_yaxes(title_text=f"{asset} DVOL", secondary_y=False)
+    fig.update_yaxes(title_text="VIX", secondary_y=True, showgrid=False)
+    return _done(fig, "US cash session only (09:30-16:00 New York); overnight gaps hidden.")
+
+
+def norm_overlay(z: pd.DataFrame, title: str, bar: pd.Timedelta) -> go.Figure:
+    x = _sgt(z.index)
+    fig = go.Figure()
+    colors = {"VIX": fx.NAVY, "DVOL_BTC": ASSET_COLOR["BTC"], "DVOL_ETH": ASSET_COLOR["ETH"]}
+    for c in z.columns:
+        fig.add_scatter(x=x, y=z[c], name=c.replace("DVOL_", "") + (" DVOL" if c.startswith("DVOL") else ""),
+                        line=dict(color=colors.get(c, fx.GREY), width=1.5))
+    _base(fig, title)
+    fig.update_xaxes(title_text=fx.XAXIS_TIME, rangebreaks=_gap_breaks(x, bar))
+    fig.update_yaxes(title_text="z-score within the window")
+    return _done(fig, "Each series standardised over the window shown, so moves are comparable.")
+
+
+def change_scatter(dx: pd.Series, dy: pd.Series, fit: dict, asset: str, label: str) -> go.Figure:
+    d = pd.concat([dx.rename("x"), dy.rename("y")], axis=1).dropna()
+    fig = go.Figure()
+    fig.add_scatter(x=d["x"], y=d["y"], mode="markers", name=f"{label} changes",
+                    marker=dict(color=fx.BLUE, size=4, opacity=0.45))
+    if np.isfinite(fit.get("beta", np.nan)) and len(d):
+        xs = np.linspace(d["x"].min(), d["x"].max(), 20)
+        fig.add_scatter(x=xs, y=fit["alpha"] + fit["beta"] * xs, mode="lines", name=f"beta {fit['beta']:.2f}",
+                        line=dict(color=fx.RED, width=2))
+    _base(fig, f"{label} ΔVIX vs Δ{asset} DVOL (same bar)")
+    fig.update_layout(hovermode="closest")
+    fig.update_xaxes(title_text="ΔVIX (pts)")
+    fig.update_yaxes(title_text=f"Δ{asset} DVOL (pts)")
+    return _done(fig, f"corr {fit.get('corr', np.nan):+.2f}, beta {fit.get('beta', np.nan):.2f} "
+                      f"(HAC t {fit.get('t', np.nan):.1f}), n={fit.get('n', 0)}.")
+
+
+def rolling_intraday(rbs: dict, asset: str) -> go.Figure:
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                        subplot_titles=("Rolling correlation", "Rolling beta (DVOL pts per VIX pt)"))
+    for (name, rb), c in zip(rbs.items(), (fx.AMBER, fx.NAVY)):
+        x = _sgt(rb.index)
+        fig.add_scatter(x=x, y=rb["corr"], name=name, line=dict(color=c, width=1.5), row=1, col=1)
+        fig.add_scatter(x=x, y=rb["beta"], name=name, line=dict(color=c, width=1.5), row=2, col=1, showlegend=False)
+    _base(fig, f"Hourly ΔVIX vs Δ{asset} DVOL: rolling 1-week and 1-month", height=560)
+    return _done(fig, "Within-session hourly changes only.", subplot_titles=True)
+
+
+def intraday_cross_corr(cc: pd.DataFrame, asset: str, unit: str) -> go.Figure:
+    sig = cc["corr"].abs() > cc["band"]
+    colors = [fx.RED if (s and l > 0) else (fx.BLUE if s else "#B8C4D2") for s, l in zip(sig, cc["lag"])]
+    xv = cc["minutes"] if unit == "min" else cc["minutes"] / 60
+    fig = go.Figure(go.Bar(x=xv, y=cc["corr"], marker_color=colors, name="corr",
+                           hovertemplate="%{x}" + unit + ": %{y:.3f}<extra></extra>"))
+    b = float(cc["band"].median())
+    for y in (b, -b):
+        fig.add_hline(y=y, line=dict(color=fx.GREY, dash="dash", width=1))
+    step = "5-min" if unit == "min" else "hourly"
+    _base(fig, f"Intraday lead-lag ({step}): ΔVIX (t−k) vs Δ{asset} DVOL (t)")
+    fig.update_xaxes(title_text=f"k ({unit}). k > 0: VIX leads DVOL")
+    fig.update_yaxes(title_text="Correlation")
+    return _done(fig, f"Within-session pairs only. Dashed: ±1.96/√n (±{b:.3f}). Red = significant with VIX leading.")
+
+
+def intraday_events(paths: dict, asset: str) -> go.Figure:
+    fig = go.Figure()
+    for (name, p), c in zip(paths.items(), (fx.RED, fx.GREEN)):
+        if p is None or p.empty or p["n"].max() == 0:
+            continue
+        rgba = "rgba({},{},{},0.15)".format(*[int(c[i:i + 2], 16) for i in (1, 3, 5)])
+        fig.add_scatter(x=list(p["minutes"]) + list(p["minutes"][::-1]), y=list(p["hi"]) + list(p["lo"][::-1]),
+                        fill="toself", fillcolor=rgba, line=dict(width=0), hoverinfo="skip", showlegend=False)
+        fig.add_scatter(x=p["minutes"], y=p["mean"], name=f"{name} (n={int(p['n'].max())})", line=dict(color=c, width=2))
+    fig.add_vline(x=0, line=dict(color=fx.GREY, width=1))
+    fig.add_hline(y=0, line=dict(color=fx.GREY, width=1))
+    _base(fig, f"{asset} DVOL around large 5-min VIX moves")
+    fig.update_xaxes(title_text="Minutes from the VIX move (bar end)")
+    fig.update_yaxes(title_text="DVOL change vs the bar before (vol pts)")
+    return _done(fig, "Move = 5-min ΔVIX beyond 3 trailing sd; same session only. Shaded: 95% band.")
+
+
+def today_fair(fv: pd.DataFrame, asset: str, day_label: str) -> go.Figure:
+    x = _sgt(fv.index)
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.65, 0.35],
+                        subplot_titles=(f"{asset} DVOL vs TradFi fair value (5-min)", "Rich (+) / cheap (−), vol pts"))
+    fig.add_scatter(x=x, y=fv["DVOL"], name=f"{asset} DVOL", line=dict(color=ASSET_COLOR.get(asset, fx.NAVY), width=2), row=1, col=1)
+    fig.add_scatter(x=x, y=fv["fair"], name="Fair value", line=dict(color=fx.NAVY, width=1.4, dash="dash"), row=1, col=1)
+    r = fv["resid"]
+    fig.add_scatter(x=x, y=r.clip(lower=0), fill="tozeroy", mode="lines", name="Rich", line=dict(color=fx.RED, width=0.8),
+                    fillcolor="rgba(192,57,43,0.45)", row=2, col=1)
+    fig.add_scatter(x=x, y=r.clip(upper=0), fill="tozeroy", mode="lines", name="Cheap", line=dict(color=fx.GREEN, width=0.8),
+                    fillcolor="rgba(14,122,56,0.45)", row=2, col=1)
+    _base(fig, f"Today: {asset} DVOL vs fair value intraday ({day_label})", height=520)
+    fig.update_xaxes(tickformat="%H:%M")
+    fig.update_xaxes(title_text=fx.XAXIS_TIME, row=2, col=1)
+    return _done(fig, "Fair value = latest daily fit (window chosen in the sidebar) applied to live VIX; MOVE held at its last close.",
+                 subplot_titles=True)

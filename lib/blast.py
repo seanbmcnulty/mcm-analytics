@@ -319,9 +319,18 @@ GROUPS = [
     ("vixdvol", "📉 TradFi vol vs DVOL", [
         ("Rich/cheap & prediction", _items("vixdvol", False, [
             ("rich_cheap", "Rich/cheap vs TradFi vol"),
+            ("today", "Today: DVOL vs fair value (5-min)"),
             ("ranking", "Predictor ranking"),
-            ("leadlag", "VIX lead-lag"),
-            ("events", "DVOL after VIX / MOVE spikes"),
+            ("leadlag", "VIX lead-lag (daily)"),
+            ("events", "DVOL after VIX / MOVE spikes (daily)"),
+        ])),
+        ("Intraday", _items("vixdvol", False, [
+            ("intraday_overlay", "Intraday overlay (5-min)"),
+            ("intraday_leadlag", "Intraday lead-lag (5-min & hourly)"),
+            ("intraday_events", "DVOL after big 5-min VIX moves"),
+            ("scatter", "Scatter of changes"),
+            ("norm_overlay", "Normalised overlay (hourly)"),
+            ("intraday_rolling", "Rolling 1w/1m corr & beta"),
         ])),
         ("Context", _items("vixdvol", False, [
             ("levels", "DVOL vs VIX & MOVE"),
