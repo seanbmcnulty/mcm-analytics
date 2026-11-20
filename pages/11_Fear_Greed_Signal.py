@@ -38,6 +38,9 @@ from lib.telegram import send_message, is_configured
 from lib import cache as cache_lib
 from lib import fx_style
 from lib import fng
+from lib import blast, freshness
+
+freshness.reload_if_changed(blast)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -56,6 +59,11 @@ st.caption(
     "long (fear) or short (greed) historically paid off?"
 )
 
+# Home chart blast (lib/blast.py): one pass per selected asset ("fng:BTC", ...).
+_blast_step = blast.active_step("fng")   # clears the flag if Telegram isn't configured
+if _blast_step is not None:
+    blast.banner(_blast_step, f"sending the {_blast_step.asset} Fear & Greed signal summary…")
+
 BUCKET_ORDER = fng.BUCKET_ORDER
 BUCKET_SIGNAL = fng.BUCKET_SIGNAL
 BUCKET_COLORS = fng.BUCKET_COLORS
@@ -68,6 +76,8 @@ with st.sidebar:
     st.header("Parameters")
 
     selected_asset = st.selectbox("Asset", options=ASSETS, index=0)
+    if _blast_step is not None and _blast_step.asset in ASSETS:
+        selected_asset = _blast_step.asset
     cfg = ASSET_CONFIG[selected_asset]
     st.caption(
         "Fear & Greed is one market-wide series (not per-asset) — this "
@@ -140,11 +150,11 @@ if not thresholds_valid:
         "Fear/Neutral split, and the Greed/Neutral split must be below the "
         "Extreme Greed edge. Adjust the sliders in the sidebar."
     )
-    st.stop()
+    blast.stop("fng", f"{selected_asset}: invalid threshold settings")
 
 if not horizons:
     st.warning("Select at least one forward-return horizon from the sidebar.")
-    st.stop()
+    blast.stop("fng", f"{selected_asset}: no forward-return horizon selected")
 
 # ---------------------------------------------------------------------------
 # Data fetching
@@ -175,11 +185,11 @@ if fng_df is None or fng_df.empty:
         "(network issue or the API is down). Nothing else on this page depends "
         "on Deribit, so this is the only failure mode — try again shortly."
     )
-    st.stop()
+    blast.stop("fng", f"{selected_asset}: Fear & Greed index fetch failed")
 
 if price_df is None or price_df.empty:
     st.error(f"Could not fetch Deribit perpetual OHLC for {selected_asset}.")
-    st.stop()
+    blast.stop("fng", f"{selected_asset}: Deribit price fetch failed")
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +325,7 @@ def compute_equity_curve(merged: pd.DataFrame) -> pd.DataFrame:
 merged = merge_price_fng(price_df, fng_df)
 if merged.empty:
     st.error("No overlapping dates between the Fear & Greed history and this asset's price history.")
-    st.stop()
+    blast.stop("fng", f"{selected_asset}: no overlapping F&G / price dates")
 
 merged = add_bucket(merged, thresholds)
 merged = add_forward_returns(merged, horizons)
@@ -598,28 +608,36 @@ if len(equity_df) > 1:
 st.divider()
 st.subheader("Telegram Report")
 
+
+def _signal_summary() -> str:
+    lines = [f"<b>{selected_asset} Fear &amp; Greed Signal</b>"]
+    lines.append(f"Generated: {fx_style.local_now():%Y-%m-%d %H:%M} {fx_style.DISPLAY_TZ_LABEL}")
+    lines.append("")
+    lines.append(f"F&amp;G: {current_value:.0f} ({current_bucket})")
+    lean_txt = f"{'Long' if current_lean_pct > 0 else 'Short' if current_lean_pct < 0 else 'Flat'} {abs(current_lean_pct):.0f}%"
+    lines.append(f"Suggested lean: {lean_txt}")
+    if headline and headline["n"] > 0 and not np.isnan(headline["win_rate"]):
+        lines.append(
+            f"Historical win rate ({headline_horizon}d): {headline['win_rate'] * 100:.0f}% "
+            f"(n={headline['n']}, p={headline['p_value']:.3f})"
+        )
+    lines.append("")
+    lines.append("Not a trading signal on its own — funding/fees/slippage not modeled.")
+    return "\n".join(lines)
+
+
 if not is_configured():
     st.info("Telegram not configured. Set credentials in secrets.toml or environment.")
 else:
-    if st.button("Send Signal Summary to Telegram", type="primary"):
-        lines = [f"<b>{selected_asset} Fear &amp; Greed Signal</b>"]
-        lines.append(f"Generated: {fx_style.local_now():%Y-%m-%d %H:%M} {fx_style.DISPLAY_TZ_LABEL}")
-        lines.append("")
-        lines.append(f"F&amp;G: {current_value:.0f} ({current_bucket})")
-        lean_txt = f"{'Long' if current_lean_pct > 0 else 'Short' if current_lean_pct < 0 else 'Flat'} {abs(current_lean_pct):.0f}%"
-        lines.append(f"Suggested lean: {lean_txt}")
-        if headline and headline["n"] > 0 and not np.isnan(headline["win_rate"]):
-            lines.append(
-                f"Historical win rate ({headline_horizon}d): {headline['win_rate'] * 100:.0f}% "
-                f"(n={headline['n']}, p={headline['p_value']:.3f})"
-            )
-        lines.append("")
-        lines.append("Not a trading signal on its own — funding/fees/slippage not modeled.")
-        msg = "\n".join(lines)
-        if send_message(msg):
+    if st.button("Send Signal Summary to Telegram", type="primary") or _blast_step is not None:
+        if send_message(_signal_summary()):
             st.success("Signal summary sent to Telegram")
+            _fng_result = (1, [])
         else:
             st.error("Failed to send to Telegram")
+            _fng_result = (0, [f"{selected_asset} signal summary"])
+        if _blast_step is not None:
+            blast.finish(_blast_step, *_fng_result)
 
 # ---------------------------------------------------------------------------
 # Footer

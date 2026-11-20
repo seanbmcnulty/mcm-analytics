@@ -41,6 +41,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy.stats import norm
 
+from lib import blast
 from lib import cache as cache_lib
 from lib import deribit
 from lib import fx_style
@@ -519,6 +520,12 @@ def plot_cumulative_aggression(data, asset):
                    xaxis_title="Time (SGT)", yaxis=dict(title="Cum. $ through mark", tickprefix="$", tickformat="~s"))
 
 
+# Chart order of build_figs, as Home blast selector keys (lib/blast.py "bt.chart.*").
+CHART_KEYS = ("scatter", "strike_expiry", "net_heatmap", "gross_heatmap", "cumulative",
+              "iv_surface", "term_flow", "put_call", "delta_term", "vega_expiry",
+              "vega_strike", "vega_expiry_w", "vega_strike_w", "aggression")
+
+
 def build_figs(data, hist_spot, dvol, spot, asset, venue):
     """The ordered chart list for one asset (also what is sent to Telegram)."""
     figs = [
@@ -570,7 +577,7 @@ def _send_chart(fig, base):
 def _send_many(pairs, label, venue_title):
     if not pairs:
         st.warning(f"Nothing to send for {label}.")
-        return
+        return 0, []
     ok_n = bad_n = 0
     reasons = []
     bar = st.progress(0.0) if len(pairs) > 1 else None
@@ -593,6 +600,7 @@ def _send_many(pairs, label, venue_title):
         with st.expander(f"⚠️ {len(reasons)} chart(s) had trouble"):
             for r in reasons:
                 st.markdown(f"- {r}")
+    return ok_n, reasons
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +695,15 @@ def render_page(venue) -> None:
     if notice:
         st.warning(notice)
 
+    # Home chart blast (lib/blast.py): fresh data, then the selected charts
+    # are sent after the figures are built (bottom of this function).
+    page_id = f"bt_{venue.key}"
+    blast_step = blast.active_step(page_id)
+    if blast_step is not None:
+        blast.banner(blast_step, f"refreshing {venue.title} block trades and sending the "
+                                 "selected charts to Telegram…")
+        cache_lib.clear_all_caches()
+
     # Every underlying with live options gets a tab + a min-size filter.
     listed = _cached_listed(venue.key)
     base_assets = core + sorted(a for a in listed if a not in core)
@@ -737,7 +754,7 @@ def render_page(venue) -> None:
             payload = _cached_all(venue.key, start_ms, tuple(base_assets))
         except Exception as e:
             st.error(f"{venue.title} fetch failed: {e}")
-            st.stop()
+            blast.stop(page_id, f"{venue.title} fetch failed: {e}")
         frames, meta = payload["frames"], payload["meta"]
         raw_active = [a for a in base_assets if frames.get(a) is not None and not frames[a].empty]
         spots = _par(lambda a: _cached_spot(venue.key, a), raw_active)
@@ -837,6 +854,19 @@ def render_page(venue) -> None:
         _send_many([(a, f) for a in btc_eth for f in figs[a]], "BTC+ETH", venue.title)
     if c_all:
         _send_many([(a, f) for a in active for f in figs[a]], "all underlyings", venue.title)
+
+    if blast_step is not None:
+        want = blast.selected(blast_step)
+        b_assets = blast.assets_for(blast_step)
+        sendable = [a for a in b_assets if a in figs]
+        pairs = [(a, f) for a in sendable for k, f in zip(CHART_KEYS, figs[a]) if k in want]
+        if pairs:
+            n_ok, why = _send_many(pairs, ", ".join(sendable), venue.title)
+        else:
+            n_ok, why = 0, []
+        idle = [a for a in b_assets if a not in figs]
+        blast.finish(blast_step, n_ok, why,
+                     note=(f"no blocks for {', '.join(idle)}" if idle else None))
 
     with tabs[len(assets)]:
         st.markdown(f'<div class="asset-header">📊 ALL {venue.title} Block Trades Overview</div>', unsafe_allow_html=True)

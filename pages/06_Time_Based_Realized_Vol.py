@@ -11,7 +11,7 @@ endpoint, always on the perpetual (no spot leg — Deribit's public API has no
 spot market to compare against). SOL and HYPE were added 2026-10-10 after
 confirming 1m/5m/1h/1D candles are served for both (HYPE's perp only has
 history since ~mid-June 2026, so 30d lookbacks are fine but nothing longer
-exists to fetch). The Home-page auto pipeline still only runs BTC/ETH.
+exists to fetch). The Home-page chart blast runs BTC/ETH unless other assets are ticked.
 
 Core question this page answers: if you hedge every X minutes/hours, what
 realized vol do you actually experience? Seven estimators (close-to-close,
@@ -41,6 +41,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from lib.deribit import get_tradingview_ohlc
+from lib import blast, freshness
 from lib import cache as cache_lib
 from lib.constants import ASSET_CONFIG, ASSET_COLORS, PLOTLY_LAYOUT
 from lib.telegram import send_message, send_photo, is_configured
@@ -49,6 +50,8 @@ from lib import fx_style
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
+
+freshness.reload_if_changed(blast)
 
 st.set_page_config(
     page_title="Time Based Realized Vol",
@@ -1363,30 +1366,39 @@ def fig_rolling_methods_for_interval(analysis: Dict[str, Any], asset: str, lookb
 
 def send_time_based_rv_report_to_telegram(
     asset: str, lookback: str, summary_df: pd.DataFrame, figures: List[Tuple[go.Figure, str]],
+    send_text: bool = True, stats: Dict[str, Any] | None = None,
 ) -> Tuple[bool, str]:
+    """Lookback summary message + charts. ``send_text`` False skips the
+    message (Home blast selection); ``stats`` collects {"sent", "failed"}."""
+    stats = stats if stats is not None else {}
+    stats.setdefault("sent", 0)
+    stats.setdefault("failed", [])
     if summary_df.empty:
         send_message(f"⚠️ <b>Time Based Realized Vol</b>\nNo valid frequency rows for {asset} ({lookback}).")
+        stats["failed"].append(f"{asset} {lookback}: no rows")
         return False, "No rows to send"
     metric_col = "Composite RV (%)" if "Composite RV (%)" in summary_df.columns else "Latest ann. RV (%)"
     top = safe_pick_row(summary_df, metric_col, ascending=False)
     low = safe_pick_row(summary_df, metric_col, ascending=True)
-    send_message(
+    if send_text and send_message(
         f"📊 <b>Time Based Realized Vol</b>\n"
         f"Asset: <b>{asset}</b>\n"
         f"Lookback: {lookback}\n"
         f"Best for long gamma (highest composite RV): <b>{top['Interval']}</b> ({top[metric_col]:.2f}%)\n"
         f"Best for short gamma (lowest composite RV): <b>{low['Interval']}</b> ({low[metric_col]:.2f}%)\n"
         f"Time: {fx_style.local_now():%Y-%m-%d %H:%M} {fx_style.DISPLAY_TZ_LABEL}"
-    )
+    ):
+        stats["sent"] += 1
     ok = True
     for fig, name in figures:
         if fig is None:
             continue
         png = fx_style.fig_to_png(fig)
-        if png:
-            ok = send_photo(png, caption=name) and ok
+        if png and send_photo(png, caption=name):
+            stats["sent"] += 1
         else:
             ok = False
+            stats["failed"].append(name)
     return ok, "Report sent to Telegram" if ok else "One or more charts failed to send"
 
 
@@ -1464,33 +1476,26 @@ with st.expander("Estimator glossary (assumptions and caveats)", expanded=False)
     st.dataframe(estimator_glossary, width="stretch", hide_index=True)
 
 # ---------------------------------------------------------------------------
-# Auto pipeline (triggered from the Home page's "Refresh BTC/ETH & send to
-# Telegram" button, chained from pages/02_Block_Trades_-_Deribit.py step 2):
-# this page only ever shows one asset at a time (sidebar selectbox), so the
-# BTC and ETH legs run as two separate passes over this same page rather
-# than in one run — see the pipeline-continuation block near the bottom,
-# which reruns for "tbrv_eth" after "tbrv_btc" finishes, then hands off
-# to Spot Vol Correlation. `_auto_tbrv_asset`, when set, overrides the asset the rest of this
-# script uses regardless of what the sidebar widget shows.
+# Auto pipeline (the Home page's chart blast, lib/blast.py): this page only
+# ever shows one asset at a time (sidebar selectbox), so each selected asset
+# is its own pass over this page ("tbrv:BTC", then "tbrv:ETH", ...) — see
+# the blast.finish call near the bottom, which reruns this page for the next
+# asset or hands off to the next page. `_auto_tbrv_asset`, when set, overrides
+# the asset the rest of this script uses regardless of the sidebar widget.
 # ---------------------------------------------------------------------------
 if cache_lib.expire_stale_auto_pipeline():
     st.caption("Auto pipeline timed out after 15 minutes and was cleared.")
 
-_auto_pipeline_step = st.session_state.get("auto_pipeline")
-_auto_tbrv_asset = None
-if _auto_pipeline_step in ("tbrv_btc", "tbrv_eth"):
-    if is_configured():
-        _auto_tbrv_asset = "BTC" if _auto_pipeline_step == "tbrv_btc" else "ETH"
-        st.info(f"🔄📤 Auto pipeline — step 3/4: refreshing Time Based Realized "
-                f"Vol data for {_auto_tbrv_asset} and sending to Telegram…")
-        cache_lib.clear_all_caches()
-        st.session_state.pop(_SNAP_KEY, None)
-        st.session_state.pop(_UI_CACHE_KEY, None)
-    else:
-        # Shouldn't happen — the Home page button is disabled when Telegram
-        # isn't configured — but clear the flag rather than getting stuck.
-        st.session_state["auto_pipeline"] = None
-        st.session_state["auto_pipeline_started_at"] = None
+# One pass per selected asset ("tbrv:BTC", "tbrv:ETH", ...); blast.active_step
+# also clears the flag if Telegram isn't configured.
+_blast_step = blast.active_step("tbrv")
+_auto_tbrv_asset = _blast_step.asset if _blast_step is not None else None
+if _auto_tbrv_asset:
+    blast.banner(_blast_step, f"refreshing Time Based Realized Vol data for "
+                              f"{_auto_tbrv_asset} and sending to Telegram…")
+    cache_lib.clear_all_caches()
+    st.session_state.pop(_SNAP_KEY, None)
+    st.session_state.pop(_UI_CACHE_KEY, None)
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -1546,7 +1551,7 @@ with st.sidebar:
 
 if not compare_intervals:
     st.warning("Select at least one hedging frequency.")
-    st.stop()
+    blast.stop("tbrv", "no hedging frequency selected on the page")
 compare_intervals = sort_intervals_short_to_long(list(compare_intervals))
 lookbacks_to_run = list(LOOKBACK_OPTIONS)
 
@@ -1575,7 +1580,7 @@ detail_lookbacks = st.multiselect(
 )
 if not detail_lookbacks:
     st.warning("Select at least one detailed charts lookback.")
-    st.stop()
+    blast.stop("tbrv", "no detailed lookback selected on the page")
 
 # ---------------------------------------------------------------------------
 # Data loading — fetch once per interval at max lookback, slice for each lookback
@@ -1637,7 +1642,7 @@ with st.spinner("Loading comparison dataset from Deribit across selected frequen
 
 if not lookback_data:
     st.error("No successful datasets for any lookback window. Deribit may be unreachable right now.")
-    st.stop()
+    blast.stop("tbrv", f"{asset}: no data from Deribit")
 
 _live_intervals = [iv for iv in compare_intervals if should_use_live_bar(iv, use_live_bar)]
 if _live_intervals:
@@ -1814,61 +1819,83 @@ st.caption(
 # ---------------------------------------------------------------------------
 
 if send_tg:
+    # Manual button: everything. Home blast: only the selected pieces
+    # (lib/blast.py "tbrv.*" keys).
+    _want = blast.selected(_blast_step) if _auto_tbrv_asset else None
+
+    def _on(key: str) -> bool:
+        return _want is None or key in _want
+
+    _stats: Dict[str, Any] = {"sent": 0, "failed": []}
+
+    def _photo(png, caption):
+        if png and send_photo(png, caption=caption):
+            _stats["sent"] += 1
+            return True
+        _stats["failed"].append(caption)
+        return False
+
     with st.spinner("Sending report to Telegram…"):
         ok = True
-        send_message(
+        if _on("overview_text") and send_message(
             "📊 <b>Time Based Realized Vol — Overview</b>\n"
             f"Asset: <b>{asset}</b>\n"
             f"3D matrix metric: <b>{matrix_metric_label}</b>\n"
             f"Detailed lookbacks selected: <b>{', '.join(detail_candidates)}</b>"
-        )
-        png_cross = fx_style.fig_to_png(fig_cross)
-        ok = (bool(png_cross) and send_photo(png_cross, caption=f"TB RV — {asset} cross-lookback heatmap")) and ok
-        ok = send_decision_matrix_3d_to_telegram(
-            all_rows, asset, metric_col=matrix_metric_col, metric_label=matrix_metric_label,
-            caption=f"TB RV — {asset} 3D decision matrix",
-        ) and ok
+        ):
+            _stats["sent"] += 1
+        if _on("cross_heatmap"):
+            ok = _photo(fx_style.fig_to_png(fig_cross), f"TB RV — {asset} cross-lookback heatmap") and ok
+        if _on("matrix3d"):
+            _m_ok = send_decision_matrix_3d_to_telegram(
+                all_rows, asset, metric_col=matrix_metric_col, metric_label=matrix_metric_label,
+                caption=f"TB RV — {asset} 3D decision matrix",
+            )
+            if not _m_ok:
+                _stats["failed"].append(f"TB RV — {asset} 3D decision matrix")
+            ok = _m_ok and ok
 
-        if not rec_df.empty:
-            send_message(
+        if _on("recommendations") and not rec_df.empty:
+            if send_message(
                 "📋 <b>Overview recommendations (selected detailed lookbacks)</b>\n" +
                 "\n".join(
                     f"{row['Lookback']}: {row['Recommended interval']} "
                     f"(Composite {row['Composite RV (%)']:.2f}%, Forecast {row['Forecast next RV (%)']:.2f}%)"
                     for _, row in rec_df[rec_df["Lookback"].isin(detail_candidates)].iterrows()
                 )
-            )
+            ):
+                _stats["sent"] += 1
 
-        for lb in [x for x in detail_candidates if x in lookback_data]:
-            sdf = lookback_data[lb]["summary"]
-            an = lookback_data[lb]["analyses"]
-            sub_ok, _ = send_time_based_rv_report_to_telegram(
-                asset, lb, sdf,
-                [
-                    (fig_rolling_multi(an, asset, lb), f"TB RV — {asset} {lb} rolling comparison"),
-                    (fig_interval_bar(sdf, asset, lb), f"TB RV — {asset} {lb} interval ranking"),
-                    (fig_rolling_distribution_box(an, asset, lb), f"TB RV — {asset} {lb} rolling distribution"),
-                    (fig_metrics_heatmap(sdf, asset, lb), f"TB RV — {asset} {lb} metric heatmap"),
-                    (fig_forecast_bar(sdf, asset, lb), f"TB RV — {asset} {lb} forecast"),
-                    (fig_completeness_bar(sdf, asset), f"TB RV — {asset} {lb} completeness"),
-                    (fig_estimator_heatmap(sdf, asset, lb), f"TB RV — {asset} {lb} estimator heatmap"),
-                    (fig_estimator_grouped_bars(sdf, asset, lb), f"TB RV — {asset} {lb} estimator grouped bars"),
-                ],
-            )
-            ok = ok and sub_ok
+        _detail_keys = ("rolling", "ranking", "distribution", "metric_heatmap", "forecast",
+                        "completeness", "estimator_heatmap", "estimator_bars")
+        if _on("detail_text") or any(_on(k) for k in _detail_keys):
+            for lb in [x for x in detail_candidates if x in lookback_data]:
+                sdf = lookback_data[lb]["summary"]
+                an = lookback_data[lb]["analyses"]
+                _builders = {
+                    "rolling": (lambda: fig_rolling_multi(an, asset, lb), f"TB RV — {asset} {lb} rolling comparison"),
+                    "ranking": (lambda: fig_interval_bar(sdf, asset, lb), f"TB RV — {asset} {lb} interval ranking"),
+                    "distribution": (lambda: fig_rolling_distribution_box(an, asset, lb), f"TB RV — {asset} {lb} rolling distribution"),
+                    "metric_heatmap": (lambda: fig_metrics_heatmap(sdf, asset, lb), f"TB RV — {asset} {lb} metric heatmap"),
+                    "forecast": (lambda: fig_forecast_bar(sdf, asset, lb), f"TB RV — {asset} {lb} forecast"),
+                    "completeness": (lambda: fig_completeness_bar(sdf, asset), f"TB RV — {asset} {lb} completeness"),
+                    "estimator_heatmap": (lambda: fig_estimator_heatmap(sdf, asset, lb), f"TB RV — {asset} {lb} estimator heatmap"),
+                    "estimator_bars": (lambda: fig_estimator_grouped_bars(sdf, asset, lb), f"TB RV — {asset} {lb} estimator grouped bars"),
+                }
+                sub_ok, _ = send_time_based_rv_report_to_telegram(
+                    asset, lb, sdf,
+                    [(build(), name) for k, (build, name) in _builders.items() if _on(k)],
+                    send_text=_on("detail_text"), stats=_stats,
+                )
+                ok = ok and sub_ok
     if ok:
         st.success("Report sent to Telegram")
     else:
         st.error("One or more lookback reports failed to send")
 
 if _auto_tbrv_asset:
-    if _auto_pipeline_step == "tbrv_btc":
-        st.session_state["auto_pipeline"] = "tbrv_eth"
-        st.rerun()
-    else:
-        # Hand off to Spot Vol Correlation (keep started_at for chain timeout).
-        st.session_state["auto_pipeline"] = "spot_vol"
-        st.switch_page("pages/08_Spot_Vol_Correlation.py")
+    # Next asset's pass (same page -> rerun) or the next page.
+    blast.finish(_blast_step, _stats["sent"], _stats["failed"])
 
 # ---------------------------------------------------------------------------
 # Footer

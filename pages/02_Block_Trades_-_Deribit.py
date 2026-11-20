@@ -25,6 +25,7 @@ import plotly.graph_objects as go
 from scipy.stats import norm
 import streamlit as st
 
+from lib import blast, freshness
 from lib import cache as cache_lib
 from lib import deribit
 from lib import fx_style
@@ -36,6 +37,8 @@ from lib.flow_summary import DERIBIT_EXTRA_MIN_SIZES
 # ---------------------------------------------------------------------------
 # Page Config & Styles
 # ---------------------------------------------------------------------------
+freshness.reload_if_changed(blast)
+
 st.set_page_config(
     page_title="Block Trades — Deribit",
     page_icon="📊",
@@ -197,17 +200,13 @@ with st.sidebar:
 if cache_lib.expire_stale_auto_pipeline():
     st.caption("Auto pipeline timed out after 15 minutes and was cleared.")
 
-_auto_pipeline_active = (st.session_state.get("auto_pipeline") == "block_trades"
-                         and telegram.is_configured())
+# blast.active_step also clears the flag if Telegram isn't configured.
+_blast_step = blast.active_step("bt_deribit")
+_auto_pipeline_active = _blast_step is not None
 if _auto_pipeline_active:
-    st.info("🔄📤 Auto pipeline — step 2/4: refreshing Block Trades data for "
-            "BTC/ETH and sending to Telegram…")
+    blast.banner(_blast_step, "refreshing Block Trades data and sending the selected "
+                              "charts to Telegram…")
     cache_lib.clear_all_caches()
-elif st.session_state.get("auto_pipeline") == "block_trades":
-    # Shouldn't happen — the Home page button is disabled when Telegram
-    # isn't configured — but clear the flag rather than getting stuck.
-    st.session_state["auto_pipeline"] = None
-    st.session_state["auto_pipeline_started_at"] = None
 
 # ---------------------------------------------------------------------------
 # API Fetching Helpers
@@ -1265,14 +1264,14 @@ def _send_chart_to_telegram(fig, caption_base: str):
         return True, None
     return False, f"{caption_base}: failed to **send**"
 
-def _send_many_to_telegram(fig_label_pairs: list, label: str) -> None:
+def _send_many_to_telegram(fig_label_pairs: list, label: str) -> tuple[int, list]:
     """Send a batch of (clean_asset_name, fig) pairs to Telegram with a
     progress bar and a success/failure summary - shared by the toolbar's
     per-asset, BTC+ETH, and All buttons so there's one code path instead
     of three copies (mirrors 01_MCM_Bot.py's _send_to_telegram)."""
     if not fig_label_pairs:
         st.warning(f"Nothing to send for {label}.")
-        return
+        return 0, []
     total_sent = total_failed = 0
     all_reasons: list = []
     progress = st.progress(0.0) if len(fig_label_pairs) > 1 else None
@@ -1307,6 +1306,7 @@ def _send_many_to_telegram(fig_label_pairs: list, label: str) -> None:
                 "or didn't receive it.")
             for r in all_reasons:
                 st.markdown(f"- {r}")
+    return total_sent, all_reasons
 
 # ---------------------------------------------------------------------------
 # Data Pipeline & Tab Rendering
@@ -1413,7 +1413,7 @@ with _tg_box:
     send_btc_eth_clicked = st.button(
         "🖼️ BTC+ETH", key="tg_send_btc_eth", width="stretch",
         disabled=not _tg_configured or not _BTC_ETH,
-        help=f"Send BTC and ETH's charts to Telegram ({CHARTS_PER_ASSET * 2} charts).") or _auto_pipeline_active
+        help=f"Send BTC and ETH's charts to Telegram ({CHARTS_PER_ASSET * 2} charts).")
     send_all_clicked = st.button(
         "📤 All", key="tg_send_all", width="stretch",
         disabled=not _tg_configured,
@@ -1537,10 +1537,22 @@ if send_btc_eth_clicked and _BTC_ETH:
 if send_all_clicked:
     _send_many_to_telegram(_figs_for(ASSETS), "all assets")
 
+# Chart order in asset_figs_dict, as Home blast selector keys (lib/blast.py
+# "bt.chart.*"). Same order as lib/block_flow.CHART_KEYS.
+BLAST_CHART_KEYS = ("scatter", "strike_expiry", "net_heatmap", "gross_heatmap", "cumulative",
+                    "iv_surface", "term_flow", "put_call", "delta_term", "vega_expiry",
+                    "vega_strike", "vega_expiry_w", "vega_strike_w", "aggression")
+
 if _auto_pipeline_active:
-    st.session_state["auto_pipeline"] = "tbrv_btc"
-    # keep auto_pipeline_started_at — timeout covers the whole chain
-    st.switch_page("pages/06_Time_Based_Realized_Vol.py")
+    # Home blast: the selected chart types for the selected assets (SOL/HYPE
+    # are the USDC-settled books here), then on to the next page.
+    _want = blast.selected(_blast_step)
+    _bt_assets = [a for a in ASSETS
+                  if a.replace('_USDC', '') in blast.assets_for(_blast_step)]
+    _pairs = [(a.replace('_USDC', ''), fig) for a in _bt_assets
+              for k, fig in zip(BLAST_CHART_KEYS, asset_figs_dict[a]) if k in _want]
+    _sent, _reasons = _send_many_to_telegram(_pairs, ", ".join(a.replace('_USDC', '') for a in _bt_assets))
+    blast.finish(_blast_step, _sent, _reasons)
 
 # ---------------------------------------------------------------------------
 # Render ALL (2x2 Grid) Tab

@@ -62,6 +62,9 @@ from lib.constants import PLOTLY_LAYOUT
 from lib import fx_style
 from lib import cache as cache_lib
 from lib.telegram import send_message, send_photo, is_configured
+from lib import blast, freshness
+
+freshness.reload_if_changed(blast)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -821,7 +824,12 @@ def _send_chart(fig: go.Figure | None, caption: str) -> bool:
 
 
 def send_asset_report_to_telegram(asset: str, event_keys: tuple[str, ...], event_label: str, timeframe: str,
-                                   spider_pre_h: int, spider_post_h: int, bloomberg_span: str) -> tuple[int, list[str]]:
+                                   spider_pre_h: int, spider_post_h: int, bloomberg_span: str,
+                                   only: set | None = None) -> tuple[int, list[str]]:
+    """Summary message + charts for one asset. ``only`` = Home blast selection
+    (lib/blast.py "macro.*" keys); None = everything."""
+    def _on(key: str) -> bool:
+        return only is None or key in only
     window_minutes = macro.TIMEFRAME_MINUTES[timeframe]
     bloomberg_minutes = BLOOMBERG_SPAN_MINUTES[bloomberg_span]
     window_before_h = max(4, spider_pre_h)
@@ -834,37 +842,48 @@ def send_asset_report_to_telegram(asset: str, event_keys: tuple[str, ...], event
     ohlc_by_event = fetch_ohlc_by_event_cached(asset, event_keys, window_before_h, window_after_h)
 
     kpis = macro.summary_kpis(impact)
-    send_message(
-        f"📅 <b>Macro Event Impact – {asset}</b>\n\n"
-        f"Events compared: {kpis.get('events', 0)}\n"
-        f"Avg |Actual Move| ({timeframe}): {kpis.get('avg_abs_actual', float('nan')):.2f}%\n"
-        f"Avg Implied Move: {kpis.get('avg_implied', float('nan')):.2f}%\n"
-        f"Expectation alignment: {kpis.get('aligned_pct', float('nan')):.1f}%"
-    )
+    sent, failed = 0, []
+    if _on("summary"):
+        if send_message(
+            f"📅 <b>Macro Event Impact – {asset}</b>\n\n"
+            f"Events compared: {kpis.get('events', 0)}\n"
+            f"Avg |Actual Move| ({timeframe}): {kpis.get('avg_abs_actual', float('nan')):.2f}%\n"
+            f"Avg Implied Move: {kpis.get('avg_implied', float('nan')):.2f}%\n"
+            f"Expectation alignment: {kpis.get('aligned_pct', float('nan')):.1f}%"
+        ):
+            sent += 1
+        else:
+            failed.append(f"{asset} - summary message")
 
     sel_ts = [pd.Timestamp(t) for t in events["release_time_utc"]] if not events.empty else []
     timeline_fig = None
-    if sel_ts:
+    if sel_ts and _on("timeline"):
         timeline_start = min(sel_ts) - pd.Timedelta(days=7)
         timeline_end = max(pd.Timestamp.now(tz=UTC), max(sel_ts)) + pd.Timedelta(days=3)
         daily_ohlc = macro.fetch_daily_ohlc_range(asset, int(timeline_start.timestamp() * 1000), int(timeline_end.timestamp() * 1000))
         timeline_fig = chart_event_timeline_candles(daily_ohlc, events, asset, event_label)
 
     charts = [
-        (timeline_fig, f"{asset} - Price Timeline"),
-        (chart_bloomberg_reaction(events, ohlc_by_event, bloomberg_minutes, bloomberg_span, event_label, asset), f"{asset} - Bloomberg Reaction"),
-        (chart_event_spider(events, ohlc_by_event, spider_pre_h, spider_post_h), f"{asset} - Path Comparison"),
-        (chart_scatter_z_vs_actual(impact, timeframe), f"{asset} - Z-Score vs Actual Move"),
-        (chart_bar_actual_vs_implied(impact), f"{asset} - Actual vs Implied Move"),
-        (chart_dvol_crush(impact), f"{asset} - DVOL Crush"),
-        (chart_asymmetry(impact), f"{asset} - Asymmetry"),
-        (chart_distribution(impact), f"{asset} - Distribution"),
-        (chart_move_ratio_over_time(impact), f"{asset} - Move Ratio Over Time"),
-        (chart_decision_vs_expectations(impact, timeframe), f"{asset} - Decision vs Expectations"),
-        (chart_path_dependency(impact, timeframe), f"{asset} - Path Diagnostics"),
+        ("timeline", lambda: timeline_fig, f"{asset} - Price Timeline"),
+        ("bloomberg", lambda: chart_bloomberg_reaction(events, ohlc_by_event, bloomberg_minutes, bloomberg_span, event_label, asset), f"{asset} - Bloomberg Reaction"),
+        ("spider", lambda: chart_event_spider(events, ohlc_by_event, spider_pre_h, spider_post_h), f"{asset} - Path Comparison"),
+        ("z_scatter", lambda: chart_scatter_z_vs_actual(impact, timeframe), f"{asset} - Z-Score vs Actual Move"),
+        ("actual_implied", lambda: chart_bar_actual_vs_implied(impact), f"{asset} - Actual vs Implied Move"),
+        ("dvol_crush", lambda: chart_dvol_crush(impact), f"{asset} - DVOL Crush"),
+        ("asymmetry", lambda: chart_asymmetry(impact), f"{asset} - Asymmetry"),
+        ("distribution", lambda: chart_distribution(impact), f"{asset} - Distribution"),
+        ("move_ratio", lambda: chart_move_ratio_over_time(impact), f"{asset} - Move Ratio Over Time"),
+        ("decision", lambda: chart_decision_vs_expectations(impact, timeframe), f"{asset} - Decision vs Expectations"),
+        ("path_diag", lambda: chart_path_dependency(impact, timeframe), f"{asset} - Path Diagnostics"),
     ]
-    sent, failed = 0, []
-    for fig, name in charts:
+    for key, build, name in charts:
+        if not _on(key):
+            continue
+        try:
+            fig = build()
+        except Exception:
+            failed.append(f"{name} (build)")
+            continue
         if fig is None:
             continue
         if _send_chart(fig, name):
@@ -875,10 +894,12 @@ def send_asset_report_to_telegram(asset: str, event_keys: tuple[str, ...], event
 
 
 def send_all_reports_to_telegram(event_keys: tuple[str, ...], event_label: str, timeframe: str,
-                                  spider_pre_h: int, spider_post_h: int, bloomberg_span: str) -> tuple[int, list[str]]:
+                                  spider_pre_h: int, spider_post_h: int, bloomberg_span: str,
+                                  assets: list | None = None,
+                                  only: set | None = None) -> tuple[int, list[str]]:
     total_sent, total_failed = 0, []
-    for asset in macro.MACRO_ASSETS:
-        sent, failed = send_asset_report_to_telegram(asset, event_keys, event_label, timeframe, spider_pre_h, spider_post_h, bloomberg_span)
+    for asset in (assets or macro.MACRO_ASSETS):
+        sent, failed = send_asset_report_to_telegram(asset, event_keys, event_label, timeframe, spider_pre_h, spider_post_h, bloomberg_span, only=only)
         total_sent += sent
         total_failed.extend(failed)
     return total_sent, total_failed
@@ -928,9 +949,15 @@ def main() -> None:
 
     st.markdown("---")
 
+    _blast_step = blast.active_step("macro")   # Home chart blast; clears the flag if Telegram isn't set up
+    if _blast_step is not None:
+        blast.banner(_blast_step)
+        cache_lib.clear_all_caches()
+
     cal = _load_calendar()
     if cal is None or cal.empty:
         st.error(f"❌ Could not load the macro events calendar from `{CSV_PATH.name}`.")
+        blast.abort("macro", "macro events calendar unavailable")
         return
 
     event_types_all = sorted(cal["event"].unique().tolist())
@@ -943,11 +970,13 @@ def main() -> None:
 
     if not event_types:
         st.warning("Select at least one event type.")
+        blast.abort("macro", "no event type selected on the page")
         return
 
     candidates = _candidate_events(event_types)  # most recent first
     if candidates.empty:
         st.warning("No past events match the selected event type(s).")
+        blast.abort("macro", "no past events match")
         return
     n_recent = st.number_input(
         f"Number of recent events ({len(candidates)} match the type filter above)",
@@ -969,6 +998,18 @@ def main() -> None:
 
     st.caption(f"📅 Last updated: {datetime.now():%Y-%m-%d %H:%M:%S} — {len(picked)} event(s) selected")
     st.markdown("---")
+
+    if _blast_step is not None:
+        # The page's settings (on a fresh visit: the defaults — every event
+        # type, last 5 releases, 1h reaction) drive what's sent.
+        try:
+            with st.spinner("Sending Macro Event Impact reports…"):
+                _sent, _failed = send_all_reports_to_telegram(
+                    event_keys, event_label, timeframe, spider_pre_h, spider_post_h, bloomberg_span,
+                    assets=blast.assets_for(_blast_step), only=blast.selected(_blast_step))
+        except Exception as _exc:  # never leave the flag stuck on a build error
+            _sent, _failed = 0, [f"Macro Event Impact failed: {_exc}"]
+        blast.finish(_blast_step, _sent, _failed)
 
     now_utc = pd.Timestamp.now(tz=UTC)
     future = cal[(cal["event"].isin(event_types)) & (cal["release_time_utc"] > now_utc)].sort_values("date")

@@ -17,6 +17,9 @@ from lib.constants import ASSET_CONFIG, ASSETS
 from lib.telegram import is_configured
 from lib import cache as cache_lib
 from lib import commands as cmdreg
+from lib import blast, freshness
+
+freshness.reload_if_changed(blast)
 
 st.set_page_config(
     page_title="MCM Analytics",
@@ -126,28 +129,151 @@ if cache_lib.expire_stale_auto_pipeline():
                "you can start it again.")
 
 _tg_ready = is_configured()
-_pipeline_running = st.session_state.get("auto_pipeline") is not None
+_pipeline_running = blast.running()
+
+# --- Report selector -------------------------------------------------------
+# The canonical selection lives in non-widget keys (``blast_sel_items`` /
+# ``blast_sel_assets``) because Streamlit drops a widget's state when you
+# leave the page; the checkboxes are re-seeded from it on every run. A fresh
+# session starts from the saved default (💾 below) or, if none, from exactly
+# what this button sent before the selector existed.
+_SEL, _SEL_A = "blast_sel_items", "blast_sel_assets"
+if _SEL not in st.session_state:
+    _saved = blast.load_saved()
+    st.session_state[_SEL] = set(_saved[0]) if _saved else blast.default_items()
+    st.session_state[_SEL_A] = list(_saved[1]) if _saved else list(blast.DEFAULT_ASSETS)
+
+
+def _cb_key(item_key: str) -> str:
+    return f"blast_cb::{item_key}"
+
+
+def _asset_key(asset: str) -> str:
+    return f"blast_asset::{asset}"
+
+
+def _apply(items=None, assets=None) -> None:
+    """Set the selection (and the widgets showing it) from a button callback."""
+    if items is not None:
+        st.session_state[_SEL] = set(items)
+        for it in blast.ITEMS:
+            st.session_state[_cb_key(it.key)] = it.key in st.session_state[_SEL]
+    if assets is not None:
+        st.session_state[_SEL_A] = list(assets)
+        for a in blast.ALL_ASSETS:
+            st.session_state[_asset_key(a)] = a in assets
+
+
+def _set_group(keys, on: bool) -> None:
+    cur = set(st.session_state[_SEL])
+    _apply(cur | set(keys) if on else cur - set(keys))
+
+
+def _save_default() -> None:
+    ok = blast.save(st.session_state[_SEL], st.session_state[_SEL_A])
+    st.session_state["blast_saved_msg"] = ("💾 Saved — new sessions (including the scheduled runs) start "
+                                           "from this selection." if ok else "Couldn't save the selection.")
+
+
+def _reset_default() -> None:
+    blast.forget_saved()
+    _apply(blast.default_items(), blast.DEFAULT_ASSETS)
+    st.session_state["blast_saved_msg"] = "↩️ Back to the standard pipeline selection (saved default removed)."
+
+
+for _it in blast.ITEMS:
+    st.session_state.setdefault(_cb_key(_it.key), _it.key in st.session_state[_SEL])
+for _a in blast.ALL_ASSETS:
+    st.session_state.setdefault(_asset_key(_a), _a in st.session_state[_SEL_A])
+
+st.markdown("**Reports to send** — tick what the button below sends. Pages run in app order "
+            "(MCM Bot → Block Trades → Time Based RV → Regime → Spot-Vol → Macro → Fear & Greed → "
+            "IBIT → Ecoinometrics); pages with nothing ticked are skipped.")
+_ac = st.columns([1, 1, 1, 1, 4])
+for _col, _a in zip(_ac, blast.ALL_ASSETS):
+    _col.checkbox(_a, key=_asset_key(_a), disabled=_pipeline_running)
+_ac[4].caption("Assets (pages that don't support an asset skip it; Regime and Macro are BTC/ETH only; "
+               "IBIT and Ecoinometrics aren't asset-specific).")
+
+_bc = st.columns(4)
+_bc[0].button("☑️ Select all", key="blast_all", width="stretch", disabled=_pipeline_running,
+              on_click=_apply, kwargs={"items": [i.key for i in blast.ITEMS]})
+_bc[1].button("⬜ Clear all", key="blast_none", width="stretch", disabled=_pipeline_running,
+              on_click=_apply, kwargs={"items": []})
+_bc[2].button("↩️ Standard pipeline", key="blast_reset", width="stretch", disabled=_pipeline_running,
+              on_click=_reset_default,
+              help="MCM Bot (all commands), Block Trades — Deribit, Time Based RV and Spot-Vol "
+                   "Correlation for BTC/ETH: what this button always sent. Also removes a saved default.")
+_bc[3].button("💾 Save as default", key="blast_save", width="stretch", disabled=_pipeline_running,
+              on_click=_save_default,
+              help="New sessions (e.g. the 7 AM / 7 PM scheduled click) start from this selection. "
+                   "Kept until the app restarts or redeploys, then it's back to the standard pipeline.")
+if st.session_state.get("blast_saved_msg"):
+    st.caption(st.session_state.pop("blast_saved_msg"))
+
+for _gid, _gtitle, _subs in blast.GROUPS:
+    _gkeys = [it.key for _, its in _subs for it in its]
+    with st.expander(_gtitle):
+        _gc = st.columns([1, 1, 4])
+        _gc[0].button("Select all", key=f"blast_gall_{_gid}", width="stretch", disabled=_pipeline_running,
+                      on_click=_set_group, args=(_gkeys, True))
+        _gc[1].button("Clear", key=f"blast_gnone_{_gid}", width="stretch", disabled=_pipeline_running,
+                      on_click=_set_group, args=(_gkeys, False))
+        for _stitle, _its in _subs:
+            _sc = st.columns([5, 1, 1])
+            _sc[0].markdown(f"*{_stitle}*")
+            _skeys = [it.key for it in _its]
+            _sc[1].button("All", key=f"blast_sall_{_gid}_{_stitle}", width="stretch",
+                          disabled=_pipeline_running, on_click=_set_group, args=(_skeys, True))
+            _sc[2].button("None", key=f"blast_snone_{_gid}_{_stitle}", width="stretch",
+                          disabled=_pipeline_running, on_click=_set_group, args=(_skeys, False))
+            _cols = st.columns(3)
+            for _i, _it in enumerate(_its):
+                _cols[_i % 3].checkbox(_it.label, key=_cb_key(_it.key), disabled=_pipeline_running)
+
+# Widgets -> canonical selection.
+st.session_state[_SEL] = {it.key for it in blast.ITEMS if st.session_state.get(_cb_key(it.key))}
+st.session_state[_SEL_A] = [a for a in blast.ALL_ASSETS if st.session_state.get(_asset_key(a))]
+_items, _assets = st.session_state[_SEL], st.session_state[_SEL_A]
+_steps, _skipped = blast.build_plan(_items, _assets)
+
+_counts = []
+for _gid, _gtitle, _subs in blast.GROUPS:
+    _gk = [it.key for _, its in _subs for it in its]
+    _n = sum(k in _items for k in _gk)
+    if _n:
+        _counts.append(f"{_gtitle.split(' ', 1)[1]} {_n}/{len(_gk)}")
+st.caption("Selected: " + (" · ".join(_counts) if _counts else "nothing")
+           + f" — assets: {', '.join(_assets) or 'none'} — {len(_steps)} page step(s)."
+           + (f" Skipped: {'; '.join(_skipped)}." if _skipped else ""))
+
 if st.button(
-    "🔄📤 Refresh BTC/ETH & send to Telegram (MCM Bot → Block Trades → Time Based RV → Spot Vol Correlation)",
+    blast.BUTTON_LABEL,
+    key="blast_go",
     width="stretch",
     type="primary",
-    disabled=not _tg_ready or _pipeline_running,
-    help="Clears cached data and re-runs every MCM Bot command for BTC and "
-         "ETH, sends those reports to Telegram, then does the same for the "
-         "Block Trades — Deribit page's BTC and ETH charts, then the Time "
-         "Based Realized Vol page's BTC and ETH reports, then Spot Vol "
-         "Correlation BTC/ETH Telegram reports as the final step. Takes "
-         "several minutes — you'll land on each page as its step runs.",
+    disabled=not _tg_ready or _pipeline_running or not _steps,
+    help="Clears cached data on each page it visits, re-runs the selected reports and sends them "
+         "to Telegram one page at a time, in app order (by default: every MCM Bot command, the "
+         "Block Trades — Deribit charts, the Time Based Realized Vol report, then Spot Vol "
+         "Correlation, for BTC and ETH). Takes several minutes — you'll land on each page as its "
+         "step runs, and the last page shows a summary of what was sent and what failed.",
 ):
-    st.session_state["auto_pipeline"] = "mcm_bot"
-    st.session_state["auto_pipeline_started_at"] = datetime.now(timezone.utc)
-    st.switch_page("pages/01_MCM_Bot.py")
+    _first = blast.start(_items, _assets)
+    if _first:
+        st.switch_page(_first)
 
 if not _tg_ready:
     st.caption("Configure Telegram (see secrets.toml.example) to enable this.")
 elif _pipeline_running:
     st.caption("Auto pipeline running — Home button disabled until it finishes "
-               "or times out (15 min).")
+               "or a step times out (15 min).")
+elif not _steps:
+    st.caption("Nothing to send — tick at least one report and an asset it supports "
+               "(Block Trades needs a venue and at least one chart).")
+
+if not _pipeline_running and st.session_state.get(blast.SUMMARY):
+    blast.render_summary(st.session_state[blast.SUMMARY], heading="Last chart blast")
 
 # ---------------------------------------------------------------------------
 # Navigation
