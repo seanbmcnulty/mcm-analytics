@@ -8,10 +8,6 @@ from pathlib import Path
 
 # Ensure lib/ is importable
 sys.path.insert(0, str(Path(__file__).parent))
-from lib import auth as _auth, freshness as _fresh  # noqa: E402
-_fresh.reload_if_changed(_auth)  # pick up a changed gate after a Cloud redeploy
-from lib.auth import require_password  # noqa: E402
-require_password()  # site password gate: before anything renders
 
 import streamlit as st
 from datetime import datetime, timezone
