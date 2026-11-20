@@ -165,6 +165,9 @@ CASES = {
     "bt_deribit": ({"bt.venue.deribit", "bt.chart.scatter", "bt.chart.put_call"}, ["BTC"],
                    lambda s: len(s) == 2),
     "bt_okx": ({"bt.venue.okx", "bt.chart.scatter"}, ["BTC", "ETH"], lambda s: len(s) <= 2),
+    # opt-in "won vs market" chart: sent only when Paradex read-only keys are configured (0 sends otherwise)
+    "bt_paradex": ({"bt.venue.paradex", "bt.chart.won"}, ["BTC"],
+                   lambda s: len(s) <= 1 and all("Won vs Market" in c for _, c in s)),
     "tbrv": ({"tbrv.overview_text", "tbrv.cross_heatmap"}, ["BTC"],
              lambda s: [k for k, _ in s] == ["msg", "photo"]),
     "regime": ({"regime.summary", "regime.gauge"}, ["BTC"], lambda s: [k for k, _ in s] == ["msg", "photo"]),

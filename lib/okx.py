@@ -44,6 +44,8 @@ import numpy as np
 import pandas as pd
 import requests
 
+from lib import own_trades
+
 API_BASE = "https://www.okx.com/api/v5"
 SGT = timezone(timedelta(hours=8))
 
@@ -364,6 +366,8 @@ class _Venue:
     fetch_spot = staticmethod(fetch_spot)
     fetch_hist_spot = staticmethod(fetch_hist_spot)
     feed_status = staticmethod(feed_status)
+    # Our own block trades (read-only private API) for the won-vs-market view; public-only without keys.
+    fetch_own = staticmethod(lambda start_ms, end_ms: own_trades.okx_fetch_own(start_ms, end_ms))
 
     @staticmethod
     def _render_vol_compare():

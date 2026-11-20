@@ -34,8 +34,11 @@ def test_mcm_items_cover_every_command():
 
 def test_block_trade_chart_keys_match_pages():
     from lib import block_flow
-    reg = tuple(it.short for it in blast.ITEMS if it.page == "bt")
+    reg = tuple(it.short for it in blast.ITEMS if it.page == "bt" and it.short not in block_flow.OWN_CHART_KEYS)
     assert reg == block_flow.CHART_KEYS
+    own = tuple(it.short for it in blast.ITEMS if it.page == "bt" and it.short in block_flow.OWN_CHART_KEYS)
+    assert own == block_flow.OWN_CHART_KEYS
+    assert not any(it.default for it in blast.ITEMS if it.key == "bt.chart.won")   # private data: opt-in
     m = re.search(r"BLAST_CHART_KEYS = \((.*?)\)", _src("pages/02_Block_Trades_-_Deribit.py"), re.S)
     assert tuple(re.findall(r'"(\w+)"', m.group(1))) == reg
 
@@ -80,7 +83,8 @@ def test_every_page_has_a_hook():
     for pid, meta in blast.PAGES.items():
         if pid.startswith("bt_") and pid != "bt_deribit":
             src = _src(meta.path)
-            assert "block_flow.render_page" in src and "freshness.reload_if_changed(blast, block_flow)" in src
+            assert "block_flow.render_page" in src
+            assert re.search(r"freshness\.reload_if_changed\((\w+, )*blast, block_flow\)", src), pid
             continue
         src = _src(meta.path)
         assert f'blast.active_step("{pid}")' in src, pid

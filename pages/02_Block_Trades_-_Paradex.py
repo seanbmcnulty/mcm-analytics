@@ -11,10 +11,10 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from lib import blast, block_flow, freshness, paradex
+from lib import blast, block_flow, freshness, own_trades, paradex
 
 # Pick up a changed lib.block_flow / lib.blast after a Cloud redeploy (old code
 # stays in memory otherwise, and the Home chart blast hook would be missing).
-freshness.reload_if_changed(blast, block_flow)
+freshness.reload_if_changed(own_trades, paradex, blast, block_flow)
 
 block_flow.render_page(paradex.VENUE)
