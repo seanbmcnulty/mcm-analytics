@@ -118,7 +118,8 @@ missing = [k for k in vl.PREDICTORS if k not in panel or panel[k].notna().sum() 
 if missing:
     st.info("Not available right now (left out of the ranking): "
             + ", ".join(vl.PREDICTORS[k] for k in missing)
-            + ". Try that source's refresh button.")
+            + (". FRED often times out from Streamlit Cloud; the weekly GitHub Action fills data/vl_fred.csv."
+               if "HY_OAS" in missing else ". Try that source's refresh button."))
 
 full = vl.asset_frame(panel, asset)
 years = {"All (since Mar 2021)": None, "3 years": 3, "2 years": 2}[lookback]
@@ -209,15 +210,17 @@ else:
     c[4].metric("DVOL / VIX", f"{r['ratio_vix']:.2f}x",
                 f"{vl.ordinal(r['ratio_vix_pct_1y'])} pct 1y" if np.isfinite(r["ratio_vix_pct_1y"]) else None,
                 delta_color="off")
-    comp = pd.DataFrame([
-        {"Component": "Fair-value residual (vols)", "Reading": r["resid"], "z": r["resid_z"],
-         "Pct 1y": np.nan, "Pct 3y": np.nan},
-        {"Component": "DVOL / VIX", "Reading": r["ratio_vix"], "z": r["ratio_vix_z"],
-         "Pct 1y": r["ratio_vix_pct_1y"], "Pct 3y": r["ratio_vix_pct_3y"]},
-    ] + ([{"Component": "DVOL / MOVE", "Reading": r["ratio_move"], "z": r["ratio_move_z"],
-           "Pct 1y": r["ratio_move_pct_1y"], "Pct 3y": r["ratio_move_pct_3y"]}] if "ratio_move" in r else []))
-    st.dataframe(comp.style.format({"Reading": "{:.2f}", "z": "{:+.2f}", "Pct 1y": "{:.0f}", "Pct 3y": "{:.0f}"},
-                                   na_rep="—"), hide_index=True, width="stretch")
+    def _f(v, fmt):
+        return fmt.format(v) if v is not None and np.isfinite(v) else "—"
+
+    _rows = [("Fair-value residual (vols)", r["resid"], r["resid_z"], None, None),
+             ("DVOL / VIX", r["ratio_vix"], r["ratio_vix_z"], r["ratio_vix_pct_1y"], r["ratio_vix_pct_3y"])]
+    if "ratio_move" in r:
+        _rows.append(("DVOL / MOVE", r["ratio_move"], r["ratio_move_z"], r["ratio_move_pct_1y"], r["ratio_move_pct_3y"]))
+    comp = pd.DataFrame([{"Component": n, "Reading": _f(a, "{:+.2f}" if i == 0 else "{:.3f}"), "z": _f(b, "{:+.2f}"),
+                          "Percentile 1y": _f(c1, "{:.0f}"), "Percentile 3y": _f(c3, "{:.0f}")}
+                         for i, (n, a, b, c1, c3) in enumerate(_rows)])
+    st.dataframe(comp, hide_index=True, width="stretch")
     show(vlc.rich_cheap(df, rc, asset), "rich_cheap")
     cq1, cq2 = st.columns([3, 2])
     with cq1:
