@@ -20,6 +20,8 @@ while Deribit is live -- the banner at the top says how old the data is.
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from lib import auth as _auth, freshness as _fresh  # noqa: E402
+_fresh.reload_if_changed(_auth)  # pick up a changed gate after a Cloud redeploy
 from lib.auth import require_password  # noqa: E402
 require_password()  # site password gate: before anything renders
 
