@@ -161,6 +161,9 @@ GROUPS = [
             ("vega_strike_w", "30d-weighted vega by strike"),
             ("aggression", "Cumulative aggression (not Binance/Bullish/Paradex)"),
         ], prefix="bt.chart")),
+        ("Our trades (OKX & Paradex, needs their read-only API keys)", _items("bt", False, [
+            ("won", "Blocks won vs market"),
+        ], prefix="bt.chart")),
     ]),
     ("tbrv", "⏱️ Time Based Realized Vol", [
         ("Overview (all lookbacks)", _items("tbrv", True, [

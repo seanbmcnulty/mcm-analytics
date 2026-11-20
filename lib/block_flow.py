@@ -14,6 +14,8 @@ string, shown as a warning at the top of the page):
     fetch_spot(asset) -> float
     fetch_hist_spot(asset, start_ms, end_ms) -> DataFrame[timestamp (SGT), close]
     feed_status(meta) -> Optional[str]
+    fetch_own(start_ms, end_ms) -> dict   (optional; lib.own_trades — our own block trades, read-only
+                                           private API, for the "won vs market" view)
 
 Trade frames use one schema (all USD-quoted, USDC-settled, linear options):
     timestamp (SGT tz-aware), instrument_name, strike, expiry, option_type ('C'/'P'),
@@ -241,11 +243,15 @@ def build_packages(df: pd.DataFrame) -> pd.DataFrame:
             "Net vega $": g["dollar_vega"].sum(),
             "Gross premium $": g["abs_premium_usd"].sum(),
             "Perp hedge": g["hedge_size"].iloc[0] if "hedge_size" in g else 0.0,
+            "Won": ("🏆 won" if g["won"].any() else "ours (taker)" if g["ours"].any() else "")
+                   if "won" in g else None,
             "_t": g["timestamp"].min(),
         })
     out = pd.DataFrame(rows).sort_values("_t", ascending=False).drop(columns="_t")
     if not (out["Perp hedge"] != 0).any():
         out = out.drop(columns="Perp hedge")  # venue gives no hedge legs (or none in window)
+    if out["Won"].isna().all():
+        out = out.drop(columns="Won")         # no own-trade data for this venue
     return out.reset_index(drop=True)
 
 
@@ -526,6 +532,78 @@ CHART_KEYS = ("scatter", "strike_expiry", "net_heatmap", "gross_heatmap", "cumul
               "vega_strike", "vega_expiry_w", "vega_strike_w", "aggression")
 
 
+# Opt-in blast item (lib/blast.py "bt.chart.won"): only venues with a fetch_own hook (OKX, Paradex)
+# and only when their API keys are configured.
+OWN_CHART_KEYS = ("won",)
+WON_GOLD = "#D4A017"
+
+
+def tag_own(df: pd.DataFrame, own: dict) -> pd.DataFrame:
+    """Add ``ours`` (any role) and ``won`` (we were the maker = our quote won the ticket) by block id."""
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    role = d["block_id"].map(own or {}) if "block_id" in d else pd.Series(None, index=d.index)
+    d["ours"] = role.notna()
+    d["won"] = role.eq("maker")
+    return d
+
+
+def own_summary(data: dict) -> dict:
+    """Block and premium counts, ours vs the whole public tape, across the given frames."""
+    n = n_won = n_ours = 0
+    prem = prem_won = 0.0
+    for df in data.values():
+        if df is None or df.empty:
+            continue
+        pk = df.assign(_pkg=df["block_id"].where(df["block_id"].notna(), df.get("trade_id")))
+        n += pk["_pkg"].nunique()
+        prem += float(df["abs_premium_usd"].sum())
+        if "won" in df:
+            n_won += pk.loc[pk["won"], "_pkg"].nunique()
+            n_ours += pk.loc[pk["ours"], "_pkg"].nunique()
+            prem_won += float(df.loc[df["won"], "abs_premium_usd"].sum())
+    return {"blocks": n, "won": n_won, "ours": n_ours, "premium": prem, "premium_won": prem_won,
+            "block_share": n_won / n if n else 0.0, "premium_share": prem_won / prem if prem else 0.0}
+
+
+def add_won_overlay(fig, data):
+    """Gold rings around the minutes where we won a block (on-page scatter only, never sent)."""
+    if fig is None or data is None or data.empty or "won" not in data or not data["won"].any():
+        return fig
+    w = data[data["won"]].copy()
+    w["minute_n"] = w["timestamp"].dt.floor("min").dt.tz_localize(None)
+    g = w.groupby(["minute_n", "instrument_name", "strike"]).agg(prem=("abs_premium_usd", "sum")).reset_index()
+    allp = data["abs_premium_usd"]
+    m = float(allp.abs().max() or 1.0)
+    size = 7.0 + (46.0 - 7.0) * np.sqrt(g["prem"].abs() / m) + 8
+    fig.add_trace(go.Scatter(
+        x=g["minute_n"], y=g["strike"], mode="markers", name="Won by us",
+        hoverinfo="text", text=[f"Won by us<br>{r.instrument_name}<br>Premium: ${r.prem:,.0f}" for r in g.itertuples()],
+        marker=dict(size=size, symbol="circle-open", color=WON_GOLD, line=dict(width=3, color=WON_GOLD))))
+    return fig
+
+
+def plot_won_vs_market(data, asset, venue_title):
+    """Gross premium by tenor: blocks we won vs the rest of the public tape."""
+    if data is None or data.empty or "won" not in data:
+        return _empty(f"{asset} {venue_title} Blocks Won vs Market: No Data")
+    d = data.copy()
+    d["tenor"] = pd.cut(d["tte"] * 365.25, TENOR_EDGES, labels=TENOR_LABELS, right=False)
+    g = d.groupby(["tenor", "won"], observed=False)["abs_premium_usd"].sum().unstack(fill_value=0.0)
+    for c in (True, False):
+        if c not in g:
+            g[c] = 0.0
+    s = own_summary({asset: d})
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=list(g.index.astype(str)), y=g[True].values, name="Won by us", marker_color=WON_GOLD))
+    fig.add_trace(go.Bar(x=list(g.index.astype(str)), y=g[False].values, name="Rest of market", marker_color="#B0B7C3"))
+    title = (f"{asset} {venue_title} Blocks Won vs Market ({s['won']}/{s['blocks']} blocks, "
+             f"{s['premium_share']:.0%} of premium)")
+    return _layout(fig, title, xaxis_title="Tenor", barmode="stack",
+                   yaxis=dict(title="Gross premium (USD)", tickprefix="$", tickformat="~s"))
+
+
 def build_figs(data, hist_spot, dvol, spot, asset, venue):
     """The ordered chart list for one asset (also what is sent to Telegram)."""
     figs = [
@@ -647,6 +725,74 @@ def _cached_dvol(asset: str, start_ms: int) -> pd.Series:
     return out.set_index("timestamp")["close"].sort_index()
 
 
+@st.cache_data(ttl=TTL_MEDIUM, show_spinner=False)
+def _cached_own(venue_key: str, start_ms: int) -> dict:
+    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    return _VENUES[venue_key].fetch_own(start_ms, end_ms)
+
+
+def _style_packages(pk: pd.DataFrame, fmt: dict):
+    sty = pk.style.format({k: v for k, v in fmt.items() if k in pk.columns})
+    if "Won" in pk.columns:
+        sty = sty.apply(lambda r: ["background-color: #FFF4C2" if r["Won"] == "🏆 won" else ""] * len(r), axis=1)
+    return sty
+
+
+def _render_own_tab(venue, own, data, active, start_sgt):
+    st.markdown(f'<div class="asset-header">🏆 Tickets Won vs Market — {venue.title}</div>', unsafe_allow_html=True)
+    if own is None or not own.get("configured"):
+        st.info(f"Showing the public tape only. Add read-only {venue.title} API keys to Streamlit secrets "
+                f"(`[{venue.key}]`, see `secrets.toml.example`) to mark the blocks we won.")
+        return
+    if own.get("error"):
+        st.warning(f"Couldn't load our {venue.title} trades: {own['error']}")
+        return
+    s = own_summary({a: data[a] for a in active})
+    c = st.columns(4)
+    c[0].metric("Blocks won", f"{s['won']}", f"of {s['blocks']} on the tape", delta_color="off")
+    c[1].metric("Share of blocks", f"{s['block_share']:.1%}")
+    c[2].metric("Premium won", f"${s['premium_won']:,.0f}", f"{s['premium_share']:.1%} of ${s['premium']:,.0f}",
+                delta_color="off")
+    rfq = own.get("rfq")
+    if rfq:
+        traded = rfq["won"] + rfq["lost"]
+        c[3].metric("RFQ win rate", f"{rfq['won'] / traded:.0%}" if traded else "—",
+                    f"{rfq['won']} won / {rfq['lost']} traded away", delta_color="off")
+    else:
+        c[3].metric("All our won blocks", f"{own['n_won']}", "maker side", delta_color="off")
+    notes = [f"Window from {start_sgt:%d %b %H:%M} SGT. A ticket counts as won when our quote filled it "
+             "(we were the maker); blocks we initiated show as 'ours (taker)'."]
+    off_tape = own["n_blocks"] - s["ours"]
+    if off_tape > 0:
+        notes.append(f"{off_tape} of our blocks aren't in the charted option legs (perp/futures-only packages, "
+                     "an underlying below its minimum size, or not yet published on the public tape).")
+    if rfq:
+        notes.append(f"RFQs sent to us: {rfq['total']} — {rfq['won']} won, {rfq['lost']} traded with another maker, "
+                     f"{rfq['no_trade']} expired or cancelled without a trade. 'Traded away' can include RFQs "
+                     "we didn't quote.")
+    else:
+        notes.append(f"{venue.title} doesn't publish lost RFQs, so there is no win rate: share of the tape only.")
+    st.caption(" ".join(notes))
+    for a in active:
+        if "won" not in data[a]:
+            continue
+        st.plotly_chart(plot_won_vs_market(data[a], a, venue.title), width="stretch", key=f"{venue.key}_{a}_won")
+    won_pk = []
+    for a in active:
+        df = data[a]
+        if "won" in df and df["ours"].any():
+            pk = build_packages(df[df["ours"]])
+            pk.insert(0, "Underlying", a)
+            won_pk.append(pk)
+    if won_pk:
+        st.subheader("Our blocks")
+        pk = pd.concat(won_pk, ignore_index=True).sort_values("Time (SGT)", ascending=False)
+        st.dataframe(_style_packages(pk, {"Net premium $": "${:,.0f}", "Net delta $": "${:,.0f}",
+                                          "Net vega $": "${:,.0f}", "Gross premium $": "${:,.0f}",
+                                          "Perp hedge": "{:+,.3f}"}),
+                     width="stretch", hide_index=True)
+
+
 def _anchor(now):
     am = now.replace(hour=7, minute=0, second=0, microsecond=0)
     pm = now.replace(hour=19, minute=0, second=0, microsecond=0)
@@ -765,6 +911,16 @@ def render_page(venue) -> None:
         f = raw[raw["abs_amount"] >= min_sizes[a]].copy() if raw is not None and not raw.empty else pd.DataFrame()
         data[a] = enrich(f, spots.get(a) or 0.0, a, venue.has_mark) if not f.empty else pd.DataFrame()
 
+    # Our own block trades (OKX / Paradex, read-only keys in secrets): tag won tickets on the tape.
+    own = None
+    if getattr(venue, "fetch_own", None):
+        try:
+            own = _cached_own(venue.key, start_ms)
+        except Exception as e:
+            own = {"configured": True, "error": str(e)[:200], "own": {}}
+        if own and own.get("configured") and not own.get("error"):
+            data = {a: tag_own(df, own.get("own", {})) for a, df in data.items()}
+
     # Logical order: the core assets first, then the rest by premium traded (busiest first), then name.
     def _prem(a):
         return float(data[a]["abs_premium_usd"].sum()) if not data[a].empty else 0.0
@@ -788,7 +944,14 @@ def render_page(venue) -> None:
             n = len(data[a])
             c.metric(f"{a} Blocks", f"{n}", f"${_prem(a):,.0f} premium" if n else None, delta_color="off")
 
+    if own and own.get("configured") and not own.get("error"):
+        s_own = own_summary({a: data[a] for a in active})
+        st.success(f"🏆 We won {s_own['won']} of {s_own['blocks']} blocks in this window "
+                   f"({s_own['premium_share']:.1%} of premium). Won blocks are ringed in gold on the trade "
+                   "charts and shaded in the package tables; see the Won vs Market tab.")
     figs = {a: build_figs(data[a], hists[a], dvols[a], spots.get(a) or 0.0, a, venue) for a in active}
+    has_own = bool(own and own.get("configured") and not own.get("error"))
+    won_figs = {a: plot_won_vs_market(data[a], a, venue.title) for a in active} if has_own else {}
     n_charts = len(next(iter(figs.values()))) if figs else 0
 
     tg_ok = telegram.is_configured()
@@ -804,8 +967,9 @@ def render_page(venue) -> None:
                           help=f"Send every underlying that has blocks ({len(active)} x {n_charts} charts).")
 
     extra = getattr(venue, "extra_tab", None)       # optional (title, render_fn) venue-specific tab
+    own_tab = bool(getattr(venue, "fetch_own", None))
     tabs = st.tabs([f"📈 {a}" for a in assets] + ["📊 ALL (2x2 Grid)", "📋 Block Trade Statistics"]
-                   + ([extra[0]] if extra else []))
+                   + (["🏆 Won vs Market"] if own_tab else []) + ([extra[0]] if extra else []))
     for i, a in enumerate(assets):
         with tabs[i]:
             st.markdown(f'<div class="asset-header">{a} Option Block Flow Analysis — {venue.title}</div>',
@@ -818,7 +982,8 @@ def render_page(venue) -> None:
                 continue
             fs = figs[a]
             k = f"{venue.key}_{a}"
-            st.plotly_chart(fs[0], width="stretch", key=f"{k}_scatter")
+            st.plotly_chart(add_won_overlay(go.Figure(fs[0]), df) if has_own else fs[0],
+                            width="stretch", key=f"{k}_scatter")
             st.plotly_chart(fs[1], width="stretch", key=f"{k}_strike_expiry")
             c1, c2 = st.columns(2)
             c1.plotly_chart(fs[2], width="stretch", key=f"{k}_net_heat")
@@ -846,7 +1011,7 @@ def render_page(venue) -> None:
                    "Net vega $": "${:,.0f}", "Gross premium $": "${:,.0f}"}
             if "Perp hedge" in pk.columns:
                 fmt["Perp hedge"] = "{:+,.3f}"
-            st.dataframe(pk.style.format(fmt), width="stretch", hide_index=True)
+            st.dataframe(_style_packages(pk, fmt), width="stretch", hide_index=True)
 
     if c_one and pick in figs:
         _send_many([(pick, f) for f in figs[pick]], pick, venue.title)
@@ -860,13 +1025,18 @@ def render_page(venue) -> None:
         b_assets = blast.assets_for(blast_step)
         sendable = [a for a in b_assets if a in figs]
         pairs = [(a, f) for a in sendable for k, f in zip(CHART_KEYS, figs[a]) if k in want]
+        if "won" in want:
+            pairs += [(a, won_figs[a]) for a in sendable if a in won_figs]
         if pairs:
             n_ok, why = _send_many(pairs, ", ".join(sendable), venue.title)
         else:
             n_ok, why = 0, []
         idle = [a for a in b_assets if a not in figs]
-        blast.finish(blast_step, n_ok, why,
-                     note=(f"no blocks for {', '.join(idle)}" if idle else None))
+        notes = [f"no blocks for {', '.join(idle)}"] if idle else []
+        if "won" in want and not has_own:
+            notes.append("won-vs-market chart skipped (no read-only API keys for this venue)"
+                         if getattr(venue, "fetch_own", None) else "won-vs-market chart is OKX/Paradex only")
+        blast.finish(blast_step, n_ok, why, note=("; ".join(notes) or None))
 
     with tabs[len(assets)]:
         st.markdown(f'<div class="asset-header">📊 ALL {venue.title} Block Trades Overview</div>', unsafe_allow_html=True)
@@ -890,6 +1060,14 @@ def render_page(venue) -> None:
                     st.caption("Greeks are dollar Greeks at execution using each trade's own (price-implied) IV; "
                                "Delta/Vega/Gamma are signed from the taker's side (buy +, sell -).")
 
-    if extra:
+    if own_tab:
         with tabs[len(assets) + 2]:
+            _render_own_tab(venue, own, data, active, start_sgt)
+            if has_own and won_figs:
+                if st.button("🏆 Send won-vs-market charts to Telegram", key=f"{venue.key}_tg_won",
+                             disabled=not tg_ok):
+                    _send_many([(a, won_figs[a]) for a in active], "won vs market", venue.title)
+
+    if extra:
+        with tabs[len(assets) + 2 + int(own_tab)]:
             extra[1]()

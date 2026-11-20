@@ -9,7 +9,8 @@ for _mod_name in ("tests.test_telegram_caption", "tests.test_requirements_pins",
                   "tests.test_snapshot_tools", "tests.test_vol_term_structure",
                   "tests.test_ecoinometrics", "tests.test_eco_charts",
                   "tests.test_eco_refresh", "tests.test_ibit_flow",
-                  "tests.test_eco_new_charts", "tests.test_blast"):
+                  "tests.test_eco_new_charts", "tests.test_blast",
+                  "tests.test_own_trades"):
     try:
         _mod = __import__(_mod_name, fromlist=["*"])
         for _attr in dir(_mod):

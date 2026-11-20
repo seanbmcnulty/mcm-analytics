@@ -304,6 +304,22 @@ finds a bug worth remembering, add a dated entry below before the session
 ends. Newest entry on top. This is how continuity works across sessions —
 nothing here persists otherwise.
 
+### 2026-11-20 — Block Trades OKX/Paradex: tickets we won vs the market
+
+`lib/own_trades.py` reads our own block trades with read-only keys
+(`[okx] api_key/api_secret/passphrase`, `[paradex] api_key` in Streamlit
+secrets, env fallback `OKX_API_*` / `PARADEX_API_KEY`). Only GETs:
+OKX `rfq/trades` (maker = us = won; `blockTdId` matches the public tape) and
+`rfq/rfqs` (`filled` vs `traded_away` = win rate); Paradex `/account` +
+`/block-trades?status=COMPLETED` (maker_account = us; `block_id` matches the
+public tape; no lost-RFQ data, so share of tape only). `lib/block_flow`
+tags `ours`/`won` per leg, rings won blocks in gold on the on-page scatter
+(never on the Telegram copy), shades won package rows, and adds a
+"🏆 Won vs Market" tab plus an opt-in blast chart `bt.chart.won`
+(default off; private data). No keys → public-only view with a notice.
+There was no Deribit equivalent (Deribit pages are public-only).
+The repo is public: never commit own-trade data or keys.
+
 ### 2026-11-15 — IBIT large tickets from the free chain snapshot
 
 Cboe still has no prints, so `pages/12_IBIT.py` "Large tickets" does not
