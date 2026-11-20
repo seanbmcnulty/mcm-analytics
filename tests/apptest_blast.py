@@ -180,7 +180,7 @@ CASES = {
             lambda s: [c for _, c in s] == ["Ecoinometrics — Fed tone", "Ecoinometrics — Drawdowns"]),
     # per-asset page: one step per asset; rich/cheap sends its chart + quintiles
     "vixdvol": ({"vixdvol.rich_cheap", "vixdvol.ranking"}, ["BTC", "ETH"],
-                lambda s: [c for _, c in s][:3] == ["TradFi vol vs BTC DVOL — Rich/cheap vs TradFi",
+                lambda s: [c.split("\n")[0] for _, c in s][:3] == ["TradFi vol vs BTC DVOL — Rich/cheap vs TradFi",
                                                      "TradFi vol vs BTC DVOL — Rich/cheap quintiles",
                                                      "TradFi vol vs BTC DVOL — Predictor ranking"]
                 and len(s) == 6 and "ETH" in s[-1][1]),

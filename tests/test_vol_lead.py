@@ -393,6 +393,94 @@ def test_committed_intraday_csvs_load():
         assert vld.cash_session_mask(d.index, vld.INTRADAY[k]["first"], vld.INTRADAY[k]["last"]).all()
 
 
+# ------------------------------------------------------------------ explain / charts (readability layer)
+def _cc(corrs, band=0.05, unit="min"):
+    lags = list(range(-3, 4))
+    return pd.DataFrame({"lag": lags, "minutes": [5 * l for l in lags], "corr": corrs, "n": 1000, "band": band})
+
+
+def test_leadlag_takeaway_needs_unbroken_run_from_first_lag():
+    from lib import vol_lead_explain as vx
+    # lead at 5 and 10 min, gap at 15: peak 5 min, run ends at 10
+    cc = _cc([0.0, 0.0, 0.0, 0.2, 0.15, 0.08, 0.01])
+    s = vx.leadlag_stats(cc, "min")
+    assert s["peak_x"] == 5 and s["sig_x"] == [5.0, 10.0] and s["isolated_x"] == []
+    cc2 = _cc([0.0, 0.0, 0.0, 0.2, 0.15, 0.0, 0.09])  # 15 min bar is isolated
+    s2 = vx.leadlag_stats(cc2, "min")
+    assert s2["sig_x"] == [5.0] and s2["isolated_x"] == [15.0]
+    t2 = vx.leadlag_takeaway(cc2, "min", "BTC")
+    assert "about 5 min" in t2 and "corr +0.01" not in t2 and "Isolated significant bar at 15 min" in t2
+    # no lag-1 lead -> "no meaningful lead" even with a significant bar further out
+    cc3 = _cc([0.0, 0.0, 0.0, 0.3, 0.01, 0.0, 0.09])
+    t3 = vx.leadlag_takeaway(cc3, "min", "ETH")
+    assert t3.startswith("No meaningful VIX lead") and "Same-bar" not in t3.split(".")[0]
+
+
+def test_granger_and_signal_tables_use_plain_verdicts():
+    from lib import vol_lead_explain as vx
+    gr = pd.DataFrame({"lag": [1, 2], "minutes": [5, 10], "F": [9.0, 1.0], "p_value": [0.0004, 0.4], "n": [100, 99]})
+    rev = gr.assign(p_value=[0.03, 0.2])
+    t = vx.granger_table(gr, rev, "min")
+    assert list(t.columns) == ["Past moves included", "Past VIX helps predict DVOL?", "Past DVOL helps predict VIX?",
+                               "Observations"]
+    assert t.iloc[0, 1] == "✅ yes (p<0.001)" and t.iloc[1, 1] == "— no (p=0.40)" and t.iloc[0, 2] == "✅ yes (p=0.030)"
+    assert "both ways" in vx.granger_takeaway(gr, rev, "min", "BTC")
+    sig = pd.DataFrame({"target": ["DVOL", "DVOL"], "h": [5, 20], "slope": [-1.5, 0.2], "t": [-2.5, 0.4],
+                        "r2": [0.1, 0.0], "oos_r2_pct": [8.0, -1.0], "cw_p": [0.01, 0.6], "n": 200, "n_oos": 100})
+    sp = vx.signal_plain(sig)
+    assert sp.iloc[0]["Rich → falls? (vols per +1 sd)"].startswith("✅") and sp.iloc[1]["Beats naive forecast?"].startswith("—")
+    assert vx.signal_takeaway(sig, "BTC").startswith("Yes")
+
+
+def test_ranking_plain_sorted_by_usefulness():
+    from lib import vol_lead_explain as vx
+    rows = []
+    for lab, g, p in (("VIX", -1.0, 0.5), ("DXY", 0.6, 0.01), ("MOVE", 0.9, 0.2)):
+        for h in (1, 5):
+            rows.append({"predictor": lab, "label": lab, "h": h, "oos_r2_gain_pct": g if h == 5 else -0.5, "cw_p": p})
+    rank = pd.DataFrame(rows)
+    t = vx.ranking_plain(rank)
+    assert list(t["Predictor"]) == ["DXY", "MOVE", "VIX"]  # significant first, then by gain
+    assert t.iloc[0]["Improves forecast?"] == "✅ yes, 5d" and t.iloc[1]["Improves forecast?"] == "— no"
+    m = vx.ranking_sig_mask(rank, t)
+    assert m.loc[0, "5d gain %"] and not m.loc[1, "5d gain %"] and not m.loc[0, "1d gain %"]
+    assert "DXY" in vx.ranking_takeaway(rank, "BTC") and "VIX itself never helps" in vx.ranking_takeaway(rank, "BTC")
+
+
+def test_verdict_bullets_are_short_and_computed():
+    from lib import vol_lead_explain as vx
+    df = vl.asset_frame(vl.align_panel(_panel(n=400, seed=12)), "BTC")
+    rc = vl.rich_cheap(df, window=63, long_window=126)
+    cc5 = _cc([0.0, 0.0, 0.0, 0.2, 0.15, 0.01, 0.0], band=0.03)
+    ccd = vl.cross_corr(vl.change(df, "VIX"), df["DVOL"].diff(), 5)
+    b = vx.verdict_bullets("BTC", "1 year", cc5=cc5, cc_daily=ccd, rc=rc, pct=37.0)
+    assert 2 <= len(b) <= 4
+    assert "about 5 min" in b[0] and "corr +0.15" in b[0]
+    last = rc.dropna(subset=["score"]).iloc[-1]
+    assert f"{abs(last['resid']):.1f} vols" in b[-1] and "37th percentile of the last 1 year" in b[-1]
+
+
+def test_event_takeaway_flags_insignificant_moves():
+    from lib import vol_lead_explain as vx
+    p = pd.DataFrame({"offset": [0, 1, 2], "minutes": [0, 60, 120], "mean": [0.5, 0.2, 0.3],
+                      "lo": [0.1, -0.1, -0.2], "hi": [0.9, 0.5, 0.8], "n": [10, 10, 10]})
+    t = vx.event_takeaway(p, "VIX jumps", "BTC", (0, 120), "min")
+    assert t == "After 10 VIX jumps, BTC DVOL averaged +0.5 vols in the jump bar, +0.3 vols after 2h (not significant)."
+
+
+def test_charts_mark_noise_band_peak_and_sides():
+    from lib import vol_lead_charts as vlc
+    cc = _cc([0.0, 0.0, 0.0, 0.2, 0.15, 0.01, 0.0])
+    f = vlc.intraday_cross_corr(cc, "BTC", "min")
+    names = {t.name for t in f.data}
+    assert "VIX leads (significant)" in names and "Noise (inside band)" in names
+    texts = " ".join(a.text for a in f.layout.annotations)
+    assert "peak: VIX leads by 5 min" in texts and "DVOL moves first" in texts and "VIX moves first" in texts
+    assert any(s.type == "rect" for s in f.layout.shapes)  # shaded noise band
+    g = vlc.rich_cheap_gauge(19.0, -0.98, -0.5, "BTC", "the last 1 year")
+    assert "cheap" in g.layout.title.text and "19th percentile" in g.layout.title.text
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
