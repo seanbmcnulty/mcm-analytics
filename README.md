@@ -101,7 +101,7 @@ This app is ready to deploy on [Streamlit Community Cloud](https://share.streaml
 1. Push this repo to GitHub
 2. Go to share.streamlit.io → "New app"
 3. Select the repo, branch `main`, main file `Home.py`
-4. Add Telegram secrets in the app settings (Advanced → Secrets)
+4. Add Telegram secrets and the site password (`[auth] password`, see `secrets.toml.example`) in the app settings (Advanced → Secrets). Without `[auth]` the app is open to anyone with the link.
 5. Deploy!
 
 ## Project Structure

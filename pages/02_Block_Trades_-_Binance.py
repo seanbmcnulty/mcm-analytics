@@ -9,6 +9,8 @@ lib/binance.py (fetch + normalise) and lib/block_flow.py (analytics, charts, Tel
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from lib.auth import require_password  # noqa: E402
+require_password()  # site password gate: before anything renders
 
 from lib import blast, block_flow, freshness, binance
 

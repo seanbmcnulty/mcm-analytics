@@ -8,6 +8,8 @@ from pathlib import Path
 
 # Ensure lib/ is importable
 sys.path.insert(0, str(Path(__file__).parent))
+from lib.auth import require_password  # noqa: E402
+require_password()  # site password gate: before anything renders
 
 import streamlit as st
 from datetime import datetime, timezone

@@ -37,6 +37,8 @@ fully ported below.
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from lib.auth import require_password  # noqa: E402
+require_password()  # site password gate: before anything renders
 
 import json
 from datetime import datetime, timedelta, timezone

@@ -20,6 +20,8 @@ and Strategy's weekly funding breakdown parsed from its SEC 8-K
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from lib.auth import require_password  # noqa: E402
+require_password()  # site password gate: before anything renders
 
 import numpy as np
 import pandas as pd
