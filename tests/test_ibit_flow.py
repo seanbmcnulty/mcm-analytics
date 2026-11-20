@@ -273,6 +273,8 @@ def test_record_does_not_wipe_history_or_surface_files():
 
         assert L.record_chain_snapshot(monday, empty, base) == "no_data"
         assert L.record_chain_snapshot(monday, bad, base) == "error"
+        assert L.LAST_RECORD_ERROR["error"] == "RuntimeError: cboe down"
+        assert "cboe down" in L.LAST_RECORD_ERROR["traceback"]
         assert L.record_chain_snapshot(monday, stale, base) == "stale"
         assert len(L.read_chain_store(base)) == len(first)
         assert L.record_chain_snapshot(monday, fetch_mon, base) == "recorded"
@@ -360,3 +362,49 @@ def test_snapshot_rows_come_from_the_parsed_chain():
                                      datetime(2026, 11, 13, 21, 50, tzinfo=UTC))
     assert len(rows) == 1 and rows["oi"].iloc[0] == 12 and rows["session_date"].iloc[0] == "2026-11-13"
     assert rows["option"].iloc[0] == "IBIT261218C00050000"
+
+
+def test_cboe_fetch_sends_referer_retries_and_names_the_error():
+    """Cboe's Cloudflare front 403s requests without a cboe.com Referer."""
+    from unittest.mock import patch
+    import requests as _rq
+
+    class _R:
+        def __init__(self, code, payload=None):
+            self.status_code, self._p = code, payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise _rq.HTTPError(f"{self.status_code} Client Error: Forbidden", response=self)
+
+        def json(self):
+            return self._p
+
+    seen = []
+    good = {"data": {"options": [{"option": "IBIT261218C00050000"}]}}
+    replies = iter([_R(403), _R(403), _R(200, good)])
+
+    def fake_get(url, timeout, headers):
+        seen.append(headers)
+        return next(replies)
+
+    with patch("lib.ibit.requests.get", side_effect=fake_get), patch("lib.ibit._time.sleep") as nap:
+        assert L.fetch_raw("IBIT", attempts=2) is good
+    assert all(h["Referer"] == "https://www.cboe.com/" for h in seen)
+    assert len(seen) == 3 and nap.call_count == 1
+
+    with patch("lib.ibit.requests.get", return_value=_R(403)), patch("lib.ibit._time.sleep"):
+        try:
+            L.fetch_raw("IBIT", attempts=3)
+            raise AssertionError("403 everywhere should raise")
+        except RuntimeError as e:
+            msg = str(e)
+    assert "after 3 attempt(s)" in msg and "HTTPError" in msg and "403" in msg
+
+    # A page keeps one pass: no sleeping, one request per host.
+    with patch("lib.ibit.requests.get", return_value=_R(403)) as g, patch("lib.ibit._time.sleep") as nap:
+        try:
+            L.fetch_raw("IBIT")
+        except RuntimeError:
+            pass
+    assert g.call_count == len(L.CBOE_URLS) and nap.call_count == 0
