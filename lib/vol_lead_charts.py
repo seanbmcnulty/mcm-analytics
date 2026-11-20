@@ -18,8 +18,13 @@ def _base(fig: go.Figure, title: str, height: int = H) -> go.Figure:
     return fig
 
 
-def _done(fig, note=None):
-    return fx.finalize(fig, note=note)
+def _done(fig, note=None, subplot_titles: bool = False):
+    fig = fx.finalize(fig, note=note)
+    if subplot_titles:
+        # lift the legend above the first subplot's title
+        t = (fig.layout.margin.t or 70) + 26
+        fig.update_layout(margin=dict(t=t), legend=dict(y=1.07))
+    return fig
 
 
 def levels(df: pd.DataFrame, asset: str) -> go.Figure:
@@ -47,7 +52,7 @@ def spread_ratio(df: pd.DataFrame, asset: str) -> go.Figure:
         fig.add_scatter(x=df.index, y=m, name="1y mean", line=dict(color=fx.AMBER, width=1, dash="dash"),
                         row=r, col=1, showlegend=(r == 1))
     _base(fig, f"{asset} DVOL spreads and ratios to TradFi vol", height=620)
-    return _done(fig)
+    return _done(fig, subplot_titles=True)
 
 
 def cross_corr(cc: pd.DataFrame, asset: str, xname: str = "VIX") -> go.Figure:
@@ -113,7 +118,8 @@ def rich_cheap(df: pd.DataFrame, rc: pd.DataFrame, asset: str) -> go.Figure:
     for y in (1, -1):
         fig.add_hline(y=y, line=dict(color=fx.GREY, dash="dot", width=1), row=2, col=1)
     _base(fig, f"Is {asset} vol rich or cheap vs TradFi vol?", height=620)
-    return _done(fig, "Score = mean of the fair-value residual z and the 1y z-scores of DVOL/VIX and DVOL/MOVE.")
+    return _done(fig, "Score = mean of the fair-value residual z and the 1y z-scores of DVOL/VIX and DVOL/MOVE.",
+                 subplot_titles=True)
 
 
 def quintile_bars(q: pd.DataFrame, asset: str) -> go.Figure:
