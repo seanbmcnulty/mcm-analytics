@@ -143,8 +143,12 @@ def test_every_page_is_gated_first():
         head = src[:gate]
         # nothing Streamlit-ish may run before the gate
         assert not re.search(r"^\s*(st\.|import streamlit|from streamlit)", head, re.M), f.name
-        assert not re.search(r"^[a-z_]+\.(render_page|reload_if_changed)\(", head, re.M), f.name
+        assert not re.search(r"^[a-z_]+\.render_page\(", head, re.M), f.name
+        assert not re.search(r"^(?!_fresh\.reload_if_changed\(_auth\))[a-z_]+\.reload_if_changed\(",
+                             head, re.M), f.name
         assert "from lib.auth import require_password" in head, f.name
+        # the gate module itself is reloaded after a Cloud redeploy (lib/freshness.py)
+        assert "_fresh.reload_if_changed(_auth)" in head, f.name
 
 
 if __name__ == "__main__":
