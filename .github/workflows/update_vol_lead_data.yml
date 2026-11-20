@@ -1,0 +1,58 @@
+name: Update VIX vs DVOL data
+
+# Rebuilds data/vl_*.csv for pages/14_VIX_vs_DVOL.py (Deribit DVOL, Cboe VIX
+# family, Yahoo MOVE/DXY/NDX, FRED HY OAS). Public sources, no API keys.
+on:
+  schedule:
+    - cron: '45 7 * * 0'   # Sundays 07:45 UTC (15:45 SGT)
+  workflow_dispatch:
+    inputs:
+      datasets:
+        description: Which datasets to rebuild (all, or comma list of dvol,cboe,yahoo,fred)
+        default: all
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-vol-lead-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check requests pandas numpy
+
+      - name: Rebuild datasets
+        env:
+          DATASETS: ${{ github.event.inputs.datasets || 'all' }}
+        run: python tools/refresh_vol_lead_data.py --datasets "$DATASETS"
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "mcm-vol-lead-data-bot"
+          git config user.email "actions@users.noreply.github.com"
+          for f in data/vl_dvol.csv data/vl_cboe.csv data/vl_yahoo.csv data/vl_fred.csv; do
+            if [ -f "$f" ]; then git add -- "$f"; fi
+          done
+          if git diff --cached --quiet; then
+            echo "VIX vs DVOL CSVs unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "vol-lead data: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git pull --rebase origin main
+          git push origin HEAD:refs/heads/main

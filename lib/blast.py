@@ -95,6 +95,7 @@ _PAGE_LIST = [
     Page("fng", "Fear & Greed Signal", "pages/11_Fear_Greed_Signal.py", ALL_ASSETS, per_asset=True),
     Page("ibit", "IBIT", "pages/12_IBIT.py", None, views=True),
     Page("eco", "Ecoinometrics", "pages/13_Ecoinometrics_Charts.py", None),
+    Page("vixdvol", "TradFi vol vs DVOL", "pages/14_VIX_vs_DVOL.py", ("BTC", "ETH"), per_asset=True),
 ]
 PAGES = {p.id: p for p in _PAGE_LIST}
 PAGE_ORDER = [p.id for p in _PAGE_LIST]
@@ -313,6 +314,19 @@ GROUPS = [
             ("nasdaq_corr", "BTC–Nasdaq correlation"),
             ("nasdaq_down", "Nasdaq down days"),
             ("inflation", "Inflation & yields"),
+        ])),
+    ]),
+    ("vixdvol", "📉 TradFi vol vs DVOL", [
+        ("Rich/cheap & prediction", _items("vixdvol", False, [
+            ("rich_cheap", "Rich/cheap vs TradFi vol"),
+            ("ranking", "Predictor ranking"),
+            ("leadlag", "VIX lead-lag"),
+            ("events", "DVOL after VIX / MOVE spikes"),
+        ])),
+        ("Context", _items("vixdvol", False, [
+            ("levels", "DVOL vs VIX & MOVE"),
+            ("spreads", "Spreads & ratios"),
+            ("rolling", "Rolling beta"),
         ])),
     ]),
 ]
