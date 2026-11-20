@@ -11,6 +11,10 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from lib import block_flow, derive
+from lib import blast, block_flow, freshness, derive
+
+# Pick up a changed lib.block_flow / lib.blast after a Cloud redeploy (old code
+# stays in memory otherwise, and the Home chart blast hook would be missing).
+freshness.reload_if_changed(blast, block_flow)
 
 block_flow.render_page(derive.VENUE)

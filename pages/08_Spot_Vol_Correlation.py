@@ -52,7 +52,10 @@ from lib import deribit, history, surface
 from lib.constants import ASSET_CONFIG, PLOTLY_LAYOUT
 from lib import fx_style
 from lib import cache as cache_lib
+from lib import blast, freshness
 from lib.telegram import send_message, send_photo, is_configured
+
+freshness.reload_if_changed(blast)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -909,9 +912,15 @@ def _send_chart(fig: go.Figure | None, caption: str) -> bool:
 
 
 def send_asset_report_to_telegram(asset: str, days: int, resolution: str, prediction_windows: tuple,
-                                  include_pair_charts: bool = True) -> tuple[int, list[str]]:
+                                  include_pair_charts: bool = True,
+                                  only: set | None = None) -> tuple[int, list[str]]:
     """Every chart for one asset's tab, sent as a Telegram photo album
-    preceded by a text summary. Returns (sent_count, failed_chart_names)."""
+    preceded by a text summary. Returns (sent_count, failed_chart_names).
+    ``only`` = Home blast selection (lib/blast.py "spot_vol.*" keys); None =
+    everything. Unselected charts aren't built."""
+    def _on(key: str) -> bool:
+        return only is None or key in only
+
     spot = _spot_series(asset, days)
     if spot.empty:
         return 0, [f"{asset} (no spot data)"]
@@ -928,36 +937,50 @@ def send_asset_report_to_telegram(asset: str, days: int, resolution: str, predic
     latest_cvol = f"{cvol.iloc[-1]:.2f}%" if not cvol.empty else "—"
     latest_skew = f"{svol.iloc[-1]:.2f}%" if not svol.empty else "—"
     rv_note = "\n⚠️ no DVOL — vol history is RV-scaled" if (not has_dvol and cvol_est) else ""
-    send_message(
-        f"📈 <b>Spot Vol Correlation – {asset}</b>\n\n"
-        f"Spot: ${spot.iloc[-1]:,.2f}\n"
-        f"CVOL 30d: {latest_cvol}\n"
-        f"25Δ Skew: {latest_skew}{rv_note}"
-    )
+    sent, failed = 0, []
+    if _on("summary"):
+        if send_message(
+            f"📈 <b>Spot Vol Correlation – {asset}</b>\n\n"
+            f"Spot: ${spot.iloc[-1]:,.2f}\n"
+            f"CVOL 30d: {latest_cvol}\n"
+            f"25Δ Skew: {latest_skew}{rv_note}"
+        ):
+            sent += 1
+        else:
+            failed.append(f"{asset} - summary message")
 
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=days)
     start_ms, end_ms = int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
 
+    # (selector key, builder, caption) in the order they're sent; a builder
+    # returning None (chart doesn't apply to this asset) is skipped silently.
     charts = [
-        (_scatter_vs_spot(_align_to_spot(cvol, spot), asset, f"CVOL vs Spot — {asset}", "CVOL (%)", cvol_est, cvol_src), f"{asset} - CVOL vs Spot"),
-        (_scatter_vs_spot(_align_to_spot(svol, spot), asset, f"25Δ Skew vs Spot — {asset}", "25Δ Skew (%)", svol_est, svol_src), f"{asset} - 25Δ Skew vs Spot"),
-        (_scatter_vs_spot(_align_to_spot(rr, spot), asset, f"10Δ Risk Reversal vs Spot — {asset}", "10Δ RR (%)", rr_est, rr_src), f"{asset} - 10Δ RR vs Spot"),
-        (_scatter_vs_spot(_align_to_spot(bf, spot), asset, f"10Δ Butterfly vs Spot — {asset}", "10Δ BF (%)", bf_est, bf_src), f"{asset} - 10Δ BF vs Spot"),
-        (_dvol_spread_chart(days, resolution) if pair_ok else None, "ETH/BTC DVOL Spread"),
-        (_candlestick_dvol(asset, start_ms, end_ms, resolution, svol) if has_dvol else None, f"{asset} - DVol Snapshot"),
-        (_chart_rolling_correlation(spot, cvol, asset), f"{asset} - Rolling Correlation"),
-        (_chart_rolling_covariance(spot, cvol, asset), f"{asset} - Rolling Covariance"),
-        (_rv_iv_basis_chart(asset, days) if basis_ok else None, f"{asset} - RV-IV Basis"),
-        (_rv_iv_basis_spread_chart(days) if pair_ok else None, "ETH-BTC RV-IV Basis Spread"),
-        (_zscore_chart(_rolling_zscore(_dvol_spread_series(days, resolution)), "ETH-BTC DVOL Spread") if pair_ok else None, "ETH-BTC DVOL Spread Z-Score"),
-        (_dvol_beta_chart(days, resolution) if pair_ok else None, "ETH DVOL Beta to BTC DVOL"),
-        (_skew_spread_chart(days) if pair_ok else None, "ETH-BTC 25Δ Skew Spread"),
-        (_zscore_chart(_rolling_zscore(_skew_spread_series(days)), "ETH-BTC 25Δ Skew Spread") if pair_ok else None, "ETH-BTC Skew Spread Z-Score"),
-        (_chart_vol_prediction(asset, prediction_windows), f"{asset} - Vol Prediction"),
+        ("cvol_scatter", lambda: _scatter_vs_spot(_align_to_spot(cvol, spot), asset, f"CVOL vs Spot — {asset}", "CVOL (%)", cvol_est, cvol_src), f"{asset} - CVOL vs Spot"),
+        ("skew_scatter", lambda: _scatter_vs_spot(_align_to_spot(svol, spot), asset, f"25Δ Skew vs Spot — {asset}", "25Δ Skew (%)", svol_est, svol_src), f"{asset} - 25Δ Skew vs Spot"),
+        ("rr_scatter", lambda: _scatter_vs_spot(_align_to_spot(rr, spot), asset, f"10Δ Risk Reversal vs Spot — {asset}", "10Δ RR (%)", rr_est, rr_src), f"{asset} - 10Δ RR vs Spot"),
+        ("bf_scatter", lambda: _scatter_vs_spot(_align_to_spot(bf, spot), asset, f"10Δ Butterfly vs Spot — {asset}", "10Δ BF (%)", bf_est, bf_src), f"{asset} - 10Δ BF vs Spot"),
+        ("dvol_spread", lambda: _dvol_spread_chart(days, resolution) if pair_ok else None, "ETH/BTC DVOL Spread"),
+        ("dvol_snapshot", lambda: _candlestick_dvol(asset, start_ms, end_ms, resolution, svol) if has_dvol else None, f"{asset} - DVol Snapshot"),
+        ("rolling_corr", lambda: _chart_rolling_correlation(spot, cvol, asset), f"{asset} - Rolling Correlation"),
+        ("rolling_cov", lambda: _chart_rolling_covariance(spot, cvol, asset), f"{asset} - Rolling Covariance"),
+        ("rv_iv_basis", lambda: _rv_iv_basis_chart(asset, days) if basis_ok else None, f"{asset} - RV-IV Basis"),
+        ("rv_iv_spread", lambda: _rv_iv_basis_spread_chart(days) if pair_ok else None, "ETH-BTC RV-IV Basis Spread"),
+        ("dvol_spread_z", lambda: _zscore_chart(_rolling_zscore(_dvol_spread_series(days, resolution)), "ETH-BTC DVOL Spread") if pair_ok else None, "ETH-BTC DVOL Spread Z-Score"),
+        ("dvol_beta", lambda: _dvol_beta_chart(days, resolution) if pair_ok else None, "ETH DVOL Beta to BTC DVOL"),
+        ("skew_spread", lambda: _skew_spread_chart(days) if pair_ok else None, "ETH-BTC 25Δ Skew Spread"),
+        ("skew_spread_z", lambda: _zscore_chart(_rolling_zscore(_skew_spread_series(days)), "ETH-BTC 25Δ Skew Spread") if pair_ok else None, "ETH-BTC Skew Spread Z-Score"),
+        ("vol_prediction", lambda: _chart_vol_prediction(asset, prediction_windows), f"{asset} - Vol Prediction"),
     ]
-    sent, failed = 0, []
-    for fig, name in charts:
+    for key, build, name in charts:
+        if not _on(key):
+            continue
+        try:
+            fig = build()
+        except Exception:
+            fig = None
+            failed.append(f"{name} (build)")
+            continue
         if fig is not None and _send_chart(fig, name):
             sent += 1
         elif fig is not None:
@@ -966,11 +989,16 @@ def send_asset_report_to_telegram(asset: str, days: int, resolution: str, predic
 
 
 def send_all_reports_to_telegram(days: int, resolution: str, prediction_windows: tuple,
-                                 assets: tuple | list | None = None) -> tuple[int, list[str]]:
+                                 assets: tuple | list | None = None,
+                                 only: set | None = None) -> tuple[int, list[str]]:
     total_sent, total_failed = 0, []
-    for i, asset in enumerate(assets or SV_ASSETS):
+    assets = list(assets or SV_ASSETS)
+    # ETH-BTC pair charts go out once, with the first of BTC/ETH sent.
+    pair_host = next((a for a in assets if a in PAIR_ASSETS), None)
+    for asset in assets:
         sent, failed = send_asset_report_to_telegram(
-            asset, days, resolution, prediction_windows, include_pair_charts=(i == 0))
+            asset, days, resolution, prediction_windows, include_pair_charts=(asset == pair_host),
+            only=only)
         total_sent += sent
         total_failed.extend(failed)
     return total_sent, total_failed
@@ -1042,33 +1070,23 @@ def main() -> None:
     if cache_lib.expire_stale_auto_pipeline():
         st.caption("Auto pipeline timed out after 15 minutes and was cleared.")
 
-    if st.session_state.get("auto_pipeline") == "spot_vol":
-        if is_configured():
-            st.info("🔄📤 Auto pipeline — step 4/4: refreshing Spot Vol "
-                    "Correlation for BTC+ETH and sending to Telegram…")
-            cache_lib.clear_all_caches()
-            days = 90  # "Last 3 months" UI default (DATE_RANGE_PRESETS index 2)
-            resolution = RESOLUTION_MAP["1D"]
-            prediction_windows = _prediction_windows_for_lookback(days)
-            with st.spinner("Sending Spot Vol Correlation reports for BTC+ETH…"):
+    _blast_step = blast.active_step("spot_vol")   # clears the flag if Telegram isn't configured
+    if _blast_step is not None:
+        _sv_assets = blast.assets_for(_blast_step)
+        blast.banner(_blast_step, f"refreshing Spot Vol Correlation for {', '.join(_sv_assets)} "
+                                  "and sending to Telegram…")
+        cache_lib.clear_all_caches()
+        days = 90  # "Last 3 months" UI default (DATE_RANGE_PRESETS index 2)
+        resolution = RESOLUTION_MAP["1D"]
+        prediction_windows = _prediction_windows_for_lookback(days)
+        try:
+            with st.spinner(f"Sending Spot Vol Correlation reports for {', '.join(_sv_assets)}…"):
                 sent, failed = send_all_reports_to_telegram(
-                    days, resolution, prediction_windows, assets=AUTO_ASSETS)
-            st.session_state["auto_pipeline"] = None
-            st.session_state["auto_pipeline_started_at"] = None
-            if failed:
-                st.warning(
-                    f"Auto pipeline finished Spot Vol with {sent} chart(s) "
-                    f"sent; failed: {', '.join(failed)}"
-                )
-            st.success(
-                "✅ Auto pipeline complete — MCM Bot, Block Trades, Time Based "
-                "Realized Vol, and Spot Vol Correlation reports for BTC/ETH "
-                "have all been sent to Telegram."
-            )
-        else:
-            # Same guard as other pipeline pages — clear rather than stuck.
-            st.session_state["auto_pipeline"] = None
-            st.session_state["auto_pipeline_started_at"] = None
+                    days, resolution, prediction_windows, assets=_sv_assets,
+                    only=blast.selected(_blast_step))
+        except Exception as exc:  # never leave the flag stuck on a build error
+            sent, failed = 0, [f"Spot Vol Correlation failed: {exc}"]
+        blast.finish(_blast_step, sent, failed)
 
     with st.expander("📖 How to Use This Dashboard", expanded=False):
         st.markdown("""

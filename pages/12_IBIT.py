@@ -31,10 +31,13 @@ from plotly.subplots import make_subplots
 
 import html
 
+from lib import blast, freshness
 from lib import cache as cache_lib
 from lib import fx_style
 from lib import ibit as L
 from lib.constants import TTL_DAILY_EXTERNAL, TTL_LONG, TTL_MEDIUM, TTL_SLOW
+
+freshness.reload_if_changed(blast)
 
 st.set_page_config(page_title="IBIT", page_icon="🪙", layout="wide",
                    initial_sidebar_state="expanded")
@@ -76,6 +79,8 @@ _cur_badge = "IBIT×BTC"
 
 def sec(title: str, sub: str = "", color: str = IB, badge: str | None = None) -> None:
     """Coloured badge + report name (MCM Bot tile label), optional caption."""
+    global _CUR_SEC
+    _CUR_SEC = title
     b = badge or _cur_badge
     st.markdown(f'<div class="mcm-tile"><span class="a" style="background:{color}">'
                 f'{html.escape(b)}</span><span class="c">{html.escape(title)}</span></div>',
@@ -134,7 +139,16 @@ def susd(x):
     return ("-" if x < 0 else "") + usd(abs(float(x)))
 
 
+# Home chart blast (lib/blast.py): while a step runs, every chart shown is
+# remembered with the report section (sec title) it sits under, and the
+# selected sections are sent at the bottom of the page.
+_CUR_SEC = ""
+_SHOWN: list = []
+
+
 def show(fig, key):
+    if _blast_step is not None:
+        _SHOWN.append((_CUR_SEC, fig))
     th = _chart_theme()
     fx_style.apply_chart_theme(fig, th)
     fx_style.add_watermark(fig)
@@ -227,6 +241,11 @@ def load_btc_comparison(session_start_ms: int, session_end_ms: int, now_ms: int)
     return fallback, True
 
 
+_blast_step = blast.active_step("ibit")   # clears the flag if Telegram isn't configured
+if _blast_step is not None:
+    blast.banner(_blast_step)
+    cache_lib.clear_all_caches()
+
 with st.sidebar:
     st.title("🪙 IBIT")
     st.caption("Cboe delayed option chain (free, ~15 min delayed, snapshot) vs Deribit public API")
@@ -280,7 +299,7 @@ try:
         ib, ibm = load_ibit()
 except Exception as e:  # noqa: BLE001
     st.error(f"Could not load IBIT options from Cboe: {e}")
-    st.stop()
+    blast.stop("ibit", f"Cboe chain unavailable: {e}")
 
 der, derm, der_err = None, None, None
 try:
@@ -352,6 +371,8 @@ _VIEWS = ["⚔️ Deribit vs IBIT", "🌋 IBIT surface", "📊 IBIT positioning"
           "🧲 Gamma & max pain", "🔥 Activity", "🧱 Large tickets", "🗂 Data & notes"]
 # Only the selected view renders (like MCM Bot).
 _view = st.radio("View", _VIEWS, key="ibit_view", horizontal=True, label_visibility="collapsed")
+if _blast_step is not None and _blast_step.sub is not None:
+    _view = _VIEWS[int(_blast_step.sub)]   # one blast pass per view ("ibit:0" ...)
 _cur_badge = "IBIT×BTC" if _view == _VIEWS[0] else "IBIT"
 
 # ===========================================================================
@@ -1284,3 +1305,21 @@ if _view == _VIEWS[6]:
 - **Implied distribution** is risk-neutral and approximated by a quartic fit of the smile; treat tail probabilities as indicative.
 - IBIT trades only in US hours; Deribit is 24/7, so comparisons outside those hours mix a stale IBIT snapshot with live Deribit data.
 """)
+
+
+# ---------------------------------------------------------------------------
+# Home chart blast: send this view's selected sections, then move on.
+# ---------------------------------------------------------------------------
+if _blast_step is not None:
+    _want = blast.selected(_blast_step)
+    _pairs = []
+    for _sec, _fig in _SHOWN:
+        if blast.IBIT_ITEM_BY_SECTION.get(_sec) in _want:
+            _t = getattr(getattr(getattr(_fig, "layout", None), "title", None), "text", None)
+            _pairs.append((_fig, f"IBIT — {_sec}" + (f": {_t}" if _t and _t != _sec else "")))
+    with st.spinner("Sending IBIT charts to Telegram…"):
+        _sent, _failed = blast.send_figs(_pairs, light_theme=True)
+    _empty = sorted(k for k in _want if blast.ITEM_BY_KEY[f"ibit.{k}"].sub == _blast_step.sub
+                    and not any(blast.IBIT_ITEM_BY_SECTION.get(sec) == k for sec, _ in _SHOWN))
+    blast.finish(_blast_step, _sent, _failed,
+                 note=(f"nothing to chart for {', '.join(_empty)}" if _empty else None))

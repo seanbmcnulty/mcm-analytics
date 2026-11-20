@@ -35,6 +35,9 @@ from lib.constants import PLOTLY_LAYOUT, ASSET_COLORS
 from lib import fx_style
 from lib import cache as cache_lib
 from lib.telegram import send_message, send_photo, is_configured
+from lib import blast, freshness
+
+freshness.reload_if_changed(blast)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -646,56 +649,71 @@ def _send_chart(fig: go.Figure | None, caption: str) -> bool:
     return send_photo(img, caption=caption[:1024])
 
 
-def send_asset_report_to_telegram(asset: str, snap: dict, rv_window_days: int) -> tuple[int, list[str]]:
+def send_asset_report_to_telegram(asset: str, snap: dict, rv_window_days: int,
+                                  only: set | None = None) -> tuple[int, list[str]]:
     """Every chart for one asset's dashboard, sent as a Telegram photo album
-    preceded by a text summary. Returns (sent_count, failed_chart_names)."""
+    preceded by a text summary. Returns (sent_count, failed_chart_names).
+    ``only`` = Home blast selection (lib/blast.py "regime.*" keys); None =
+    everything. Unselected charts aren't built."""
+    def _on(key: str) -> bool:
+        return only is None or key in only
+
     df = snap["df"]
     rv_col = snap["rv_col"]
     current_regime = snap["current_regime"]
     days_in_regime = snap["days_in_regime"]
     prob_label = "Return to Low prob" if current_regime in ("Moderate", "High") else "Breakout prob"
     duration_line = _format_duration_forecast(snap.get("duration_forecast"))
-    send_message(
-        f"📊 <b>Regime Identifier – {asset}</b>\n\n"
-        f"Regime: <b>{current_regime}</b> ({days_in_regime} days)\n"
-        f"{rv_window_days}d RV: {snap['current_rv']:.2f}%\n"
-        f"{prob_label}: {snap['breakout_prob']:.0f}%"
-        + (f"\n{duration_line}" if duration_line else "")
-    )
-    shock_fig, _ = create_shock_analysis(df, asset=asset)
-    squeeze_fig, _ = create_volume_squeeze_chart(df, asset=asset)
-    charts = [
-        (create_regime_gauge(snap["current_rv"], current_regime, asset), f"{asset} - Regime Gauge"),
-        (create_days_in_regime_gauge(snap["days_in_regime"], current_regime, snap["breakout_prob"]), f"{asset} - Days in Regime"),
-        (create_price_chart_with_regime(df, asset), f"{asset} - Price & Regime"),
-        (create_volatility_time_series(df, asset, rv_col, rv_window_days), f"{asset} - Volatility Time Series"),
-        (create_regime_timeline(df, asset), f"{asset} - Regime Timeline"),
-        (create_volatility_distribution(df, rv_col, rv_window_days), f"{asset} - Volatility Distribution"),
-        (shock_fig, f"{asset} - Shock Analysis"),
-        (squeeze_fig, f"{asset} - Volume Squeeze"),
-        (create_comparative_volatility(df), f"{asset} - Comparative Volatility"),
-        (create_regime_statistics(df, asset, rv_col), f"{asset} - Regime Statistics"),
-        (create_return_distribution_by_regime(df, asset), f"{asset} - Return Distribution"),
-        (create_regime_transition_matrix(df, asset), f"{asset} - Regime Transition Matrix"),
-        (create_breakout_probability_time_series(df, asset, snap["learned_weights"], snap["calibration"], rv_col, rv_window_days), f"{asset} - Breakout Probability"),
-        (create_garch_indicators_chart(df, rv_col, rv_window_days), f"{asset} - GARCH Indicators"),
-        (create_volatility_term_structure_chart(df), f"{asset} - Volatility Term Structure"),
-        (create_compression_indicators_chart(df), f"{asset} - Compression Indicators"),
-        (create_early_warning_signals_chart(df), f"{asset} - Early Warning Signals"),
-        (create_microstructure_indicators_chart(df), f"{asset} - Microstructure Indicators"),
-        (create_calibration_summary_chart(asset, snap["backtest_breakout"], snap["backtest_rtl"]), f"{asset} - Calibration Summary"),
-        (create_forward_outcome_chart(asset, snap["backtest_breakout"], snap["backtest_rtl"]), f"{asset} - Forward Outcome"),
-        (create_regime_duration_distribution_chart(df, asset, current_regime, days_in_regime), f"{asset} - Regime Duration Distribution"),
-        (create_volatility_percentile_time_series(df, rv_col, rv_window_days), f"{asset} - Volatility Percentile"),
-        (create_rolling_correlation_chart(df, 30, rv_col, rv_window_days), f"{asset} - Rolling Correlation"),
-        (create_drawdowns_by_regime_chart(df, asset), f"{asset} - Drawdowns by Regime"),
-        (create_seasonality_heatmap_chart(df), f"{asset} - Seasonality"),
-        (create_expected_move_by_regime_chart(df, asset), f"{asset} - Expected Move by Regime"),
-        (create_return_skew_by_regime_chart(df, asset), f"{asset} - Return Skew by Regime"),
-        (create_autocorrelation_returns_chart(df), f"{asset} - Return Autocorrelation"),
-    ]
     sent, failed = 0, []
-    for fig, name in charts:
+    if _on("summary"):
+        if send_message(
+            f"📊 <b>Regime Identifier – {asset}</b>\n\n"
+            f"Regime: <b>{current_regime}</b> ({days_in_regime} days)\n"
+            f"{rv_window_days}d RV: {snap['current_rv']:.2f}%\n"
+            f"{prob_label}: {snap['breakout_prob']:.0f}%"
+            + (f"\n{duration_line}" if duration_line else "")
+        ):
+            sent += 1
+        else:
+            failed.append(f"{asset} - summary message")
+    charts = [
+        ("gauge", lambda: create_regime_gauge(snap["current_rv"], current_regime, asset), f"{asset} - Regime Gauge"),
+        ("days_in_regime", lambda: create_days_in_regime_gauge(snap["days_in_regime"], current_regime, snap["breakout_prob"]), f"{asset} - Days in Regime"),
+        ("price_regime", lambda: create_price_chart_with_regime(df, asset), f"{asset} - Price & Regime"),
+        ("vol_ts", lambda: create_volatility_time_series(df, asset, rv_col, rv_window_days), f"{asset} - Volatility Time Series"),
+        ("timeline", lambda: create_regime_timeline(df, asset), f"{asset} - Regime Timeline"),
+        ("vol_dist", lambda: create_volatility_distribution(df, rv_col, rv_window_days), f"{asset} - Volatility Distribution"),
+        ("shock", lambda: create_shock_analysis(df, asset=asset)[0], f"{asset} - Shock Analysis"),
+        ("squeeze", lambda: create_volume_squeeze_chart(df, asset=asset)[0], f"{asset} - Volume Squeeze"),
+        ("comparative_vol", lambda: create_comparative_volatility(df), f"{asset} - Comparative Volatility"),
+        ("statistics", lambda: create_regime_statistics(df, asset, rv_col), f"{asset} - Regime Statistics"),
+        ("return_dist", lambda: create_return_distribution_by_regime(df, asset), f"{asset} - Return Distribution"),
+        ("transition", lambda: create_regime_transition_matrix(df, asset), f"{asset} - Regime Transition Matrix"),
+        ("breakout_prob", lambda: create_breakout_probability_time_series(df, asset, snap["learned_weights"], snap["calibration"], rv_col, rv_window_days), f"{asset} - Breakout Probability"),
+        ("garch", lambda: create_garch_indicators_chart(df, rv_col, rv_window_days), f"{asset} - GARCH Indicators"),
+        ("vol_term", lambda: create_volatility_term_structure_chart(df), f"{asset} - Volatility Term Structure"),
+        ("compression", lambda: create_compression_indicators_chart(df), f"{asset} - Compression Indicators"),
+        ("early_warning", lambda: create_early_warning_signals_chart(df), f"{asset} - Early Warning Signals"),
+        ("microstructure", lambda: create_microstructure_indicators_chart(df), f"{asset} - Microstructure Indicators"),
+        ("calibration", lambda: create_calibration_summary_chart(asset, snap["backtest_breakout"], snap["backtest_rtl"]), f"{asset} - Calibration Summary"),
+        ("forward_outcome", lambda: create_forward_outcome_chart(asset, snap["backtest_breakout"], snap["backtest_rtl"]), f"{asset} - Forward Outcome"),
+        ("duration_dist", lambda: create_regime_duration_distribution_chart(df, asset, current_regime, days_in_regime), f"{asset} - Regime Duration Distribution"),
+        ("vol_percentile", lambda: create_volatility_percentile_time_series(df, rv_col, rv_window_days), f"{asset} - Volatility Percentile"),
+        ("rolling_corr", lambda: create_rolling_correlation_chart(df, 30, rv_col, rv_window_days), f"{asset} - Rolling Correlation"),
+        ("drawdowns", lambda: create_drawdowns_by_regime_chart(df, asset), f"{asset} - Drawdowns by Regime"),
+        ("seasonality", lambda: create_seasonality_heatmap_chart(df), f"{asset} - Seasonality"),
+        ("expected_move", lambda: create_expected_move_by_regime_chart(df, asset), f"{asset} - Expected Move by Regime"),
+        ("return_skew", lambda: create_return_skew_by_regime_chart(df, asset), f"{asset} - Return Skew by Regime"),
+        ("autocorr", lambda: create_autocorrelation_returns_chart(df), f"{asset} - Return Autocorrelation"),
+    ]
+    for key, build, name in charts:
+        if not _on(key):
+            continue
+        try:
+            fig = build()
+        except Exception:
+            failed.append(f"{name} (build)")
+            continue
         if fig is not None and _send_chart(fig, name):
             sent += 1
         elif fig is not None:
@@ -703,22 +721,26 @@ def send_asset_report_to_telegram(asset: str, snap: dict, rv_window_days: int) -
     return sent, failed
 
 
-def send_all_reports_to_telegram(days_back: int, rv_window_days: int) -> tuple[int, list[str]]:
+def send_all_reports_to_telegram(days_back: int, rv_window_days: int,
+                                 assets: list | None = None,
+                                 only: set | None = None) -> tuple[int, list[str]]:
     total_sent, total_failed = 0, []
-    rv_frames = regime.get_cross_asset_rv_frames(days_back)
-    cross_fig = create_cross_asset_volatility_chart(rv_frames)
-    if cross_fig is not None:
-        if _send_chart(cross_fig, "Cross-Asset 30d Volatility (BTC / ETH)"):
-            total_sent += 1
-        else:
-            total_failed.append("Cross-Asset 30d Volatility")
-    for asset in REGIME_ASSETS:
+    if only is None or "cross_asset" in only:
+        rv_frames = regime.get_cross_asset_rv_frames(days_back)
+        cross_fig = create_cross_asset_volatility_chart(rv_frames)
+        if cross_fig is not None:
+            if _send_chart(cross_fig, "Cross-Asset 30d Volatility (BTC / ETH)"):
+                total_sent += 1
+            else:
+                total_failed.append("Cross-Asset 30d Volatility")
+    per_asset = only is None or bool(set(only) - {"cross_asset"})
+    for asset in (assets or REGIME_ASSETS) if per_asset else []:
         df, err = regime.get_processed_df(asset, days_back)
         if err or df is None:
             total_failed.append(f"{asset} (data unavailable: {err})")
             continue
         snap = regime.compute_snapshot(asset, df, rv_window_days)
-        sent, failed = send_asset_report_to_telegram(asset, snap, rv_window_days)
+        sent, failed = send_asset_report_to_telegram(asset, snap, rv_window_days, only=only)
         total_sent += sent
         total_failed.extend(failed)
     return total_sent, total_failed
@@ -1163,6 +1185,24 @@ def main() -> None:
                                 else:
                                     st.success(f"Sent {sent} chart(s) to Telegram.")
 
+
+# ---------------------------------------------------------------------------
+# Home chart blast (lib/blast.py): send the selected charts with the page's
+# default settings (30d RV window, 720 days of history), then move on.
+# ---------------------------------------------------------------------------
+_blast_step = blast.active_step("regime")   # clears the flag if Telegram isn't configured
+if _blast_step is not None:
+    _r_assets = blast.assets_for(_blast_step)
+    blast.banner(_blast_step, f"refreshing Regime Identifier for {', '.join(_r_assets)} "
+                              "and sending to Telegram…")
+    cache_lib.clear_all_caches()
+    try:
+        with st.spinner("Sending Regime Identifier reports…"):
+            _sent, _failed = send_all_reports_to_telegram(720, 30, assets=_r_assets,
+                                                          only=blast.selected(_blast_step))
+    except Exception as _exc:  # never leave the flag stuck on a build error
+        _sent, _failed = 0, [f"Regime Identifier failed: {_exc}"]
+    blast.finish(_blast_step, _sent, _failed)
 
 try:
     main()

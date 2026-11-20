@@ -24,7 +24,7 @@ import streamlit as st
 
 from lib import cache as cache_lib
 from lib import commands as cmdreg
-from lib import fx_style, surface, telegram
+from lib import blast, freshness, fx_style, surface, telegram
 from lib.constants import ASSETS, ASSET_COLORS
 from lib.telegram_caption import caption_from_title
 
@@ -80,7 +80,7 @@ def _fresh_lib_modules() -> list[str]:
     return reloaded
 
 
-_RELOADED = _fresh_lib_modules()
+_RELOADED = _fresh_lib_modules() + freshness.reload_if_changed(blast)
 
 st.set_page_config(page_title="MCM Bot", page_icon="🤖", layout="wide",
                    initial_sidebar_state="expanded")
@@ -466,26 +466,40 @@ def send_result_to_telegram(asset: str, cmd_name: str, fig, df, text) -> tuple[b
     return ok, reasons
 
 
-def _telegram_queue(assets: list[str], results: dict) -> list[tuple]:
+VOL_SURFACES = "vol_surfaces"  # Home selector item: vol_run's per-expiry surface charts
+
+
+def _telegram_queue(assets: list[str], results: dict,
+                    only: set[str] | None = None) -> list[tuple]:
     """Ordered (asset, cmd_name, fig, df, text) tuples to send for `assets`,
     in dashboard order. vol_run's table is queued under its own command
     name; its per-expiry vol-surface charts are queued right after
-    moonphase, matching where they render in the dashboard."""
+    moonphase, matching where they render in the dashboard. ``only`` (the
+    Home blast selection) limits it to those commands, plus the surfaces
+    when it holds ``VOL_SURFACES``; None = everything."""
+    want = (lambda cn: True) if only is None else (lambda cn: cn in only)
     order = [(a, cn) for a in assets for cn in cmdreg.COMMAND_NAMES]
     to_send = []
     for (a, cn) in order:
-        if (a, cn) not in results:
-            continue
-        fig, df, text = results[(a, cn)]
-        to_send.append((a, cn, None, df, text) if cn == "vol_run"
-                       else (a, cn, fig, df, text))
-        if cn == "moonphase" and (a, "vol_run") in results:
+        if (a, cn) in results and want(cn):
+            fig, df, text = results[(a, cn)]
+            to_send.append((a, cn, None, df, text) if cn == "vol_run"
+                           else (a, cn, fig, df, text))
+        if cn == "moonphase" and (a, "vol_run") in results and want(VOL_SURFACES):
             f_list, _, _ = results[(a, "vol_run")]
             if isinstance(f_list, list):
                 for i, f in enumerate(f_list):
                     if f is not None:
                         to_send.append((a, f"vol_surface_{i}", f, None, None))
     return to_send
+
+
+def _commands_needed(only: set[str] | None) -> list[str]:
+    """Commands to run for a selection (vol surfaces come from vol_run)."""
+    if only is None:
+        return list(cmdreg.COMMAND_NAMES)
+    return [cn for cn in cmdreg.COMMAND_NAMES
+            if cn in only or (cn == "vol_run" and VOL_SURFACES in only)]
 
 
 def _stale_expiry_commands(asset: str, results: dict) -> list[str]:
@@ -498,32 +512,34 @@ def _stale_expiry_commands(asset: str, results: dict) -> list[str]:
             and built.get((asset, cn)) != cur]
 
 
-def _send_to_telegram(assets: list[str]) -> None:
+def _send_to_telegram(assets: list[str], only: set[str] | None = None) -> tuple[int, list[str]]:
     """Ensure every command is loaded for `assets` (running only what's
     missing — a single-asset button doesn't force-load the other 3), then
-    send them all to Telegram as images. Shared by the per-asset buttons
-    and the "All" button."""
+    send them all to Telegram as images. Shared by the per-asset buttons,
+    the "All" button and the Home blast (``only`` = its selected commands).
+    Returns (reports sent, failure reasons)."""
+    needed = _commands_needed(only)
     results = st.session_state.mcm_all_results or {}
     missing = [a for a in assets
-              if any((a, cn) not in results for cn in cmdreg.COMMAND_NAMES)]
+              if any((a, cn) not in results for cn in needed)]
     if missing:
         with st.spinner(f"Running commands for {', '.join(missing)}…"):
             results = dict(results)
-            run_reports(missing, list(cmdreg.COMMAND_NAMES),
+            run_reports(missing, needed,
                         st.session_state.get("mcm_dte_days", 30),
                         merge_into=results)
             st.session_state.mcm_all_results = results
             st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
     # Don't send expiry charts built for a previously selected Default expiry.
     for a in assets:
-        stale = _stale_expiry_commands(a, results)
+        stale = [cn for cn in _stale_expiry_commands(a, results) if cn in needed]
         if stale:
             with st.spinner(f"Updating {a} expiry charts for the selected expiry…"):
                 run_reports([a], stale, st.session_state.get("mcm_dte_days", 30),
                             merge_into=results)
                 st.session_state.mcm_all_results = results
 
-    to_send = _telegram_queue(assets, results)
+    to_send = _telegram_queue(assets, results, only)
     sent = failed = 0
     all_reasons: list[str] = []
     n_total = max(1, len(to_send))
@@ -562,6 +578,9 @@ def _send_to_telegram(assets: list[str]) -> None:
                 "the built-in retries.")
             for r in all_reasons:
                 st.markdown(f"- {r}")
+    if failed and not all_reasons:
+        all_reasons.append(f"{failed} report(s) failed")
+    return sent, all_reasons
 
 
 # Commands per asset run concurrently. Safe because lib.deribit serialises
@@ -715,33 +734,28 @@ if cache_lib.expire_stale_auto_pipeline():
     st.caption("Auto pipeline timed out after 15 minutes and was cleared.")
 
 # ---------------------------------------------------------------------------
-# Auto pipeline (triggered from the Home page's "Refresh BTC/ETH & send to
-# Telegram" button): refresh BTC+ETH here and send to Telegram, then hand
-# off to the Block Trades page for its own BTC+ETH step. Single-shot: the
-# flag is advanced to "block_trades" (or cleared) before this block can
-# ever run twice.
+# Auto pipeline (the Home page's "Refresh BTC/ETH & send to Telegram" chart
+# blast, see lib/blast.py): refresh the selected assets' selected commands
+# here and send them, then hand off to the next page with something
+# selected. Single-shot: blast.finish advances (or clears) the flag before
+# this block could run twice.
 # ---------------------------------------------------------------------------
-if st.session_state.get("auto_pipeline") == "mcm_bot":
-    if telegram.is_configured():
-        _auto_assets = [a for a in ASSETS if a in ("BTC", "ETH")]
-        st.info(f"🔄📤 Auto pipeline — step 1/4: refreshing MCM Bot data for "
-                f"{', '.join(_auto_assets)} and sending to Telegram…")
-        with st.spinner(f"Refreshing MCM Bot commands for {', '.join(_auto_assets)}…"):
-            cache_lib.clear_all_caches()
-            _merged = dict(st.session_state.mcm_all_results or {})
-            run_reports(_auto_assets, list(cmdreg.COMMAND_NAMES),
-                        st.session_state.get("mcm_dte_days", 30),
-                        merge_into=_merged)
-            st.session_state.mcm_all_results = _merged
-            st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
-        _send_to_telegram(_auto_assets)
-        st.session_state["auto_pipeline"] = "block_trades"
-        st.switch_page("pages/02_Block_Trades_-_Deribit.py")
-    else:
-        # Shouldn't happen — the Home page button is disabled when Telegram
-        # isn't configured — but clear the flag rather than getting stuck.
-        st.session_state["auto_pipeline"] = None
-        st.session_state["auto_pipeline_started_at"] = None
+_blast_step = blast.active_step("mcm")
+if _blast_step is not None:
+    _auto_assets = blast.assets_for(_blast_step)
+    _only = blast.selected(_blast_step)
+    blast.banner(_blast_step, f"refreshing MCM Bot data for {', '.join(_auto_assets)} "
+                              "and sending to Telegram…")
+    with st.spinner(f"Refreshing MCM Bot commands for {', '.join(_auto_assets)}…"):
+        cache_lib.clear_all_caches()
+        _merged = dict(st.session_state.mcm_all_results or {})
+        run_reports(_auto_assets, _commands_needed(_only),
+                    st.session_state.get("mcm_dte_days", 30),
+                    merge_into=_merged)
+        st.session_state.mcm_all_results = _merged
+        st.session_state.mcm_all_results_ts = datetime.now(timezone.utc)
+    _sent, _reasons = _send_to_telegram(_auto_assets, _only)
+    blast.finish(_blast_step, _sent, _reasons)
 
 # ---------------------------------------------------------------------------
 # Toolbar — expiry + load/refresh/core/send, one compact row instead of three

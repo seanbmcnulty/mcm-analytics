@@ -35,6 +35,7 @@ from lib import eco_refresh
 from lib import eco_style as es
 from lib import fx_style
 from lib import strategy_8k
+from lib import blast, freshness
 
 
 def _fresh_lib_modules():
@@ -85,7 +86,7 @@ def _fresh_lib_modules():
     return reloaded
 
 
-_RELOADED = _fresh_lib_modules()
+_RELOADED = _fresh_lib_modules() + freshness.reload_if_changed(blast)
 
 st.set_page_config(page_title="Ecoinometrics Charts", page_icon="📰",
                    layout="wide", initial_sidebar_state="expanded")
@@ -124,7 +125,27 @@ st.sidebar.caption(
 )
 
 
+# Home chart blast (lib/blast.py "eco.*"): while a step runs, each chart shown
+# is remembered under its tab and the selected tabs are sent at the bottom.
+ECO_TAB_KEYS = ("etf_streaks", "hacks", "fed_tone", "btc_200dma", "nasdaq_corr", "inflation",
+                "ratio_200dma", "etf_regime", "etf_30d", "nasdaq_down", "drawdowns", "strategy")
+_blast_step = blast.active_step("eco")   # clears the flag if Telegram isn't configured
+_cur_tab = None
+_SHOWN: list = []
+
+
+if _blast_step is not None:
+    blast.banner(_blast_step, "drawing the charts and sending the selected tabs to Telegram…")
+
+
+def _tab(i: int) -> None:
+    global _cur_tab
+    _cur_tab = ECO_TAB_KEYS[i]
+
+
 def show(fig):
+    if _blast_step is not None:
+        _SHOWN.append((_cur_tab, fig))
     st.plotly_chart(fig, theme=None, width="stretch", config={"displaylogo": False})
 
 
@@ -489,6 +510,7 @@ px = _load_btc()
 
 # ------------------------------------------------------------------ ETF flows
 with tabs[0]:
+    _tab(0)
     flows = _safe(_load_etf)
     if flows is not None and px is not None:
         fb = eco.flows_to_btc(flows, px)
@@ -523,6 +545,7 @@ with tabs[0]:
 
 # ----------------------------------------------------------------- Hacks study
 with tabs[1]:
+    _tab(1)
     try:
         hacks = _load_hacks()
     except Exception as ex:
@@ -543,6 +566,7 @@ with tabs[1]:
 
 # --------------------------------------------------------------------- Fed tone
 with tabs[2]:
+    _tab(2)
     try:
         ft = _load_fed()
     except Exception as ex:
@@ -610,6 +634,7 @@ with tabs[2]:
 
 # ------------------------------------------------------------------ 200DMA
 with tabs[3]:
+    _tab(3)
     if px is not None:
         g = eco.sma_gap(px, 200)
         gw = g[g["date"] >= cutoff]
@@ -640,6 +665,7 @@ with tabs[3]:
 
 # ------------------------------------------------------------ Nasdaq correlation
 with tabs[4]:
+    _tab(4)
     nq = _safe(_load_fred, "NASDAQCOM")
     if nq is not None and px is not None:
         c = eco.rolling_corr(px, nq, int(corr_win))
@@ -656,6 +682,7 @@ with tabs[4]:
 
 # ------------------------------------------------------------- Inflation / yields
 with tabs[5]:
+    _tab(5)
     cpi, y10 = _safe(_load_fred, "CPIAUCSL"), _safe(_load_fred, "DGS10")
     if cpi is not None:
         cpi = cpi.assign(yoy=cpi["value"].pct_change(12) * 100).dropna()
@@ -678,6 +705,7 @@ with tabs[5]:
 
 # ------------------------------------------------------- close / 200-day ratio
 with tabs[6]:
+    _tab(6)
     st.caption(
         "Bitcoin close divided by its 200-calendar-day average, coloured by the close. "
         "Inspired by the 6 Nov 2026 Ecoinometrics chart "
@@ -713,6 +741,7 @@ with tabs[6]:
 
 # ------------------------------------------------------- ETF flow regime
 with tabs[7]:
+    _tab(7)
     st.caption(
         "Daily US spot BTC ETF net flow in BTC, coloured by MCM's trailing-flow regime. "
         "Inspired by the 6 Nov 2026 Ecoinometrics chart "
@@ -798,6 +827,7 @@ def _btc_closes_since_2013():
 
 # --------------------------------------------------- 30-session ETF flow line
 with tabs[8]:
+    _tab(8)
     try:
         st.caption(
             "Rolling 30-session net flow into US spot BTC ETFs, in BTC, with the line coloured by the BTC price. "
@@ -824,6 +854,7 @@ with tabs[8]:
 
 # ------------------------------------------------------ Nasdaq down days
 with tabs[9]:
+    _tab(9)
     try:
         st.caption(
             "Bitcoin's same-day return on every Nasdaq-100 down day since 2014, grouped by how far the Nasdaq-100 fell. "
@@ -854,6 +885,7 @@ with tabs[9]:
 
 # --------------------------------------------------------- Drawdowns
 with tabs[10]:
+    _tab(10)
     try:
         st.caption(
             "Every Bitcoin drawdown since 2014, duration against depth. Inspired by the 13 Nov 2026 Ecoinometrics chart. "
@@ -886,6 +918,7 @@ with tabs[10]:
 
 # --------------------------------------------------- Strategy funding
 with tabs[11]:
+    _tab(11)
     try:
         st.caption(
             "Where Strategy (MSTR) raised money and what it spent it on in the week covered by its latest Monday 8-K. "
@@ -918,3 +951,19 @@ st.caption(
     "The ETF regime colours are an MCM approximation, not their model or their data. No trading advice."
 )
 _paint_status()
+
+# ---------------------------------------------------------------------------
+# Home chart blast: send the selected tabs' charts (as drawn), then move on.
+# ---------------------------------------------------------------------------
+if _blast_step is not None:
+    _want = blast.selected(_blast_step)
+    _titles = dict(zip(ECO_TAB_KEYS, ["ETF flow streaks", "Exchange hacks", "Fed tone", "BTC vs 200DMA",
+                                      "BTC–Nasdaq correlation", "Inflation & yields", "BTC / 200DMA ratio",
+                                      "ETF flow regime", "30-day ETF flow", "Nasdaq down days", "Drawdowns",
+                                      "Strategy funding"]))
+    _pairs = [(f, f"Ecoinometrics — {_titles[k]}") for k, f in _SHOWN if k in _want]
+    with st.spinner("Sending Ecoinometrics charts to Telegram…"):
+        _sent, _failed = blast.send_figs(_pairs, light_theme=False)
+    _empty = sorted(_titles[k] for k in _want if not any(t == k for t, _ in _SHOWN))
+    blast.finish(_blast_step, _sent, _failed,
+                 note=(f"no chart drawn for {', '.join(_empty)}" if _empty else None))

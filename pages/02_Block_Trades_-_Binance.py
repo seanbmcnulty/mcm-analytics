@@ -10,6 +10,10 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from lib import binance, block_flow
+from lib import blast, block_flow, freshness, binance
+
+# Pick up a changed lib.block_flow / lib.blast after a Cloud redeploy (old code
+# stays in memory otherwise, and the Home chart blast hook would be missing).
+freshness.reload_if_changed(blast, block_flow)
 
 block_flow.render_page(binance.VENUE)
