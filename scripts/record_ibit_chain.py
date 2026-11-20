@@ -35,7 +35,7 @@ _GRACEFUL = {"recorded", "skipped", "closed", "too_early"}
 
 def _fetch():
     now = datetime.now(timezone.utc)
-    payload = ibit.fetch_raw("IBIT")
+    payload = ibit.fetch_raw("IBIT", attempts=ibit.CBOE_ATTEMPTS)
     return ibit.parse_cboe(payload, now)
 
 
@@ -43,6 +43,14 @@ def cmd_record() -> int:
     now = datetime.now(timezone.utc)
     status = ibit.record_chain_snapshot(now, _fetch)
     print(f"[IBIT] {status}")
+    if status == "error":
+        err = ibit.LAST_RECORD_ERROR.get("error", "unknown error")
+        print(f"::error::IBIT chain record failed: {err}")
+        tb = ibit.LAST_RECORD_ERROR.get("traceback")
+        if tb:
+            print(tb.rstrip(), file=sys.stderr)
+    elif status == "no_data":
+        print("::error::Cboe returned a chain with no usable rows for this session.")
     decision, session = ibit.recording_decision(now)
     if decision == "ok" and session is not None and not ibit.holiday_list_covers(session):
         print(f"WARNING: NYSE holiday list covers {min(ibit.HOLIDAY_YEARS)}-"

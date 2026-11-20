@@ -31,6 +31,7 @@ import csv
 import io
 import re
 import time as _time
+import traceback
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -62,20 +63,54 @@ TENORS = [7, 14, 30, 60, 90, 180]
 # Fetch + parse
 # --------------------------------------------------------------------------
 
-def fetch_raw(symbol: str = "IBIT", timeout: float = 25.0) -> dict:
-    """Download the Cboe delayed chain (follows the cdn -> cdn-api redirect)."""
-    last: Exception | None = None
-    for url in CBOE_URLS:
-        try:
-            r = requests.get(url.format(sym=symbol), timeout=timeout,
-                             headers={"User-Agent": "Mozilla/5.0 (MCM Analytics)"})
-            r.raise_for_status()
-            payload = r.json()
-            if payload.get("data", {}).get("options"):
-                return payload
-        except Exception as e:  # noqa: BLE001 - try the next host
-            last = e
-    raise RuntimeError(f"Cboe delayed chain unavailable for {symbol}: {last}")
+# Cboe's Cloudflare front returns 403 to API clients that send no cboe.com
+# Referer (seen from GitHub Actions runners and the box since Nov 2026).  The
+# browser chain viewer sends these headers, so the request looks like it.
+CBOE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/130.0 Safari/537.36 (MCM Analytics)"),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.cboe.com/",
+    "Origin": "https://www.cboe.com",
+}
+CBOE_ATTEMPTS = 3            # passes the recorder makes over CBOE_URLS (pages use 1)
+CBOE_BACKOFF_S = 3.0         # sleep between passes: 3 s, then 6 s
+
+
+def _describe_error(e: Exception) -> str:
+    """``ExcType: message`` with the HTTP status when there is one."""
+    resp = getattr(e, "response", None)
+    status = getattr(resp, "status_code", None)
+    tail = f" (HTTP {status})" if status is not None and str(status) not in str(e) else ""
+    return f"{type(e).__name__}: {e}{tail}"
+
+
+def fetch_raw(symbol: str = "IBIT", timeout: float = 25.0,
+              attempts: int = 1, backoff: float = CBOE_BACKOFF_S) -> dict:
+    """Download the Cboe delayed chain (follows the cdn -> cdn-api redirect).
+
+    Tries every host; with ``attempts`` > 1 it retries the whole set with a
+    short backoff (the recorder does; a page keeps a single pass).  The
+    error raised at the end names each failure so a log says why.
+    """
+    errors: list[str] = []
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            _time.sleep(backoff * attempt)
+        for url in CBOE_URLS:
+            u = url.format(sym=symbol)
+            try:
+                r = requests.get(u, timeout=timeout, headers=CBOE_HEADERS)
+                r.raise_for_status()
+                payload = r.json()
+                if payload.get("data", {}).get("options"):
+                    return payload
+                errors.append(f"{u}: ValueError: response has no data.options")
+            except Exception as e:  # noqa: BLE001 - try the next host
+                errors.append(f"{u}: {_describe_error(e)}")
+    shown = "; ".join(errors[-len(CBOE_URLS):])
+    raise RuntimeError(f"Cboe delayed chain unavailable for {symbol} after "
+                       f"{max(1, attempts)} attempt(s): {shown}")
 
 
 def _bs_greeks(F, K, T, iv, is_call):
@@ -1183,6 +1218,10 @@ def snapshot_rows_from_chain(df: pd.DataFrame, session: date, recorded_at: datet
     return _normalize_store(out)
 
 
+# Why the last record_chain_snapshot() returned "error" (for the recorder log).
+LAST_RECORD_ERROR: dict[str, str] = {}
+
+
 def record_chain_snapshot(now: datetime, fetch, base: Path | None = None) -> str:
     """Append today's close, or say why it didn't.
 
@@ -1192,6 +1231,7 @@ def record_chain_snapshot(now: datetime, fetch, base: Path | None = None) -> str
     returns ``(chain dataframe, meta)`` and is not called on a skip, a closure,
     or before the gate.
     """
+    LAST_RECORD_ERROR.clear()
     try:
         decision, session = recording_decision(now)
         if decision != "ok":
@@ -1212,7 +1252,9 @@ def record_chain_snapshot(now: datetime, fetch, base: Path | None = None) -> str
             return "no_data"
         append_chain_snapshot(rows, base)
         return "recorded"
-    except Exception:
+    except Exception as exc:
+        LAST_RECORD_ERROR["error"] = _describe_error(exc)
+        LAST_RECORD_ERROR["traceback"] = traceback.format_exc()
         return "error"
 
 
