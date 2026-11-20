@@ -143,6 +143,7 @@ def fetch_dvol_daily(currency: str, start: str = DVOL_START, get=None) -> pd.Ser
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close"]).drop_duplicates("ts")
     s = pd.Series(df["close"].astype(float).values,
                   index=pd.to_datetime(df["ts"], unit="ms").dt.normalize(), name=currency).sort_index()
+    s = s[s.index < pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()]   # today's candle is unfinished
     s.index.name = "date"
     return s
 

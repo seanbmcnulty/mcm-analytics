@@ -139,7 +139,8 @@ def _analysis(asset: str, lookback: str, pred_key: str, _df: pd.DataFrame, _full
         "gr_rev": vl.granger(vl.change(_df, "VIX"), y, 5),
         "gr_pred_fwd": vl.granger(y, x, 5),
         "gr_pred_rev": vl.granger(x, y, 5),
-        "rank": vl.ranking_table(_df, list(avail), vl.HORIZONS, min_train),
+        "rank": vl.ranking_table(_df, list(avail), vl.HORIZONS, min_train, spec="change"),
+        "rank_full": vl.ranking_table(_df, list(avail), vl.HORIZONS, min_train, spec="full"),
         "vix_reg": [vl.predictive_regression(_df, "VIX", h, min_train) for h in vl.HORIZONS],
         "rc": vl.rich_cheap(_full),
         "roll": vl.rolling_beta_corr(y, x, 63),
@@ -308,9 +309,13 @@ show(vlc.rolling(A["roll"], asset, pred_key), "rolling")
 
 # ------------------------------------------------------------------ 7. ranking
 st.subheader("7 · Ranking: which TradFi gauge adds the most out-of-sample power?")
-rank = A["rank"]
+spec_choice = st.radio("Predictor information added", ["Daily change only", "Change + level"], horizontal=True,
+                       key="vl_rank_spec", help="Change only = the day's news (1 extra parameter). Change + level "
+                       "also adds where the gauge sits (2 parameters); more parameters cost more estimation noise.")
+rank = A["rank"] if spec_choice == "Daily change only" else A["rank_full"]
 if not rank.empty:
-    show(vlc.ranking_heatmap(rank, asset), "ranking")
+    show(vlc.ranking_heatmap(rank, asset, "daily change" if spec_choice == "Daily change only" else "change and level"),
+         "ranking")
     tbl = rank.pivot_table(index="label", columns="h", values="oos_r2_gain_pct")
     tbl.columns = [f"{h}d OOS gain %" for h in tbl.columns]
     pv = rank.pivot_table(index="label", columns="h", values="cw_p")
@@ -319,8 +324,9 @@ if not rank.empty:
     out = out[[c_ for h in vl.HORIZONS for c_ in (f"{h}d OOS gain %", f"{h}d CW p") if c_ in out]]
     out = out.sort_values(out.columns[0], ascending=False)
     st.dataframe(out.style.format("{:+.2f}"), width="stretch")
-    st.caption("Each predictor adds its daily change and level to a DVOL-only model (DVOL's own change and level). "
-               "Positive = better real-time forecasts than DVOL alone. CW p < 0.05 = statistically significant.")
+    st.caption("Baseline: DVOL's own daily change and level. Positive = better real-time forecasts than DVOL alone. "
+               "CW p < 0.05 = the predictor's forecasts beat the baseline after adjusting for estimation noise "
+               "(Clark-West), even when the raw OOS R² gain is tiny. The verdict uses the change-only ranking.")
 
 st.divider()
 st.caption("Research view, not trading advice. MOVE is in bp of Treasury yield vol, so DVOL/MOVE is a relative "
@@ -328,7 +334,7 @@ st.caption("Research view, not trading advice. MOVE is in bp of Treasury yield v
 
 # ------------------------------------------------------------------ blast send
 if _blast_step is not None:
-    _want = {k.rsplit(".", 1)[1] for k in blast.selected(_blast_step)}
+    _want = {k.rsplit(".", 1)[-1] for k in blast.selected(_blast_step)}
     _titles = {"rich_cheap": "Rich/cheap vs TradFi", "rich_cheap_q": "Rich/cheap quintiles",
                "levels": "DVOL vs VIX & MOVE", "spreads": "Spreads & ratios", "leadlag": "Lead-lag",
                "events_vix": "After VIX spikes", "events_move": "After MOVE spikes", "rolling": "Rolling beta",

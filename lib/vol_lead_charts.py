@@ -106,12 +106,13 @@ def rich_cheap(df: pd.DataFrame, rc: pd.DataFrame, asset: str) -> go.Figure:
     fig.add_scatter(x=rc.index, y=rc["fair"], name="Fair value", line=dict(color=fx.NAVY, width=1.4, dash="dash"),
                     row=1, col=1)
     s = rc["score"]
-    fig.add_bar(x=rc.index, y=s.where(s > 0), name="Rich", marker_color=fx.RED, row=2, col=1)
-    fig.add_bar(x=rc.index, y=s.where(s <= 0), name="Cheap", marker_color=fx.GREEN, row=2, col=1)
+    fig.add_scatter(x=rc.index, y=s.clip(lower=0), name="Rich", fill="tozeroy", mode="lines",
+                    line=dict(color=fx.RED, width=0.8), fillcolor="rgba(192,57,43,0.45)", row=2, col=1)
+    fig.add_scatter(x=rc.index, y=s.clip(upper=0), name="Cheap", fill="tozeroy", mode="lines",
+                    line=dict(color=fx.GREEN, width=0.8), fillcolor="rgba(14,122,56,0.45)", row=2, col=1)
     for y in (1, -1):
         fig.add_hline(y=y, line=dict(color=fx.GREY, dash="dot", width=1), row=2, col=1)
     _base(fig, f"Is {asset} vol rich or cheap vs TradFi vol?", height=620)
-    fig.update_layout(bargap=0)
     return _done(fig, "Score = mean of the fair-value residual z and the 1y z-scores of DVOL/VIX and DVOL/MOVE.")
 
 
@@ -126,7 +127,7 @@ def quintile_bars(q: pd.DataFrame, asset: str) -> go.Figure:
     return _done(fig, "Full-sample quintile edges (descriptive).")
 
 
-def ranking_heatmap(rank: pd.DataFrame, asset: str) -> go.Figure:
+def ranking_heatmap(rank: pd.DataFrame, asset: str, spec_label: str = "daily change") -> go.Figure:
     piv = rank.pivot_table(index="label", columns="h", values="oos_r2_gain_pct")
     pv = rank.pivot_table(index="label", columns="h", values="cw_p")
     order = piv.mean(axis=1).sort_values().index
@@ -138,4 +139,5 @@ def ranking_heatmap(rank: pd.DataFrame, asset: str) -> go.Figure:
                                zmid=0, zmin=-lim, zmax=lim, colorbar=dict(title="OOS R² gain %")))
     _base(fig, f"Which TradFi gauge adds out-of-sample power for {asset} DVOL?", height=420)
     fig.update_layout(hovermode="closest")
-    return _done(fig, "Gain in out-of-sample R² over a DVOL-only model (expanding window). * = Clark-West p < 0.05.")
+    return _done(fig, f"Gain in out-of-sample R² over a DVOL-only model from adding the predictor's {spec_label} "
+                      "(expanding window). * = Clark-West p < 0.05.")

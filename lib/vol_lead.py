@@ -197,11 +197,20 @@ def baseline_features(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"dDVOL": df["DVOL"].diff(), "DVOL": df["DVOL"]}, index=df.index)
 
 
-def predictor_features(df: pd.DataFrame, key: str) -> pd.DataFrame:
-    """Today's change and level-gap of one predictor (all known at t)."""
+SPECS = ("change", "full")
+
+
+def predictor_features(df: pd.DataFrame, key: str, spec: str = "full") -> pd.DataFrame:
+    """One predictor's information at t.
+
+    ``change``: today's change only (the "news"). ``full``: change and level
+    (plus the DVOL-VIX spread for the VIX).
+    """
     if key not in df or df[key].notna().sum() < 50:
         return pd.DataFrame(index=df.index)
     d = change(df, key)
+    if spec == "change":
+        return pd.DataFrame({f"d{key}": d}, index=df.index)
     lvl = df[key] if key != "DXY" else rolling_z(np.log(df[key]), 63)
     out = pd.DataFrame({f"d{key}": d, f"{key}_lvl": lvl}, index=df.index)
     if key == "VIX":
@@ -259,11 +268,12 @@ def oos_r2(y: pd.Series, f_model: pd.Series, f_base: pd.Series) -> tuple[float, 
     return 1.0 - float((e_m ** 2).sum() / (e_b ** 2).sum()), len(d)
 
 
-def predictive_regression(df: pd.DataFrame, key: str, h: int, min_train: int = TRADING_YEAR) -> dict:
+def predictive_regression(df: pd.DataFrame, key: str, h: int, min_train: int = TRADING_YEAR,
+                          spec: str = "full") -> dict:
     """DVOL(t+h) - DVOL(t) on DVOL's own change/level plus one predictor."""
     y = forward_change(df["DVOL"], h)
     base = baseline_features(df)
-    feats = predictor_features(df, key)
+    feats = predictor_features(df, key, spec)
     if feats.empty:
         return {"predictor": key, "h": h, "ok": False}
     full = pd.concat([y.rename("y"), base, feats], axis=1).dropna()
@@ -291,16 +301,21 @@ def predictive_regression(df: pd.DataFrame, key: str, h: int, min_train: int = T
 
 
 def ranking_table(df: pd.DataFrame, predictors=None, horizons=HORIZONS,
-                  min_train: int = TRADING_YEAR) -> pd.DataFrame:
+                  min_train: int = TRADING_YEAR, spec: str = "change") -> pd.DataFrame:
+    """OOS R^2 gain of each predictor over the DVOL-only model, per horizon.
+
+    Default ``spec="change"`` adds only the predictor's daily change (fewest
+    parameters, so estimation noise does not swamp a small signal).
+    """
     rows = []
     for key in (predictors or PREDICTORS):
         for h in horizons:
-            r = predictive_regression(df, key, h, min_train)
+            r = predictive_regression(df, key, h, min_train, spec)
             if not r.get("ok"):
                 continue
             # the t-stat of the predictor's own change (its "news")
             rows.append({
-                "predictor": key, "label": PREDICTORS.get(key, key), "h": h,
+                "predictor": key, "label": PREDICTORS.get(key, key), "h": h, "spec": spec,
                 "oos_r2_gain_pct": 100 * r["oos_r2_vs_base"],
                 "cw_p": r["cw_p"], "in_sample_r2_gain_pct": 100 * r["r2_gain"],
                 "t_change": r["t"].get(f"d{key}", np.nan), "coef_change": r["coef"].get(f"d{key}", np.nan),
