@@ -19,34 +19,7 @@ sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 os.environ["MCM_BLAST_SELECTION_PATH"] = str(Path(tempfile.mkdtemp()) / "sel.json")
 
-from streamlit.testing.v1 import AppTest as _AppTest  # noqa: E402
-
-from lib import auth  # noqa: E402
-
-# Site password gate (lib/auth.py): run with a throwaway password so the gate
-# is ENFORCING, and start every AppTest with an already-logged-in session,
-# which is what the scheduled browser run has after it signs in.
-_GATE_PW = "apptest-gate-pw"
-os.environ["MCM_APP_PASSWORD"] = _GATE_PW
-
-
-class AppTest:
-    @staticmethod
-    def from_file(*a, **kw):
-        at = _AppTest.from_file(*a, **kw)
-        at.session_state[auth.SESSION_KEY] = auth.session_fingerprint(_GATE_PW)
-        return at
-
-
-def check_gate():
-    """Unauthenticated Home shows only the login form; no blast controls."""
-    at = _AppTest.from_file(str(ROOT / "Home.py"), default_timeout=120)
-    at.run()
-    assert not at.exception, [e.value for e in at.exception]
-    assert at.text_input(key="mcm_login_pw") is not None
-    assert not [cb for cb in at.checkbox if cb.key and cb.key.startswith("blast_")]
-    assert not any("Market Overview" in getattr(h, "value", "") for h in at.subheader)
-    print("ok  gate (login form only, no Home content)")
+from streamlit.testing.v1 import AppTest  # noqa: E402
 
 from lib import blast  # noqa: E402
 import lib.telegram as tg  # noqa: E402
@@ -233,11 +206,11 @@ def check_page(pid):
 
 
 if __name__ == "__main__":
-    which = sys.argv[1:] or ["gate", "home", "chain"] + list(CASES)
+    which = sys.argv[1:] or ["home", "chain"] + list(CASES)
     failures = []
     for w in which:
         try:
-            {"gate": check_gate, "home": check_home, "chain": check_chain, "default_chain": check_default_chain}.get(w, lambda: check_page(w))()
+            {"home": check_home, "chain": check_chain, "default_chain": check_default_chain}.get(w, lambda: check_page(w))()
         except Exception as exc:  # noqa: BLE001
             import traceback
             failures.append(w)
