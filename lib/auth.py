@@ -201,7 +201,7 @@ def _fail_open_warning() -> None:
         st.warning("🔓 Password protection isn't configured yet. Add `[auth] password` "
                    "to the app's Streamlit secrets to turn on the login screen.")
     with c2:
-        st.button("Dismiss", key="_mcm_auth_dismiss",
+        st.button("✕", key="_mcm_auth_dismiss", help="Dismiss for this session",
                   on_click=lambda: st.session_state.__setitem__(_DISMISS_KEY, True))
 
 
