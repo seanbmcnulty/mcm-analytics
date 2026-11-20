@@ -1,6 +1,6 @@
 """Rebuild the VIX-vs-DVOL page's committed CSVs (data/vl_*.csv).
 
-Usage: python tools/refresh_vol_lead_data.py [--datasets all|dvol,cboe,yahoo,fred]
+Usage: python tools/refresh_vol_lead_data.py [--datasets all|dvol,cboe,yahoo,fred,5m,1h]
 Used by .github/workflows/update_vol_lead_data.yml. A failed source keeps its
 old CSV and makes the exit code 1 only when every source failed.
 """
@@ -18,10 +18,11 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--datasets", default="all")
     a = ap.parse_args(argv)
-    keys = list(vld.DATASETS) if a.datasets == "all" else [k.strip() for k in a.datasets.split(",")]
+    keys = (list(vld.DATASETS) + list(vld.INTRADAY)) if a.datasets == "all" else \
+        [k.strip() for k in a.datasets.split(",")]
     ok = 0
     for k in keys:
-        res = vld.refresh(k)
+        res = vld.refresh_intraday(k) if k in vld.INTRADAY else vld.refresh(k)
         print(res.message)
         ok += int(res.ok)
     return 0 if ok else 1

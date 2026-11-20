@@ -21,9 +21,10 @@ from lib import freshness, fx_style, blast
 from lib import vol_lead_data as vld
 from lib import vol_lead as vl
 from lib import vol_lead_charts as vlc
+from lib import vol_lead_intraday as vi
 
 # Streamlit Cloud keeps old lib modules in memory after a deploy.
-_RELOADED = freshness.reload_if_changed(fx_style, vld, vl, vlc) + freshness.reload_if_changed(blast)
+_RELOADED = freshness.reload_if_changed(fx_style, vld, vl, vi, vlc) + freshness.reload_if_changed(blast)
 
 st.set_page_config(page_title="TradFi Vol vs DVOL", page_icon="📉", layout="wide",
                    initial_sidebar_state="expanded")
@@ -40,16 +41,26 @@ _cur = None
 if _blast_step is not None:
     blast.banner(_blast_step, "drawing the charts and sending the selected ones to Telegram…")
 
+WINDOWS = {"3 months": 63, "6 months": 126, "1 year": 252, "2 years": 504}
+FV_WINDOWS = {"3 months": 63, "6 months": 126}
+
 with st.sidebar:
     st.header("Parameters")
     _assets = list(vl.ASSETS)
     _default_asset = _blast_step.asset if _blast_step is not None and _blast_step.asset in _assets else "BTC"
     asset = st.radio("Crypto vol index", _assets, index=_assets.index(_default_asset), horizontal=True)
-    lookback = st.selectbox("Analysis window", ["All (since Mar 2021)", "3 years", "2 years"], index=0,
-                            help="Sample for every statistic. Out-of-sample tests need at least ~1y of training.")
-    pred_key = st.selectbox("Predictor for the lead-lag / event / rolling views",
-                            ["VIX", "MOVE", "VVIX"], index=0)
+    lookback = st.selectbox("Analysis window", list(WINDOWS), index=2,
+                            help="Sample for every statistic, daily and intraday (2 years at most). "
+                                 "5-minute data only goes back to late Aug 2026 (Yahoo keeps ~60 days; "
+                                 "the stored file grows from there).")
+    fv_label = st.selectbox("Fair-value / z-score window", list(FV_WINDOWS), index=1,
+                            help="Rolling window for the TradFi fair-value regression and the ratio z-scores.")
+    pred_key = st.selectbox("Predictor for the daily lead-lag / rolling views", ["VIX", "MOVE", "VVIX"], index=0)
     st.caption(f"As of {fx_style.local_now():%d %b %Y %H:%M} SGT.")
+
+N_WIN = WINDOWS[lookback]
+FV_WIN = FV_WINDOWS[fv_label]
+WIN_DAYS = int(N_WIN * 365 / 252)
 
 
 def show(fig, key: str):
@@ -107,6 +118,30 @@ with st.expander("🔄 Data sources and refresh", expanded=False):
         asof = f", latest {r.as_of:%d %b %Y}" if r.as_of is not None else ""
         st.markdown(f"- {tag} {r.message}{asof} ({r.source})")
 
+@st.cache_data(ttl=900, show_spinner="Topping up intraday VIX / DVOL…")
+def _intraday(kind: str, mtime: float, bump: int):
+    """Committed CSV + live top-up (Yahoo / Deribit). Falls back to the file."""
+    return vld.refresh_intraday(kind, write=True)
+
+
+def _imtime(kind):
+    p = vld.intraday_path(kind)
+    return p.stat().st_mtime if p.exists() else 0.0
+
+
+with st.expander("⏱️ Intraday data (5-min and hourly)", expanded=False):
+    st.caption("Topped up live every 15 minutes from Yahoo ^VIX and Deribit DVOL; the stored files are the fallback.")
+    ic = st.columns(3)
+    if ic[0].button("Top up 5-min now", key="vl_refresh_5m", width="stretch"):
+        st.session_state["vl_bump"] = st.session_state.get("vl_bump", 0) + 1
+    if ic[1].button("Top up hourly now", key="vl_refresh_1h", width="stretch"):
+        st.session_state["vl_bump"] = st.session_state.get("vl_bump", 0) + 1
+    _bump = st.session_state.get("vl_bump", 0)
+    I5 = _intraday("5m", 0.0, _bump)
+    I1 = _intraday("1h", 0.0, _bump)
+    for r_ in (I5, I1):
+        st.markdown(f"- {'✅' if r_.ok else '⚠️'} {r_.message} ({r_.source})")
+
 frames = {k: (_get(k).df if _get(k).ok else pd.DataFrame()) for k in vld.DATASETS}
 if frames["dvol"].empty or frames["cboe"].empty:
     st.error("DVOL or VIX data is missing. Use Refresh all above.")
@@ -122,14 +157,13 @@ if missing:
                if "HY_OAS" in missing else ". Try that source's refresh button."))
 
 full = vl.asset_frame(panel, asset)
-years = {"All (since Mar 2021)": None, "3 years": 3, "2 years": 2}[lookback]
-df = full if years is None else full[full.index >= full.index.max() - pd.DateOffset(years=years)]
-min_train = int(max(126, min(vl.TRADING_YEAR, len(df) // 3)))
+df = full.iloc[-N_WIN:]
+min_train = int(max(40, len(df) // 2))
 avail = [k for k in vl.PREDICTORS if k not in missing]
 
 
 @st.cache_data(show_spinner="Running the lead-lag and forecast tests…")
-def _analysis(asset: str, lookback: str, pred_key: str, _df: pd.DataFrame, _full: pd.DataFrame,
+def _analysis(asset: str, n_win: int, fv_win: int, pred_key: str, _df: pd.DataFrame, _full: pd.DataFrame,
               stamp: tuple, avail: tuple, min_train: int):
     x = vl.change(_df, pred_key)
     y = _df["DVOL"].diff()
@@ -143,36 +177,74 @@ def _analysis(asset: str, lookback: str, pred_key: str, _df: pd.DataFrame, _full
         "rank": vl.ranking_table(_df, list(avail), vl.HORIZONS, min_train, spec="change"),
         "rank_full": vl.ranking_table(_df, list(avail), vl.HORIZONS, min_train, spec="full"),
         "vix_reg": [vl.predictive_regression(_df, "VIX", h, min_train) for h in vl.HORIZONS],
-        "rc": vl.rich_cheap(_full),
-        "roll": vl.rolling_beta_corr(y, x, 63),
+        "rc": vl.rich_cheap(_full, window=fv_win, long_window=max(n_win, fv_win)),
+        "roll": vl.rolling_beta_corr(y, x, 21 if n_win <= 126 else 63),
     }
     rc = out["rc"].reindex(_df.index)
     out["rc_q"] = vl.score_quintiles(rc["score"], _df["DVOL"], (5, 10, 20), _df["SPREAD_VIX"])
     out["rc_sig"] = vl.score_signal(rc["score"], _df["DVOL"], (5, 10, 20), _df["SPREAD_VIX"], min_train)
     ev = {}
+    start = _df.index.min()
     for k in ("VIX", "MOVE"):
-        if k in _df and _df[k].notna().sum() > 200:
-            lvl = _df[k].ffill()
-            e_spike = vl.find_events(lvl, 2.0, None)
-            e_cross = vl.find_events(lvl, 99.0, 25.0 if k == "VIX" else 130.0)
-            ev[k] = {"spike": (e_spike, vl.event_path(_df["DVOL"], e_spike)),
-                     "cross": (e_cross, vl.event_path(_df["DVOL"], e_cross))}
+        if k in _full and _full[k].notna().sum() > 200:
+            lvl = _full[k].ffill()
+            def _w(e):
+                return e[e["date"] >= start] if not e.empty else e
+            e_spike = _w(vl.find_events(lvl, 2.0, None))
+            e_cross = _w(vl.find_events(lvl, 99.0, 25.0 if k == "VIX" else 130.0))
+            ev[k] = {"spike": (e_spike, vl.event_path(_full["DVOL"], e_spike)),
+                     "cross": (e_cross, vl.event_path(_full["DVOL"], e_cross))}
     out["events"] = ev
     out["uncond"] = vl.unconditional_path(_df["DVOL"])
     return out
 
 
+@st.cache_data(show_spinner="Running the intraday tests…")
+def _intraday_analysis(asset: str, win_days: int, stamp5, stamp1, _m5: pd.DataFrame, _h1: pd.DataFrame):
+    col = f"DVOL_{asset}"
+    out = {}
+    b5, bh = pd.Timedelta(minutes=5), pd.Timedelta(hours=1)
+    m5 = vi.window(_m5, win_days)
+    h1 = vi.window(_h1, win_days)
+    if m5 is not None and not m5.empty:
+        dx, dy = vi.bar_change(m5["VIX"], b5), vi.bar_change(m5[col], b5)
+        out.update(cc5=vi.cross_corr(dx, dy, b5, 12), gr5=vi.granger(dy, dx, b5, 6), gr5_rev=vi.granger(dx, dy, b5, 6),
+                   fit5=vi.ols_beta(dx, dy), dx5=dx, dy5=dy)
+        up, dn = vi.find_moves(dx, 3.0, sign=1), vi.find_moves(dx, 3.0, sign=-1)
+        out["ev5"] = {"VIX jumps up": vi.event_path(m5[col], up, b5), "VIX drops": vi.event_path(m5[col], dn, b5)}
+        out["n_sessions5"] = vi.sessions(m5.index).nunique()
+    if h1 is not None and not h1.empty:
+        dx, dy = vi.bar_change(h1["VIX"], bh), vi.bar_change(h1[col], bh)
+        out.update(cch=vi.cross_corr(dx, dy, bh, 5), grh=vi.granger(dy, dx, bh, 4), grh_rev=vi.granger(dx, dy, bh, 4),
+                   fith=vi.ols_beta(dx, dy), dxh=dx, dyh=dy,
+                   rollh={"1 week (~30 hourly changes)": vi.rolling_beta_corr(dx, dy, 30),
+                          "1 month (~126)": vi.rolling_beta_corr(dx, dy, 126)},
+                   sp=vi.session_predict(h1, asset))
+        out["n_sessions1"] = vi.sessions(h1.index).nunique()
+    return out
+
+
 stamp = tuple(round(_mtime(k)) for k in vld.DATASETS) + tuple(
     sorted(st.session_state.get("vl_good", {}).keys()))
-A = _analysis(asset, lookback, pred_key, df, full, stamp, tuple(avail), min_train)
+A = _analysis(asset, N_WIN, FV_WIN, pred_key, df, full, stamp, tuple(avail), min_train)
 rc_full = A["rc"]
 rc = rc_full.reindex(df.index)
+M5 = I5.df if I5.ok else pd.DataFrame()
+H1 = I1.df if I1.ok else pd.DataFrame()
+_s5 = (len(M5), str(M5.index.max()) if len(M5) else "")
+_s1 = (len(H1), str(H1.index.max()) if len(H1) else "")
+B = _intraday_analysis(asset, WIN_DAYS, _s5, _s1, M5, H1)
 
-st.caption(f"Sample: {df.index.min():%d %b %Y} → {df.index.max():%d %b %Y}, {len(df)} trading days. "
-           f"Out-of-sample tests train on at least {min_train} days.")
+st.caption(f"Daily sample: {df.index.min():%d %b %Y} → {df.index.max():%d %b %Y}, {len(df)} trading days "
+           f"(out-of-sample tests train on at least {min_train}). Intraday: "
+           f"{B.get('n_sessions5', 0)} sessions of 5-min bars, {B.get('n_sessions1', 0)} sessions of hourly bars.")
+if len(df) - min_train < 40:
+    st.warning("This window leaves fewer than 40 out-of-sample days, so the out-of-sample numbers are very noisy. "
+               "Use 1 year or 2 years for the forecast tests.")
 
 # ------------------------------------------------------------------ verdict
 st.subheader(f"Verdict: does TradFi vol predict {asset} DVOL?")
+intra_lines = vi.verdict_lines(asset, B.get("cc5"), B.get("gr5"), B.get("gr5_rev"), B.get("cch"), B.get("sp"))
 lines = vl.verdict(asset, A["cc_vix"], A["gr_fwd"], A["gr_rev"], A["rank"])
 sig_rc = A["rc_sig"]
 if not sig_rc.empty:
@@ -189,7 +261,9 @@ if not sig_rc.empty:
         else:
             lines.append(f"Rich/cheap: the score does not significantly predict {asset} DVOL changes "
                          f"(best out-of-sample R² {best['oos_r2_pct']:+.1f}% at {int(best['h'])}d).")
-st.info("\n".join(f"- {ln}" for ln in lines))
+st.info(f"**Intraday (real time, last {lookback} where data allows)**\n"
+        + "\n".join(f"- {ln}" for ln in intra_lines)
+        + f"\n\n**Daily (last {lookback})**\n" + "\n".join(f"- {ln}" for ln in lines))
 
 # ------------------------------------------------------------------ rich / cheap
 st.subheader(f"💸 Is {asset} vol rich or cheap vs TradFi vol?")
@@ -198,28 +272,31 @@ if last.empty:
     st.warning("Not enough history for the rich/cheap model.")
 else:
     r = last.iloc[-1]
-    st.markdown(f"**{vl.rich_cheap_headline(asset, rc_full)}**  \n"
+    rcw = rc_full.reindex(df.index)
+    pct_score = vl.window_pct(rcw["score"])
+    pct_rv = vl.window_pct(rcw["ratio_vix"])
+    pct_rm = vl.window_pct(rcw["ratio_move"]) if "ratio_move" in rcw else np.nan
+    st.markdown(f"**{vl.rich_cheap_headline(asset, rc_full, pct_score, 'the last ' + lookback)}**  \n"
                 f"<span style='color:#888'>Reading for {last.index[-1]:%a %d %b %Y} New York close.</span>",
                 unsafe_allow_html=True)
     c = st.columns(5)
     c[0].metric(f"{asset} DVOL", f"{full['DVOL'].iloc[-1]:.1f}")
     c[1].metric("TradFi fair value", f"{r['fair']:.1f}", f"{r['resid']:+.1f} vols", delta_color="off",
-                help=f"Rolling 1y regression of DVOL on VIX and MOVE (fit R² {r['fv_r2']:.2f}).")
+                help=f"Rolling {fv_label} regression of DVOL on VIX and MOVE (fit R² {r['fv_r2']:.2f}).")
     c[2].metric("Composite score", f"{r['score']:+.2f} sd", help="Mean of the three component z-scores.")
-    c[3].metric("Score percentile (3y)", vl.ordinal(r["score_pct"]) if np.isfinite(r["score_pct"]) else "—")
+    c[3].metric(f"Score percentile ({lookback})", vl.ordinal(pct_score) if np.isfinite(pct_score) else "—")
     c[4].metric("DVOL / VIX", f"{r['ratio_vix']:.2f}x",
-                f"{vl.ordinal(r['ratio_vix_pct_1y'])} pct 1y" if np.isfinite(r["ratio_vix_pct_1y"]) else None,
-                delta_color="off")
+                f"{vl.ordinal(pct_rv)} pct ({lookback})" if np.isfinite(pct_rv) else None, delta_color="off")
     def _f(v, fmt):
         return fmt.format(v) if v is not None and np.isfinite(v) else "—"
 
-    _rows = [("Fair-value residual (vols)", r["resid"], r["resid_z"], None, None),
-             ("DVOL / VIX", r["ratio_vix"], r["ratio_vix_z"], r["ratio_vix_pct_1y"], r["ratio_vix_pct_3y"])]
+    _rows = [("Fair-value residual (vols)", r["resid"], r["resid_z"], vl.window_pct(rcw["resid"])),
+             ("DVOL / VIX", r["ratio_vix"], r["ratio_vix_z"], pct_rv)]
     if "ratio_move" in r:
-        _rows.append(("DVOL / MOVE", r["ratio_move"], r["ratio_move_z"], r["ratio_move_pct_1y"], r["ratio_move_pct_3y"]))
-    comp = pd.DataFrame([{"Component": n, "Reading": _f(a, "{:+.2f}" if i == 0 else "{:.3f}"), "z": _f(b, "{:+.2f}"),
-                          "Percentile 1y": _f(c1, "{:.0f}"), "Percentile 3y": _f(c3, "{:.0f}")}
-                         for i, (n, a, b, c1, c3) in enumerate(_rows)])
+        _rows.append(("DVOL / MOVE", r["ratio_move"], r["ratio_move_z"], pct_rm))
+    comp = pd.DataFrame([{"Component": n, "Reading": _f(a, "{:+.2f}" if i == 0 else "{:.3f}"),
+                          f"z ({fv_label})": _f(b, "{:+.2f}"), f"Percentile ({lookback})": _f(c1, "{:.0f}")}
+                         for i, (n, a, b, c1) in enumerate(_rows)])
     st.dataframe(comp, hide_index=True, width="stretch")
     show(vlc.rich_cheap(df, rc, asset), "rich_cheap")
     cq1, cq2 = st.columns([3, 2])
@@ -236,17 +313,116 @@ else:
                  "CW p": "{:.3f}"}), hide_index=True, width="stretch")
             st.caption("Negative slope = rich crypto vol tends to cheapen. OOS R² vs a historical-mean "
                        "forecast, expanding window; CW = Clark-West one-sided p.")
+    # ---- today: intraday DVOL vs fair value (5-min)
+    coef = rc_full.attrs.get("coef", {})
+    if not M5.empty and coef:
+        day = vi.last_sessions(M5, 1)
+        move_last = float(full["MOVE"].dropna().iloc[-1]) if "MOVE" in full and full["MOVE"].notna().any() else None
+        fvi = vi.intraday_fair(day, asset, coef, move_last).dropna()
+        if not fvi.empty:
+            dlab = f"{fvi.index[-1].tz_convert('America/New_York'):%a %d %b} NY session, last bar " \
+                   f"{fvi.index[-1].tz_convert('Asia/Singapore'):%H:%M} SGT"
+            tcols = st.columns(3)
+            tcols[0].metric(f"{asset} DVOL (latest 5-min)", f"{fvi['DVOL'].iloc[-1]:.1f}")
+            tcols[1].metric("Fair value now", f"{fvi['fair'].iloc[-1]:.1f}", f"{fvi['resid'].iloc[-1]:+.1f} vols",
+                            delta_color="off")
+            tcols[2].metric("Intraday range of rich/cheap", f"{fvi['resid'].min():+.1f} → {fvi['resid'].max():+.1f}")
+            show(vlc.today_fair(fvi, asset, dlab), "today")
+
+# ------------------------------------------------------------------ short horizon
+st.subheader("⚡ Short-horizon: VIX vs DVOL intraday")
+if M5.empty and H1.empty:
+    st.warning("No intraday data available right now.")
+else:
+    t1, t2, t3, t4, t5 = st.tabs(["Intraday overlay", "Normalised overlay", "Scatter of changes",
+                                  "Rolling corr & beta", "After big VIX moves"])
+    b5, bh = pd.Timedelta(minutes=5), pd.Timedelta(hours=1)
+    with t1:
+        if not M5.empty:
+            days = sorted(set(vi.sessions(M5.index)), reverse=True)
+            opts = ["Last 5 sessions", "Latest session"] + [f"{d:%a %d %b %Y}" for d in days[1:30]]
+            pick = st.selectbox("Sessions", opts, index=0, key="vl_overlay_pick")
+            if pick == "Last 5 sessions":
+                view = vi.last_sessions(M5, 5)
+            elif pick == "Latest session":
+                view = vi.last_sessions(M5, 1)
+            else:
+                d0 = days[opts.index(pick) - 1]
+                view = M5[vi.sessions(M5.index) == d0]
+            show(vlc.intraday_overlay(view, asset, b5, f"{asset} DVOL vs VIX, 5-min ({pick.lower()})"),
+                 "intraday_overlay")
+    with t2:
+        span = st.radio("Window", ["1 month", "3 months"], horizontal=True, key="vl_norm_span")
+        src = H1 if not H1.empty else M5
+        zv = vi.window(src, 31 if span == "1 month" else 92)
+        zcols = [c_ for c_ in ("VIX", "DVOL_BTC", "DVOL_ETH") if c_ in zv]
+        show(vlc.norm_overlay(vi.zscore_frame(zv, zcols), f"VIX vs DVOL, hourly, z-scored over {span}", bh),
+             "norm_overlay")
+    with t3:
+        freq = st.radio("Bar", ["5-min", "Hourly"], horizontal=True, key="vl_scatter_bar")
+        if freq == "5-min" and "fit5" in B:
+            show(vlc.change_scatter(B["dx5"], B["dy5"], B["fit5"], asset, "5-min"), "scatter")
+        elif "fith" in B:
+            show(vlc.change_scatter(B["dxh"], B["dyh"], B["fith"], asset, "Hourly"), "scatter")
+    with t4:
+        if "rollh" in B:
+            show(vlc.rolling_intraday(B["rollh"], asset), "intraday_rolling")
+    with t5:
+        if "ev5" in B:
+            show(vlc.intraday_events(B["ev5"], asset), "intraday_events")
+            pu = B["ev5"]["VIX jumps up"].set_index("minutes")
+            if pu["n"].max() > 0:
+                st.caption(f"{int(pu['n'].max())} VIX jumps. Average {asset} DVOL move vs the bar before: "
+                           f"{pu.loc[0, 'mean']:+.2f} in the jump bar, {pu.loc[30, 'mean']:+.2f} after 30 min, "
+                           f"{pu.loc[120, 'mean']:+.2f} after 2 hours.")
+
+st.subheader("⏱️ Intraday lead-lag, Granger and session forecasts")
+lc1, lc2 = st.columns(2)
+with lc1:
+    if "cc5" in B:
+        show(vlc.intraday_cross_corr(B["cc5"], asset, "min"), "intraday_leadlag")
+with lc2:
+    if "cch" in B:
+        show(vlc.intraday_cross_corr(B["cch"], asset, "h"), "intraday_leadlag_h")
+gcols = st.columns(2)
+if "gr5" in B:
+    g5 = pd.DataFrame({"Lags (min)": B["gr5"]["minutes"], "VIX → DVOL p": B["gr5"]["p_value"],
+                       "DVOL → VIX p": B["gr5_rev"]["p_value"], "n": B["gr5"]["n"]})
+    gcols[0].markdown("**5-min Granger**")
+    gcols[0].dataframe(g5.style.format({"VIX → DVOL p": "{:.4f}", "DVOL → VIX p": "{:.4f}"}), hide_index=True,
+                       width="stretch")
+if "grh" in B:
+    gh = pd.DataFrame({"Lags (h)": B["grh"]["minutes"] // 60, "VIX → DVOL p": B["grh"]["p_value"],
+                       "DVOL → VIX p": B["grh_rev"]["p_value"], "n": B["grh"]["n"]})
+    gcols[1].markdown("**Hourly Granger**")
+    gcols[1].dataframe(gh.style.format({"VIX → DVOL p": "{:.4f}", "DVOL → VIX p": "{:.4f}"}), hide_index=True,
+                       width="stretch")
+if "sp" in B and not B["sp"].empty:
+    st.markdown(f"**Does the morning VIX move (10:00 → 12:00 New York) predict {asset} DVOL later?**")
+    sp = B["sp"].rename(columns={"target": "DVOL change", "beta_vix": "β ΔVIX", "t_vix": "HAC t ΔVIX",
+                                 "beta_own": "β own ΔDVOL", "t_own": "HAC t own", "r2": "R²",
+                                 "oos_r2_pct": "OOS R² % (vs mean)", "oos_r2_vs_own_pct": "OOS R² % (vs DVOL-only)",
+                                 "cw_p": "CW p", "same_sign_pct": "Same sign %", "n": "Sessions"})
+    st.dataframe(sp.drop(columns=["n_oos"]).style.format(
+        {"β ΔVIX": "{:+.3f}", "HAC t ΔVIX": "{:+.2f}", "β own ΔDVOL": "{:+.3f}", "HAC t own": "{:+.2f}", "R²": "{:.3f}",
+         "OOS R² % (vs mean)": "{:+.1f}", "OOS R² % (vs DVOL-only)": "{:+.1f}", "CW p": "{:.3f}",
+         "Same sign %": "{:.0f}"}), hide_index=True, width="stretch")
+    st.caption("One row per session, hourly bars. Controls for DVOL's own morning move. Out-of-sample uses "
+               "an expanding window over sessions.")
+st.caption("Intraday caveat: DVOL is an index of Deribit option prices. A short VIX lead can partly reflect "
+           "Deribit quotes catching up to US moves, so it is only tradeable if the options themselves lag.")
 
 # ------------------------------------------------------------------ 1. levels
+st.subheader("📅 Daily analysis")
 st.subheader("1 · Levels, spreads and ratios")
 show(vlc.levels(df, asset), "levels")
-z = {k: vl.rolling_z(df[k], 252).iloc[-1] for k in ("SPREAD_VIX", "RATIO_VIX", "RATIO_MOVE") if k in df}
-p = {k: vl.rolling_pct(df[k], 252).iloc[-1] for k in z}
+z = {k: vl.rolling_z(full[k], FV_WIN).iloc[-1] for k in ("SPREAD_VIX", "RATIO_VIX", "RATIO_MOVE") if k in df}
+p = {k: vl.window_pct(df[k]) for k in z}
 c = st.columns(3)
 for i, (k, lab, fmt) in enumerate((("SPREAD_VIX", "DVOL − VIX", "{:+.1f} pts"), ("RATIO_VIX", "DVOL / VIX", "{:.2f}x"),
                                    ("RATIO_MOVE", "DVOL / MOVE", "{:.3f}x"))):
     if k in df:
-        c[i].metric(lab, fmt.format(df[k].iloc[-1]), f"z {z[k]:+.2f}, {vl.ordinal(p[k])} pct (1y)"
+        c[i].metric(lab, fmt.format(df[k].iloc[-1]), f"z {z[k]:+.2f}, {vl.ordinal(p[k])} pct ({lookback})"
                     if np.isfinite(z[k]) else None, delta_color="off")
 show(vlc.spread_ratio(df, asset), "spreads")
 
@@ -341,10 +517,15 @@ if _blast_step is not None:
     _titles = {"rich_cheap": "Rich/cheap vs TradFi", "rich_cheap_q": "Rich/cheap quintiles",
                "levels": "DVOL vs VIX & MOVE", "spreads": "Spreads & ratios", "leadlag": "Lead-lag",
                "events_vix": "After VIX spikes", "events_move": "After MOVE spikes", "rolling": "Rolling beta",
-               "ranking": "Predictor ranking"}
+               "ranking": "Predictor ranking", "today": "Today vs fair value (5-min)",
+               "intraday_overlay": "Intraday overlay (5-min)", "norm_overlay": "Normalised overlay (hourly)",
+               "scatter": "Scatter of changes", "intraday_rolling": "Rolling 1w/1m corr & beta",
+               "intraday_events": "After big 5-min VIX moves", "intraday_leadlag": "Intraday lead-lag (5-min)",
+               "intraday_leadlag_h": "Intraday lead-lag (hourly)"}
     _pairs = [(f, f"TradFi vol vs {asset} DVOL — {_titles.get(k, k)}") for k, f in _SHOWN
               if k in _want or (k == "rich_cheap_q" and "rich_cheap" in _want)
-              or (k.startswith("events_") and "events" in _want)]
+              or (k.startswith("events_") and "events" in _want)
+              or (k == "intraday_leadlag_h" and "intraday_leadlag" in _want)]
     with st.spinner("Sending to Telegram…"):
         _sent, _failed = blast.send_figs(_pairs, light_theme=True)
     blast.finish(_blast_step, _sent, _failed)

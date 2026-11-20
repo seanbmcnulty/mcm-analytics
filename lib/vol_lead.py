@@ -408,6 +408,7 @@ def fair_value(df: pd.DataFrame, inputs=FAIR_VALUE_INPUTS, window: int = TRADING
         return out.reindex(df.index)
     Y = d["DVOL"].values
     X = np.column_stack([np.ones(len(d)), d[cols].values])
+    b = None
     for i in range(mp - 1, len(d)):
         lo = max(0, i - window + 1)
         Xi, Yi = X[lo:i + 1], Y[lo:i + 1]
@@ -419,7 +420,19 @@ def fair_value(df: pd.DataFrame, inputs=FAIR_VALUE_INPUTS, window: int = TRADING
         out.iloc[i] = [fair, Y[i] - fair, (Y[i] - fair) / sd if sd > 0 else np.nan,
                        1 - float(e @ e) / tss if tss > 0 else np.nan]
     out.attrs["inputs"] = cols
-    return out.reindex(df.index)
+    if b is not None:
+        out.attrs["coef"] = dict(zip(["const"] + cols, [float(x) for x in b]))
+    res = out.reindex(df.index)
+    res.attrs = out.attrs
+    return res
+
+
+def window_pct(s: pd.Series) -> float:
+    """Percentile (0-100) of the last value of ``s`` within ``s`` itself."""
+    a = s.dropna().values
+    if len(a) < 5:
+        return float("nan")
+    return 100.0 * (np.sum(a <= a[-1]) - 0.5) / len(a)
 
 
 def rich_cheap(df: pd.DataFrame, window: int = TRADING_YEAR, long_window: int = 3 * TRADING_YEAR,
@@ -453,6 +466,8 @@ def rich_cheap(df: pd.DataFrame, window: int = TRADING_YEAR, long_window: int = 
     out["score"] = out[comps].mean(axis=1, skipna=False)
     out["score_pct"] = rolling_pct(out["score"], long_window, min_periods=window // 2)
     out.attrs["components"] = comps
+    out.attrs["coef"] = fv.attrs.get("coef", {})
+    out.attrs["window"] = window
     return out
 
 
@@ -513,14 +528,14 @@ def score_signal(score: pd.Series, dvol: pd.Series, horizons=(5, 10, 20), spread
     return pd.DataFrame(rows)
 
 
-def rich_cheap_headline(asset: str, rc: pd.DataFrame) -> str:
+def rich_cheap_headline(asset: str, rc: pd.DataFrame, pct: float | None = None, span: str = "the last 3y") -> str:
     last = rc.dropna(subset=["score"]).tail(1)
     if last.empty:
         return f"{asset}: not enough history for a rich/cheap reading."
     r = last.iloc[0]
     word = "rich" if r["resid"] > 0 else "cheap"
-    pct = r.get("score_pct", np.nan)
-    pct_txt = f", {ordinal(pct)} percentile of the last 3y" if np.isfinite(pct) else ""
+    pct = r.get("score_pct", np.nan) if pct is None else pct
+    pct_txt = f", {ordinal(pct)} percentile of {span}" if np.isfinite(pct) else ""
     return (f"{asset} vol is {abs(r['resid']):.1f} vols {word} vs TradFi fair value "
             f"({r['fair']:.1f}); composite score {r['score']:+.2f} sd{pct_txt}.")
 

@@ -239,6 +239,160 @@ def test_committed_csvs_load():
         assert r.ok and len(r.df) > 500, k
 
 
+# -------------------------------------------------------------- intraday
+from lib import vol_lead_intraday as vi  # noqa: E402
+
+B5 = pd.Timedelta(minutes=5)
+
+
+def _sessions_index(days=("2026-01-12", "2026-01-13", "2026-01-14"), first="09:35", last="16:00"):
+    out = []
+    for d in days:
+        rng = pd.date_range(f"{d} {first}", f"{d} {last}", freq="5min", tz="America/New_York")
+        out.append(rng.tz_convert("UTC"))
+    return out[0].append(out[1:])
+
+
+def test_bar_change_and_lags_never_cross_overnight():
+    idx = _sessions_index()
+    s = pd.Series(np.arange(len(idx), dtype=float), idx)
+    d = vi.bar_change(s, B5)
+    firsts = [t for t in idx if t.tz_convert("America/New_York").strftime("%H:%M") == "09:35"]
+    assert all(np.isnan(d.loc[t]) for t in firsts)
+    assert d.dropna().eq(1.0).all()
+    lag = vi.lag_series(s, 1, B5)
+    assert all(np.isnan(lag.loc[t]) for t in firsts)
+    lead = vi.lag_series(s, -1, B5)          # one bar later
+    lasts = [t for t in idx if t.tz_convert("America/New_York").strftime("%H:%M") == "16:00"]
+    assert all(np.isnan(lead.loc[t]) for t in lasts)
+
+
+def test_intraday_cross_corr_and_granger_find_10min_lead():
+    days = [str(d.date()) for d in pd.bdate_range("2026-01-05", periods=30)]
+    idx = _sessions_index(days)
+    rng = np.random.default_rng(4)
+    dx = pd.Series(rng.normal(size=len(idx)), idx)
+    dy = 0.7 * vi.lag_series(dx, 2, B5).fillna(0) + 0.5 * pd.Series(rng.normal(size=len(idx)), idx)
+    cc = vi.cross_corr(dx, dy, B5, 6)
+    best = cc.loc[cc["corr"].idxmax()]
+    assert int(best["minutes"]) == 10 and best["corr"] > 0.6
+    g = vi.granger(dy, dx, B5, 3)
+    gr = vi.granger(dx, dy, B5, 3)
+    assert g.loc[g["lag"] >= 2, "p_value"].max() < 1e-6 and gr["p_value"].min() > 0.001
+
+
+def test_dvol_at_obs_uses_candle_end_only():
+    t0 = pd.Timestamp("2026-01-12 14:30", tz="UTC")
+    candles = pd.DataFrame({"ts": [int((t0 + pd.Timedelta(minutes=i)).timestamp() * 1000) for i in range(6)],
+                            "open": 0, "high": 0, "low": 0, "close": [10, 11, 12, 13, 14, 15]})
+    obs = pd.DatetimeIndex([t0 + pd.Timedelta(minutes=5), t0 + pd.Timedelta(minutes=10)])
+    v = vld.dvol_at_obs(candles, pd.Timedelta(minutes=1), obs)
+    assert v.iloc[0] == 14 and np.isnan(v.iloc[1])     # no later value, no fill
+
+
+def test_cash_session_mask_dst():
+    winter = pd.DatetimeIndex(["2026-01-12 14:30", "2026-01-12 14:35", "2026-01-12 21:00", "2026-01-12 21:05"], tz="UTC")
+    summer = pd.DatetimeIndex(["2026-07-13 13:35", "2026-07-13 20:00", "2026-07-13 20:05"], tz="UTC")
+    assert list(vld.cash_session_mask(winter)) == [False, True, True, False]
+    assert list(vld.cash_session_mask(summer)) == [True, True, False]
+    sat = pd.DatetimeIndex(["2026-01-17 15:00"], tz="UTC")
+    assert not vld.cash_session_mask(sat)[0]
+
+
+def test_parse_yahoo_intraday_bar_end_and_future_drop():
+    t0 = int(pd.Timestamp("2026-01-12 14:30", tz="UTC").timestamp())
+    payload = {"chart": {"result": [{"timestamp": [t0, t0 + 300, t0 + 600],
+                                     "indicators": {"quote": [{"close": [20.0, None, 21.0]}]}}]}}
+    s = vld.parse_yahoo_intraday(payload, B5, now=pd.Timestamp("2026-01-12 14:42", tz="UTC"))
+    assert list(s.index) == [pd.Timestamp("2026-01-12 14:35", tz="UTC")] and s.iloc[0] == 20.0
+
+
+class _Resp:
+    def __init__(self, j):
+        self._j = j
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._j
+
+
+def test_build_intraday_fetches_only_missing_sessions():
+    days = ["2026-01-12", "2026-01-13", "2026-01-14"]
+    idx = _sessions_index(days)
+    starts = [int((t - B5).timestamp()) for t in idx]
+    calls = {"deribit": 0}
+
+    def get(url, params=None, headers=None, timeout=None):
+        if "yahoo" in url:
+            return _Resp({"chart": {"result": [{"timestamp": starts,
+                                                "indicators": {"quote": [{"close": [20.0] * len(starts)}]}}]}})
+        calls["deribit"] += 1
+        a, b = params["start_timestamp"], params["end_timestamp"]
+        ts = list(range(a - a % 60000, b, 60000))
+        return _Resp({"result": {"data": [[t, 1, 1, 1, 50.0] for t in ts]}})
+
+    now = pd.Timestamp("2026-01-14 22:00", tz="UTC")
+    full = vld.build_intraday("5m", None, get=get, now=now, pause=0)
+    assert calls["deribit"] == 6 and full["DVOL_BTC"].notna().all() and len(full) == len(idx)
+    calls["deribit"] = 0
+    again = vld.build_intraday("5m", full, get=get, now=now, pause=0)
+    assert calls["deribit"] == 2          # only the latest stored session, both assets
+    assert len(again) == len(full)
+
+
+def test_session_predict_uses_only_post_cut_targets():
+    days = [str(d.date()) for d in pd.bdate_range("2025-06-02", periods=120)]
+    rows = []
+    rng = np.random.default_rng(9)
+    for d in days:
+        dv_m = rng.normal()
+        dvix = rng.normal()
+        for h in range(10, 17):
+            t = pd.Timestamp(f"{d} {h}:00", tz="America/New_York").tz_convert("UTC")
+            vix = 20 + (dvix if h >= 12 else 0)
+            dvol = 50 + (dv_m if h >= 12 else 0) + (2.0 * dvix if h == 16 else 0)   # afternoon follows the morning VIX
+            rows.append((t, vix, dvol, dvol))
+    h1 = pd.DataFrame(rows, columns=["obs", "VIX", "DVOL_BTC", "DVOL_ETH"]).set_index("obs")
+    sp = vi.session_predict(h1, "BTC")
+    r = sp.iloc[0]
+    assert r["target"].startswith("rest of session") and abs(r["beta_vix"] - 2.0) < 0.05 and r["oos_r2_pct"] > 90
+
+
+def test_intraday_events_same_session():
+    idx = _sessions_index([str(d.date()) for d in pd.bdate_range("2026-01-05", periods=15)])
+    vix = pd.Series(20.0, idx) + np.sin(np.arange(len(idx))) * 0.01
+    t_ev = idx[-30]
+    vix.loc[vix.index >= t_ev] += 3
+    dvol = pd.Series(50.0, idx)
+    dvol.loc[dvol.index >= t_ev + 2 * B5] += 1
+    ev = vi.find_moves(vi.bar_change(vix, B5), 3.0, lookback=200)
+    assert list(ev["obs"]) == [t_ev]
+    p = vi.event_path(dvol, ev, B5, pre=2, post=4).set_index("minutes")
+    assert p.loc[0, "mean"] == 0 and p.loc[10, "mean"] == 1
+
+
+def test_short_window_rich_cheap_and_intraday_fair():
+    df = vl.asset_frame(vl.align_panel(_panel(n=400, seed=12)), "BTC")
+    rc = vl.rich_cheap(df, window=63, long_window=126)
+    coef = rc.attrs["coef"]
+    assert set(coef) == {"const", "VIX", "MOVE"}
+    last = rc.dropna(subset=["fair"]).index[-1]
+    assert np.isclose(rc.loc[last, "fair"], coef["const"] + coef["VIX"] * df.loc[last, "VIX"] + coef["MOVE"] * df.loc[last, "MOVE"])
+    assert 0 <= vl.window_pct(rc["score"].iloc[-126:]) <= 100
+    day = pd.DataFrame({"VIX": [20.0, 21.0], "DVOL_BTC": [50.0, 52.0]})
+    fv = vi.intraday_fair(day, "BTC", {"const": 10.0, "VIX": 2.0, "MOVE": 0.1}, 100.0)
+    assert list(fv["fair"]) == [60.0, 62.0] and list(fv["resid"]) == [-10.0, -10.0]
+
+
+def test_committed_intraday_csvs_load():
+    for k in ("5m", "1h"):
+        d = vld.load_intraday(k)
+        assert len(d) > 1000 and d.index.tz is not None, k
+        assert vld.cash_session_mask(d.index, vld.INTRADAY[k]["first"], vld.INTRADAY[k]["last"]).all()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
