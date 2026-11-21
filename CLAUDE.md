@@ -417,6 +417,25 @@ no per-expiry history at all is unchanged ("1 Month Ago (est.)"). The
 command is shared by every asset. `tests/test_vol_term_structure.py`.
 
 
+### 2026-11-22 — 1 Month Ago term structure uses recorded constant-maturity IVs
+
+The "1 Month Ago (est.)" line on `/vol_term_structure` was almost flat
+(~37–38 across every expiry). Two things stacked: per-expiry snapshots only
+begin on 2 Nov 2026 (so the 30-day lookback had no same-contract prints),
+and the fixed-tenor fallback remapped columns by calendar days elapsed.
+After 30 days the 1s/7s/14s pillars have expired and only the back end
+remains (30d→0, 60d→30, …), which on 22 Oct was genuinely flat at ~37.
+
+Fixed-tenor surface snapshots *do* reach back past 30 days (live from
+18 Aug). The 1-month line now interpolates the snapshot nearest now−30d
+onto today's expiries by days-to-expiry (constant maturity), so the front
+of the recorded curve is kept, and is labelled "1 Month Ago" with no
+"(est.)". The DVOL/RV reconstruction remains the fallback, still labelled
+"(est.)". 24h and 1w are unchanged (per-expiry prints + hollow markers).
+The same constant-maturity mapping is used for the 1-month lookback on
+skew, butterfly, and smile. No synthetic backfill. ETH/SOL/HYPE share
+the command.
+
 ### 2026-11-09 — Ecoinometrics: close/200DMA ratio and MCM ETF flow regime
 
 Two extra tabs on `pages/13_Ecoinometrics_Charts.py`, inspired by the 6 Nov 2026

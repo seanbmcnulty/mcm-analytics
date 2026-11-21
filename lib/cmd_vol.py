@@ -44,7 +44,8 @@ def _dec(v) -> float:
     return v / 100.0 if abs(v) >= 5 else v
 
 
-def _row_to_map(row: pd.Series, now: datetime | None = None) -> dict[float, float]:
+def _row_to_map(row: pd.Series, now: datetime | None = None, *,
+                constant_maturity: bool = False) -> dict[float, float]:
     """
     Historical row -> {DTE: IV}.
 
@@ -53,7 +54,15 @@ def _row_to_map(row: pd.Series, now: datetime | None = None) -> dict[float, floa
     given, re-key the columns to today's DTE for the SAME expiry date:
     ``dte_now = dte_then - (calendar days elapsed since the snapshot)``.
     Expiries already gone (dte_now < 0) are dropped.
+
+    ``constant_maturity=True`` (or omitting ``now``) keeps the columns as
+    tenors: the curve shape at the snapshot is interpolated onto today's
+    expiries by days-to-expiry. Use that for a long lookback such as 1
+    month, where same-expiry remapping drops the front of the curve and
+    leaves only the nearly-flat back end.
     """
+    if constant_maturity:
+        now = None
     shift = 0
     if now is not None:
         ts = getattr(row, "name", None)
@@ -204,10 +213,17 @@ def _lookback_points(frame: pd.DataFrame, now: datetime,
 def cmd_vol_term_structure(asset: str, **kwargs):
     """ATM IV across listed expiries, with 24h / 1w / 1m lagged snapshots.
 
-    Every lookback is drawn at every current expiry. Recorded per-expiry IV
-    is kept where that expiry was listed; tenors that were not listed yet are
-    filled (and marked estimated) so the line spans the same x-axis as the
-    live curve. See ``_merge_lookback_iv``.
+    Every lookback is drawn at every current expiry. 24h and 1w keep recorded
+    per-expiry IV where that expiry was listed; tenors that were not listed
+    yet are filled (and marked estimated) so the line spans the same x-axis
+    as the live curve. See ``_merge_lookback_iv``.
+
+    The 1-month line is constant-maturity: a recorded fixed-tenor snapshot
+    nearest now-30d is interpolated onto today's expiries by days-to-expiry.
+    Same-expiry remapping would drop the front of the curve (those contracts
+    have expired) and leave a nearly flat back end. The line is labelled
+    "1 Month Ago" when the snapshot is recorded, and "1 Month Ago (est.)"
+    only when it falls back to a DVOL/RV reconstruction.
     """
     now = _now()
     live = surface.iv_by_dte_for_delta(asset, "delta50")
@@ -219,7 +235,7 @@ def cmd_vol_term_structure(asset: str, **kwargs):
     if not dtes:
         dtes = sorted(int(d) for d in live)
 
-    frame, _estimated, _src = history.surface_history(asset, "delta50", days=35)
+    frame, estimated, _src = history.surface_history(asset, "delta50", days=45)
 
     fig = go.Figure()
     x_cat = [(now.date() + timedelta(days=int(d))).strftime("%d-%b") for d in dtes]
@@ -233,13 +249,19 @@ def cmd_vol_term_structure(asset: str, **kwargs):
     grid_pts = {sk: (lb, r) for lb, sk, _t, r in _lookback_points(
         frame, now, [(l, d) for l, d, _ in lookbacks])}
     for label, delta, tol in lookbacks:
-        ex = history.expiry_snapshot_near(asset, now - delta, tol, now)
+        # 1 month: constant-maturity from the fixed-tenor snapshot. Do not
+        # use same-expiry prints — after 30 days the front contracts have
+        # expired and the leftover back end is nearly flat.
+        use_cm = label == "1 Month Ago"
+        ex = None if use_cm else history.expiry_snapshot_near(
+            asset, now - delta, tol, now)
         exact = ex["atm"] if ex is not None else None
         grid = None
         grid_label = label
         if label in grid_pts:
             grid_label, row = grid_pts[label]
-            grid = _row_to_map(row, now)
+            grid = _row_to_map(row, None if use_cm else now,
+                               constant_maturity=use_cm)
         if exact is None and not grid:
             continue
         ys, flags = _merge_lookback_iv(dtes, exact, grid)
@@ -249,8 +271,13 @@ def cmd_vol_term_structure(asset: str, **kwargs):
         # Per-expiry snapshot within tolerance keeps the requested label.
         # A pure grid fallback uses the honest elapsed-time label.
         display = label if exact is not None else grid_label
+        # A recorded constant-maturity snapshot is real data interpolated
+        # onto today's tenors, not a DVOL-scaled estimate.
+        if use_cm and exact is None and not estimated:
+            flags = [False] * len(flags)
         n_est = sum(1 for i in finite if flags[i])
-        # Whole line from the smoothed grid -> "(est.)" in the legend.
+        # Whole line from a reconstruction (or a mixed line that is entirely
+        # filled) -> "(est.)" in the legend.
         name = f"{display} (est.)" if n_est == len(finite) else display
         series.append((name, label, ys, flags))
 
@@ -328,8 +355,8 @@ def _skew_term_structure(asset: str, delta: int):
     dtes = surface.listed_expiries(asset) or sorted(int(d) for d in call)
     x_cat = [(now.date() + timedelta(days=int(d))).strftime("%d-%b") for d in dtes]
 
-    fc, estimated, src = history.surface_history(asset, f"deltaCall{delta}", days=35)
-    fp, _, _ = history.surface_history(asset, f"deltaPut{delta}", days=35)
+    fc, estimated, src = history.surface_history(asset, f"deltaCall{delta}", days=45)
+    fp, _, _ = history.surface_history(asset, f"deltaPut{delta}", days=45)
 
     fig = go.Figure()
     entries: list[tuple[str, str, dict[float, float], dict[float, float]]] = [
@@ -344,7 +371,10 @@ def _skew_term_structure(asset: str, delta: int):
             # call row, not a fresh (and possibly differently-aged) lookup.
             rp, _ = history.surface_row_near(fp, ts)
             if rp is not None:
-                entries.append((label, style_key, _row_to_map(rc, now), _row_to_map(rp, now)))
+                cm = style_key == "1 Month Ago"
+                entries.append((label, style_key,
+                                _row_to_map(rc, None if cm else now, constant_maturity=cm),
+                                _row_to_map(rp, None if cm else now, constant_maturity=cm)))
 
     for label, style_key, cmap, pmap in entries:
         style = TERM_STRUCTURE_SERIES_STYLE.get(style_key, TERM_STRUCTURE_SERIES_STYLE["Current"])
@@ -393,9 +423,9 @@ def cmd_butterfly_term_structure(asset: str, **kwargs):
     dtes = surface.listed_expiries(asset) or sorted(int(d) for d in call)
     x_cat = [(now.date() + timedelta(days=int(d))).strftime("%d-%b") for d in dtes]
 
-    fc, estimated, src = history.surface_history(asset, "deltaCall10", days=35)
-    fp, _, _ = history.surface_history(asset, "deltaPut10", days=35)
-    fa, _, _ = history.surface_history(asset, "delta50", days=35)
+    fc, estimated, src = history.surface_history(asset, "deltaCall10", days=45)
+    fp, _, _ = history.surface_history(asset, "deltaPut10", days=45)
+    fa, _, _ = history.surface_history(asset, "delta50", days=45)
 
     fig = go.Figure()
     entries: list[tuple[str, str, dict[float, float], dict[float, float], dict[float, float]]] = [
@@ -413,8 +443,11 @@ def cmd_butterfly_term_structure(asset: str, **kwargs):
             rp, _ = history.surface_row_near(fp, ts)
             ra, _ = history.surface_row_near(fa, ts)
             if rp is not None and ra is not None:
-                entries.append((label, style_key, _row_to_map(rc, now),
-                                _row_to_map(rp, now), _row_to_map(ra, now)))
+                cm = style_key == "1 Month Ago"
+                entries.append((label, style_key,
+                                _row_to_map(rc, None if cm else now, constant_maturity=cm),
+                                _row_to_map(rp, None if cm else now, constant_maturity=cm),
+                                _row_to_map(ra, None if cm else now, constant_maturity=cm)))
 
     for label, style_key, cmap, pmap, amap in entries:
         style = TERM_STRUCTURE_SERIES_STYLE.get(style_key, TERM_STRUCTURE_SERIES_STYLE["Current"])
@@ -456,7 +489,7 @@ def _smile_history(asset: str) -> tuple[dict[str, pd.DataFrame], bool]:
     hist_maps: dict[str, pd.DataFrame] = {}
     estimated = True
     for key in surface.DELTA_KEYS:
-        f, est, _src = history.surface_history(asset, key, days=35)
+        f, est, _src = history.surface_history(asset, key, days=45)
         if f is not None and not f.empty:
             hist_maps[key] = f
             estimated = est
@@ -501,11 +534,14 @@ def build_vol_surface_figure(asset: str, dte: int,
             disp_label = label if gap <= tolerance else _fmt_ago(now - ref_ts)
 
             pts: dict[int, float] = {}
+            cm = label == "1 Month Ago"
             for key, frame in hist_maps.items():
                 row, _ts = history.surface_row_near(frame, now - delta)
                 if row is None:
                     continue
-                v = surface.interp_at_dte(_row_to_map(row, now), float(dte))
+                v = surface.interp_at_dte(
+                    _row_to_map(row, None if cm else now, constant_maturity=cm),
+                    float(dte))
                 if _finite(v) and v > 0:
                     pts[surface.DELTA_X_MAP[key]] = _pct(v)
             if len(pts) >= 3:
