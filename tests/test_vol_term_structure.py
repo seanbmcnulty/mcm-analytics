@@ -324,6 +324,50 @@ def test_one_month_reconstruction_stays_estimated_but_keeps_shape():
     assert _symbols(by_name["1 Month Ago (est.)"]) == ["triangle-up"]
 
 
+def test_one_month_marks_extrapolated_far_tenors():
+    """A recorded 365d pillar tagged flat_fwd marks only DTEs past the 180d pillar."""
+    if not _plotly_keeps_trace_data():
+        print("skip test_one_month_marks_extrapolated_far_tenors (plotly stub)")
+        return
+    # Include a 250 DTE (between 180 and 365) and a 40 DTE (inside 180).
+    dtes = [1, 40, 180, 250, 365]
+    now = _NOW
+    idx = pd.date_range(now - timedelta(days=34), now, freq="12h", tz="UTC")
+    levels = {1: 0.29, 7: 0.32, 14: 0.37, 30: 0.37, 60: 0.37,
+              90: 0.37, 180: 0.38, 365: 0.40}
+    frame = pd.DataFrame({d: levels[d] for d in levels}, index=idx)
+    frame[history.TENOR_FLAGS_COL] = "365:flat_fwd"
+    live = {float(d): 0.50 for d in dtes}
+
+    def surface_history(*_a, **_k):
+        return frame, False, "recorded snapshots"
+
+    with patch.object(cmd_vol, "_now", lambda: now), \
+         patch.object(surface, "listed_expiries", lambda a: list(dtes)), \
+         patch.object(surface, "iv_by_dte_for_delta", lambda a, k: dict(live)), \
+         patch.object(history, "surface_history", surface_history), \
+         patch.object(history, "expiry_snapshot_near", lambda *a, **k: None):
+        fig, _df, text = cmd_vol.cmd_vol_term_structure("BTC")
+    assert fig is not None and text is None
+    by_name = {tr.name: tr for tr in fig.data}
+    assert "1 Month Ago" in by_name
+    assert "1 Month Ago (est.)" not in by_name
+    month = by_name["1 Month Ago"]
+    ys = _finite_ys(month)
+    # 250 DTE is 70/185 of the way from 38 to 40.
+    want_250 = (0.38 + (70.0 / 185.0) * (0.40 - 0.38)) * 100.0
+    assert abs(ys[3] - want_250) < 1e-6, ys
+    assert abs(ys[2] - 38.0) < 1e-6  # 180d listed, not held from something else
+    assert abs(ys[4] - 40.0) < 1e-6
+    sym = _symbols(month)
+    assert sym[0] == "triangle-up" and sym[2] == "triangle-up"
+    assert sym[3] == "triangle-up-open" and sym[4] == "triangle-up-open"
+    cd = list(month.customdata)
+    assert "(extrap.)" not in str(cd[2]) and "(extrap.)" in str(cd[3])
+    assert "(extrap.)" in str(cd[4])
+
+
+
 def test_skew_and_butterfly_already_span_every_expiry():
     """Skew and butterfly interpolate the fixed-tenor grid, so they already cover
     every listed expiry. Locked here so a later ExactMap port doesn't reopen the gap.

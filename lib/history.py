@@ -135,6 +135,17 @@ SOURCE_COL = "source"
 SOURCE_LIVE, SOURCE_SEED, SOURCE_BACKFILL = "live", "seed", "backfill"
 _SEED_CUTOFF = pd.Timestamp("2026-09-27", tz="UTC")
 
+# Per-row note of which fixed tenors were extrapolated (empty = all listed /
+# interpolated). Format: "365:flat_fwd" or "180:flat_vol;365:flat_fwd".
+TENOR_FLAGS_COL = "tenor_flags"
+METHOD_LISTED = "listed"
+METHOD_FLAT_FWD = "flat_fwd"
+METHOD_FLAT_VOL = "flat_vol"
+# Last listed expiry must cover at least this fraction of the target tenor
+# before we will extrapolate (365 * 0.75 ≈ 274d). SOL/HYPE (~90d) stay blank.
+EXTRAP_MIN_COVER = 0.75
+META_COLS = frozenset({"timestamp", SOURCE_COL, TENOR_FLAGS_COL})
+
 
 def infer_source(ts_text: str) -> str:
     """
@@ -177,6 +188,117 @@ def ensure_source_column(path: Path) -> bool:
         return False
 
 
+def ensure_tenor_flags_column(path: Path) -> bool:
+    """Add an empty ``tenor_flags`` column to a legacy CSV. Never raises."""
+    try:
+        if not path.exists() or path.suffix == ".parquet":
+            return False
+        df = pd.read_csv(path, dtype={"timestamp": str, SOURCE_COL: str})
+        if df.empty or TENOR_FLAGS_COL in df.columns:
+            return False
+        df[TENOR_FLAGS_COL] = ""
+        df.to_csv(path, index=False)
+        return True
+    except Exception:
+        return False
+
+
+def format_tenor_flags(flags: dict[int, str]) -> str:
+    """``{365: "flat_fwd"}`` -> ``"365:flat_fwd"``."""
+    parts = [f"{int(d)}:{m}" for d, m in sorted(flags.items()) if m]
+    return ";".join(parts)
+
+
+def parse_tenor_flags(text) -> dict[int, str]:
+    """Inverse of ``format_tenor_flags``. Empty / missing -> ``{}``."""
+    out: dict[int, str] = {}
+    if text is None or (isinstance(text, float) and not np.isfinite(text)):
+        return out
+    s = str(text).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return out
+    for part in s.split(";"):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        left, right = part.split(":", 1)
+        try:
+            out[int(float(left))] = right.strip()
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def dte_columns(frame) -> list:
+    """Numeric DTE columns of a surface-history frame, skipping meta columns."""
+    if frame is None:
+        return []
+    cols = []
+    for c in frame.columns:
+        if c in META_COLS:
+            continue
+        try:
+            v = float(c)
+        except (TypeError, ValueError):
+            continue
+        cols.append(int(v) if v == int(v) else v)
+    return sorted(cols, key=float)
+
+
+def snapshot_tenor_iv(series: dict[float, float], target: float
+                      ) -> tuple[float, str | None]:
+    """
+    Decimal IV at a fixed snapshot tenor from a listed {DTE: IV} map.
+
+    * Inside the listed range, or within ``_BEYOND_EXPIRY_TOL_DAYS`` past the
+      last expiry: linear-in-DTE interpolation (same as ``interp_at_dte``).
+      Method ``listed``.
+    * Further beyond the last expiry, only if that expiry covers at least
+      ``EXTRAP_MIN_COVER`` of the target: extend the last forward variance
+      (or hold vol flat if only one expiry exists). Method ``flat_fwd`` or
+      ``flat_vol``. This is how the 365d pillar is kept for BTC/ETH while
+      Deribit's longest listed expiry is a ~10-month quarterly; SOL/HYPE
+      (~90d listed) stay blank.
+    * Otherwise: ``(nan, None)``. Nothing is invented from a short curve.
+    """
+    pts: list[tuple[float, float]] = []
+    for d, v in (series or {}).items():
+        try:
+            dte, iv = float(d), float(v)
+        except (TypeError, ValueError):
+            continue
+        if surface.finite(iv) and iv > 0 and dte >= 0:
+            pts.append((dte, iv))
+    pts.sort()
+    if not pts:
+        return float("nan"), None
+    target = float(target)
+    max_listed = pts[-1][0]
+    if target <= max_listed + _BEYOND_EXPIRY_TOL_DAYS:
+        v = surface.interp_at_dte(dict(pts), target)
+        return (float(v), METHOD_LISTED) if surface.finite(v) else (float("nan"), None)
+    if max_listed < EXTRAP_MIN_COVER * target:
+        return float("nan"), None
+    t_tgt = target / 365.0
+    d2, v2 = pts[-1]
+    t2 = d2 / 365.0
+    if t_tgt <= t2:
+        return float(v2), METHOD_LISTED
+    if len(pts) >= 2:
+        d1, v1 = pts[-2]
+        t1 = d1 / 365.0
+        fwd = surface.forward_vol(v1, t1, v2, t2)
+        method = METHOD_FLAT_FWD
+        if not surface.finite(fwd):
+            fwd, method = float(v2), METHOD_FLAT_VOL
+    else:
+        fwd, method = float(v2), METHOD_FLAT_VOL
+    w = (v2 * v2) * t2 + (fwd * fwd) * (t_tgt - t2)
+    if t_tgt <= 0 or w < 0:
+        return float("nan"), None
+    return float(np.sqrt(w / t_tgt)), method
+
+
 # ---------------------------------------------------------------------------
 # Retention + storage format
 # ---------------------------------------------------------------------------
@@ -191,7 +313,7 @@ def ensure_source_column(path: Path) -> bool:
 # published rows allowed to disappear are the non-kept rows of >FULL_RES_DAYS bins.
 FULL_RES_DAYS: int | None = 90
 OLD_RES = "1h"
-_BEYOND_EXPIRY_TOL_DAYS = 5.0  # leave a tenor blank if it's this far past the last listed expiry
+_BEYOND_EXPIRY_TOL_DAYS = 5.0  # listed interpolation still applies this close past the last expiry
 
 # Storage format: CSV until a file passes PARQUET_THRESHOLD_BYTES, then it is
 # converted (once) to ``{asset}_surface.parquet`` and the CSV is removed.
@@ -223,7 +345,7 @@ def read_store(asset: str, base: Path | None = None) -> pd.DataFrame | None:
     if p.suffix == ".parquet":
         df = pd.read_parquet(p)
     else:
-        df = pd.read_csv(p, dtype={"timestamp": str, SOURCE_COL: str})
+        df = pd.read_csv(p, dtype={"timestamp": str, SOURCE_COL: str, TENOR_FLAGS_COL: str})
     return df
 
 
@@ -239,12 +361,17 @@ def write_store(asset: str, df: pd.DataFrame, base: Path | None = None) -> Path:
     df["timestamp"] = df["timestamp"].astype(str)
     if SOURCE_COL in df:
         df[SOURCE_COL] = df[SOURCE_COL].astype(object).where(df[SOURCE_COL].notna(), None)
+    if TENOR_FLAGS_COL in df:
+        df[TENOR_FLAGS_COL] = (
+            df[TENOR_FLAGS_COL].astype(object).where(df[TENOR_FLAGS_COL].notna(), "")
+            .fillna("").astype(str)
+        )
     if not pq.exists():
         text = df.to_csv(index=False)
         if len(text.encode()) < PARQUET_THRESHOLD_BYTES:
             csv.write_text(text)
             return csv
-    num = [c for c in df.columns if c not in ("timestamp", SOURCE_COL)]
+    num = [c for c in df.columns if c not in META_COLS]
     df[num] = df[num].apply(pd.to_numeric, errors="coerce")
     df.to_parquet(pq, index=False)
     if csv.exists():
@@ -302,7 +429,7 @@ def maybe_convert_to_parquet(asset: str, base: Path | None = None) -> bool:
         return False
     if csv.stat().st_size < PARQUET_THRESHOLD_BYTES:
         return False
-    write_store(asset, pd.read_csv(csv, dtype={"timestamp": str, SOURCE_COL: str}), base)
+    write_store(asset, pd.read_csv(csv, dtype={"timestamp": str, SOURCE_COL: str, TENOR_FLAGS_COL: str}), base)
     return True
 
 
@@ -318,11 +445,14 @@ def record_snapshot_status(asset: str, min_interval_s: float = 1800.0,
       "no_data"   Deribit returned no usable surface (worth retrying)
       "error"     anything else went wrong (e.g. read-only filesystem)
 
-    Tenors beyond the longest listed expiry are written blank rather than
-    held flat (SOL/HYPE list nothing past ~3 months, so a flat-held 180d/365d
-    value is just a copy of the last expiry and carries no information).
-    Upgrades a legacy file to include the ``source`` column before appending,
-    then applies retention and converts to parquet past the size threshold.
+    Tenors inside the listed range are interpolated as before. A tenor past
+    the last listed expiry is filled by extending the last forward variance
+    when the last expiry covers at least ``EXTRAP_MIN_COVER`` of the tenor
+    (BTC/ETH 365d while the longest quarterly is ~10 months), and is left
+    blank otherwise (SOL/HYPE list nothing past ~3 months). Extrapolated
+    tenors are tagged in ``tenor_flags``. Upgrades a legacy file to include
+    the ``source`` and ``tenor_flags`` columns before appending, then applies
+    retention and converts to parquet past the size threshold.
     """
     try:
         SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -345,32 +475,42 @@ def record_snapshot_status(asset: str, min_interval_s: float = 1800.0,
         vols = surface.option_vols_by_dte(asset)
         if not vols.get("atm"):
             return "no_data"
-        listed = [float(k) for k, v in vols.get("atm", {}).items() if surface.finite(v)]
-        max_listed = max(listed) if listed else 0.0
         row: dict[str, object] = {"timestamp": now.isoformat()}
+        flags: dict[int, str] = {}
         for field in _FIELDS:
             series = {float(k): float(v) for k, v in vols.get(field, {}).items()
                       if surface.finite(v)}
             for dte in SNAPSHOT_DTES:
-                if dte > max_listed + _BEYOND_EXPIRY_TOL_DAYS:
-                    v = np.nan
-                else:
-                    v = surface.interp_at_dte(series, float(dte)) if series else np.nan
+                v, method = snapshot_tenor_iv(series, float(dte)) if series else (float("nan"), None)
                 row[f"{field}_{dte}"] = round(float(v), 6) if surface.finite(v) else ""
+                if method in (METHOD_FLAT_FWD, METHOD_FLAT_VOL):
+                    flags[int(dte)] = method
         row[SOURCE_COL] = SOURCE_LIVE
+        row[TENOR_FLAGS_COL] = format_tenor_flags(flags)
         try:
             record_expiry_snapshot(asset, now, vols)  # best-effort; never blocks the main row
         except Exception:
             pass
         if path.suffix == ".parquet":
             df = pd.read_parquet(path)
-            new = pd.DataFrame([row]).reindex(columns=list(df.columns))
-            write_store(asset, pd.concat([df, new], ignore_index=True))
+            cols = list(dict.fromkeys(list(df.columns) + list(row.keys())))
+            new = pd.DataFrame([row]).reindex(columns=cols)
+            write_store(asset, pd.concat([df.reindex(columns=cols), new], ignore_index=True))
         else:
             ensure_source_column(path)
+            ensure_tenor_flags_column(path)
             if path.exists():
                 # Match the existing header exactly so an append can never shift columns.
                 cols = list(pd.read_csv(path, nrows=0).columns)
+                # If a brand-new meta column still isn't in the header (e.g.
+                # the ensure_* rewrite lost a race), add it before appending.
+                missing = [c for c in (SOURCE_COL, TENOR_FLAGS_COL) if c in row and c not in cols]
+                if missing:
+                    existing = pd.read_csv(path, dtype=str)
+                    for c in missing:
+                        existing[c] = ""
+                    existing.to_csv(path, index=False)
+                    cols = list(existing.columns)
                 frame = pd.DataFrame([row]).reindex(columns=cols)
                 frame.to_csv(path, mode="a", header=False, index=False)
             else:
@@ -654,6 +794,8 @@ def _surface_from_snapshots(asset: str, delta_key: str,
         return None
     out = pd.DataFrame(cols)
     out.columns = [int(c) for c in out.columns]
+    if TENOR_FLAGS_COL in snaps.columns:
+        out[TENOR_FLAGS_COL] = snaps.loc[out.index, TENOR_FLAGS_COL]
     return out.sort_index()
 
 
@@ -937,9 +1079,15 @@ def surface_history(asset: str, delta_key: str = "delta50",
         # covered span removes the overlap entirely.
         lo, hi = recorded.index.min(), recorded.index.max()
         frame = frame[(frame.index < lo) | (frame.index > hi)]
-        shared = [c for c in recorded.columns if c in frame.columns]
+        shared = [c for c in dte_columns(recorded) if c in frame.columns]
         if shared:
-            frame = pd.concat([frame[shared], recorded[shared]]).sort_index()
+            rec = recorded[shared].copy()
+            frame = pd.concat([frame[shared], rec]).sort_index()
+            if TENOR_FLAGS_COL in recorded.columns:
+                frame[TENOR_FLAGS_COL] = recorded[TENOR_FLAGS_COL].combine_first(
+                    frame[TENOR_FLAGS_COL] if TENOR_FLAGS_COL in frame.columns
+                    else pd.Series(index=frame.index, dtype=object)
+                )
     return frame, True, f"{label}-scaled"
 
 
@@ -986,7 +1134,7 @@ def iv_series_at_dte(asset: str, dte: int, delta_key: str = "delta50",
                                             recorded_only=recorded_only)
     if frame is None or frame.empty:
         return None, estimated, src
-    cols = sorted(float(c) for c in frame.columns)
+    cols = [float(c) for c in dte_columns(frame)]
     target = float(dte)
     exact = [c for c in cols if abs(c - target) < 0.01]
     if exact:

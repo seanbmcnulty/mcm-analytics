@@ -436,6 +436,29 @@ The same constant-maturity mapping is used for the 1-month lookback on
 skew, butterfly, and smile. No synthetic backfill. ETH/SOL/HYPE share
 the command.
 
+
+### 2026-11-22 — Restore the 365d snapshot pillar (flat forward variance)
+
+On 16 Oct 2026 `record_snapshot_status` started leaving any tenor more than
+5 days past the last listed expiry blank (`_BEYOND_EXPIRY_TOL_DAYS`). That
+was the right call for SOL/HYPE (nothing listed past ~90d, so a flat-held
+180d/365d was just a copy of the last expiry). It also blanked BTC/ETH
+`atm_365` immediately: Deribit's longest quarterly was already ~343d, and
+the previous behaviour had been holding that last print flat out to 365d.
+First blank row: 16 Oct 2026 04:28 UTC, a couple of hours after the deploy.
+
+The recorder now fills a tenor past the last expiry only when that expiry
+covers at least 75% of the target (so 365d needs a listed expiry ≥ ~274d).
+The fill extends the last *forward variance* (or holds vol flat if only one
+expiry exists) and tags the tenor in a new `tenor_flags` column
+(`365:flat_fwd`). SOL/HYPE 180d/365d stay blank. Historical Oct 16–now
+blanks are left in place — no synthetic backfill. Per-expiry snapshots only
+start on 2 Nov, so they cannot recompute the October gap either.
+
+On `/vol_term_structure`, points that interpolate using an extrapolated
+365d pillar (typically Jun/Sep) get a hollow marker and "(extrap.)" in the
+hover; the line itself stays "1 Month Ago". `tests/test_snapshot_tenors.py`.
+
 ### 2026-11-09 — Ecoinometrics: close/200DMA ratio and MCM ETF flow regime
 
 Two extra tabs on `pages/13_Ecoinometrics_Charts.py`, inspired by the 6 Nov 2026
