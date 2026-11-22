@@ -3,8 +3,9 @@ name: Update Ecoinometrics data
 # Rebuild the CSVs pages/13 falls back to when Farside, FRED, or
 # federalreserve.gov is unreachable from Streamlit Community Cloud:
 #   data/etf_flows.csv
-#   data/fred_DFF.csv, data/fred_NASDAQCOM.csv, data/fred_CPIAUCSL.csv, data/fred_DGS10.csv
+#   data/fred_DFF.csv, data/fred_NASDAQCOM.csv, data/fred_NASDAQ100.csv, data/fred_CPIAUCSL.csv, data/fred_DGS10.csv
 #   data/fed_tone.csv
+#   data/strategy_funding.csv
 #
 # The Ecoinometrics page can also rebuild these in the current session without
 # this workflow. That disk is wiped on the next deploy, and the app cannot
@@ -34,6 +35,7 @@ on:
           - etf_flows
           - fred
           - fed_tone
+          - strategy
         default: all
 
 permissions:
@@ -72,9 +74,11 @@ jobs:
           git config user.name "mcm-ecoinometrics-data-bot"
           git config user.email "actions@users.noreply.github.com"
           git add -- data/fred_DFF.csv data/fred_NASDAQCOM.csv data/fred_CPIAUCSL.csv data/fred_DGS10.csv data/fed_tone.csv
-          if [ -f data/etf_flows.csv ]; then
-            git add -- data/etf_flows.csv
-          fi
+          for f in data/etf_flows.csv data/fred_NASDAQ100.csv data/strategy_funding.csv; do
+            if [ -f "$f" ]; then
+              git add -- "$f"
+            fi
+          done
           if git diff --cached --quiet; then
             echo "Ecoinometrics CSVs unchanged; nothing to commit."
             exit 0
