@@ -5,6 +5,8 @@ import ast
 import builtins
 import os
 import pickle
+import subprocess
+import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -90,6 +92,35 @@ def test_format_sgt_and_status_lines():
     ok_caption = eco_refresh.summary_caption({"etf_flows": live}, {})
     assert "ETF flows: live, updated 15 Jan 2026 08:30 SGT" in ok_caption
     assert "FRED: not loaded" in ok_caption
+
+
+def test_refresh_imports_without_plotly():
+    """The weekly Action installs only requests, pandas, lxml and pypdf."""
+    script = r"""
+import sys
+class _Block:
+    def find_spec(self, name, path=None, target=None):
+        if name == "plotly" or name.startswith("plotly."):
+            raise ModuleNotFoundError("plotly must not be required to refresh data")
+        return None
+sys.meta_path.insert(0, _Block())
+from lib import eco_refresh  # noqa: F401
+import importlib.util
+from pathlib import Path
+path = Path("tools/refresh_ecoinometrics_data.py")
+spec = importlib.util.spec_from_file_location("refresh_ecoinometrics_data", path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+assert hasattr(mod, "main")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_etf_live_csv_and_refresh_does_not_hide_a_failed_scrape():
@@ -412,6 +443,8 @@ def test_tools_and_workflow_share_the_builders():
     assert "data/etf_flows.csv" in workflow and "data/fed_tone.csv" in workflow
     assert "eco_refresh.clear_cache" in cache
     assert "pypdf" in requirements
+    assert "from lib import fx_style" not in (ROOT / "lib" / "eco_refresh.py").read_text(encoding="utf-8")
+    assert "pip install --disable-pip-version-check requests pandas lxml pypdf" in workflow
 
 
 def test_page_builders_run_only_from_the_refresh_handler():

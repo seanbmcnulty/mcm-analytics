@@ -15,6 +15,11 @@ commits the CSVs, and only when a token is configured.
 
 ``clear_cache`` drops those session frames. The in-process lock that stops two
 refreshes from running at once is not a cache and is left alone.
+
+This module must stay importable without plotly or streamlit: the weekly
+GitHub Action (``update_ecoinometrics_data.yml``) installs only requests,
+pandas, lxml and pypdf. Do not import ``lib.fx_style`` here; it pulls in
+plotly at module level.
 """
 from __future__ import annotations
 
@@ -28,7 +33,6 @@ import pandas as pd
 import requests
 
 from lib import ecoinometrics as eco
-from lib import fx_style
 
 GITHUB_REPO = "seanbmcnulty/mcm-analytics"
 WORKFLOW_FILE = "update_ecoinometrics_data.yml"
@@ -515,8 +519,21 @@ def dispatch_data_refresh(datasets: str = "all", *, token: str | None = None, po
     )
 
 
+def _to_sgt(ts):
+    """Convert a single timestamp to Asia/Singapore (tz-naive)."""
+    if ts is None:
+        return ts
+    try:
+        t = pd.Timestamp(ts)
+        if t.tz is None:
+            t = t.tz_localize("UTC")
+        return t.tz_convert("Asia/Singapore").tz_localize(None)
+    except Exception:
+        return pd.Timestamp(ts)
+
+
 def format_sgt(ts) -> str:
-    """Format a timestamp in Asia/Singapore via ``fx_style.to_local_ts``."""
+    """Format a timestamp in Asia/Singapore."""
     if ts is None:
         return "—"
     try:
@@ -524,7 +541,7 @@ def format_sgt(ts) -> str:
             return "—"
     except TypeError:
         return "—"
-    local = fx_style.to_local_ts(ts)
+    local = _to_sgt(ts)
     if local is None:
         return "—"
     try:
