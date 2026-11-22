@@ -72,6 +72,8 @@ def _row_to_map(row: pd.Series, now: datetime | None = None, *,
             shift = 0
     out: dict[float, float] = {}
     for c in row.index:
+        if c in history.META_COLS:
+            continue
         if not _finite(row.get(c)):
             continue
         d = float(c) - shift
@@ -154,6 +156,27 @@ def _merge_lookback_iv(dtes, exact: dict | None,
 def _open_marker(symbol: str) -> str:
     """Hollow twin of a series marker, used for estimated points on a mixed line."""
     return symbol if str(symbol).endswith("-open") else f"{symbol}-open"
+
+
+def _extrap_point_mask(dtes, grid: dict, tenor_flags: dict[int, str]) -> list[bool]:
+    """True at current DTEs that interpolate using an extrapolated snapshot pillar.
+
+    If 365d is ``flat_fwd`` and 180d is listed, Jun/Sep tenors (between 180
+    and 365) are marked; tenors at or inside the last listed pillar are not.
+    """
+    extrap_pillars = {float(d) for d, m in (tenor_flags or {}).items() if m}
+    if not extrap_pillars or not grid:
+        return [False] * len(dtes)
+    real = [float(k) for k, v in grid.items()
+            if k not in extrap_pillars and _finite(v)]
+    last_real = max(real) if real else None
+    out = []
+    for d in dtes:
+        if last_real is None:
+            out.append(True)
+        else:
+            out.append(float(d) > last_real + 1e-6)
+    return out
 
 
 def _fmt_ago(delta: timedelta) -> str:
@@ -240,9 +263,10 @@ def cmd_vol_term_structure(asset: str, **kwargs):
     fig = go.Figure()
     x_cat = [(now.date() + timedelta(days=int(d))).strftime("%d-%b") for d in dtes]
 
-    # (legend name, style key, decimal IV per dte, per-point estimated flag)
-    series: list[tuple[str, str, list[float], list[bool]]] = [(
-        "Current", "Current", [_at(live, d) for d in dtes], [False] * len(dtes))]
+    # (legend name, style key, decimal IV per dte, per-point est flag, extrap flag)
+    series: list[tuple[str, str, list[float], list[bool], list[bool]]] = [(
+        "Current", "Current", [_at(live, d) for d in dtes],
+        [False] * len(dtes), [False] * len(dtes))]
     lookbacks = [("24h Ago", timedelta(hours=24), 3.0),
                  ("1 Week Ago", timedelta(days=7), 6.0),
                  ("1 Month Ago", timedelta(days=30), 12.0)]
@@ -258,10 +282,13 @@ def cmd_vol_term_structure(asset: str, **kwargs):
         exact = ex["atm"] if ex is not None else None
         grid = None
         grid_label = label
+        tenor_flags: dict[int, str] = {}
         if label in grid_pts:
             grid_label, row = grid_pts[label]
             grid = _row_to_map(row, None if use_cm else now,
                                constant_maturity=use_cm)
+            if history.TENOR_FLAGS_COL in getattr(row, "index", []):
+                tenor_flags = history.parse_tenor_flags(row[history.TENOR_FLAGS_COL])
         if exact is None and not grid:
             continue
         ys, flags = _merge_lookback_iv(dtes, exact, grid)
@@ -275,29 +302,34 @@ def cmd_vol_term_structure(asset: str, **kwargs):
         # onto today's tenors, not a DVOL-scaled estimate.
         if use_cm and exact is None and not estimated:
             flags = [False] * len(flags)
+        extrap = _extrap_point_mask(dtes, grid or {}, tenor_flags)
         n_est = sum(1 for i in finite if flags[i])
         # Whole line from a reconstruction (or a mixed line that is entirely
-        # filled) -> "(est.)" in the legend.
+        # filled) -> "(est.)" in the legend. Extrapolated far-end points
+        # stay on the recorded line and are marked per-point instead.
         name = f"{display} (est.)" if n_est == len(finite) else display
-        series.append((name, label, ys, flags))
+        series.append((name, label, ys, flags, extrap))
 
-    for name, style_key, ys, flags in series:
+    for name, style_key, ys, flags, extrap in series:
         style = TERM_STRUCTURE_SERIES_STYLE.get(style_key, TERM_STRUCTURE_SERIES_STYLE["Current"])
         y = [_pct(v) for v in ys]
         is_current = style_key == "Current"
         wholly_est = name.endswith("(est.)")
-        # Mixed line: hollow markers on the tenors that were not listed then.
-        # A fully estimated line keeps its filled marker; the legend carries
-        # the "(est.)" suffix instead.
-        if (not is_current) and (not wholly_est) and any(flags):
+        open_at = [(f or x) for f, x in zip(flags, extrap)]
+        # Mixed line: hollow markers on tenors that were not listed then, or
+        # that rest on an extrapolated 365d pillar. A fully estimated line
+        # keeps its filled marker; the legend carries the "(est.)" suffix.
+        if (not is_current) and (not wholly_est) and any(open_at):
             symbol = [_open_marker(style["marker_symbol"]) if f else style["marker_symbol"]
-                      for f in flags]
+                      for f in open_at]
         else:
             symbol = style["marker_symbol"]
         custom = []
-        for v, f in zip(y, flags):
+        for v, f, x in zip(y, flags, extrap):
             if not _finite(v):
                 custom.append("")
+            elif x and not wholly_est:
+                custom.append(f"{v:.1f} (extrap.)")
             elif f and not wholly_est:
                 custom.append(f"{v:.1f} (est.)")
             else:
@@ -1058,7 +1090,9 @@ def cmd_atm_iv_box_plot(asset: str, lookback_days: int = 90, **kwargs):
     if frame is None or frame.empty or len(frame) < 8:
         return None, None, "No ATM IV history available for box plot."
 
-    cols = sorted(float(c) for c in frame.columns)
+    cols = [float(c) for c in history.dte_columns(frame)]
+    if not cols:
+        return None, None, "No ATM IV history available for box plot."
     dte_min, dte_max = cols[0], cols[-1]
     tenors = [(l, d) for l, d in _BOX_TENORS
               if dte_min - _tenor_snap_tol(d) <= d <= dte_max + _tenor_snap_tol(d)]

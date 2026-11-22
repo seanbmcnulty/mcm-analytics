@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # --- lightweight unit regressions (no Deribit / no plotly needed) ---
 _unit_failures = []
 for _mod_name in ("tests.test_telegram_caption", "tests.test_requirements_pins",
-                  "tests.test_snapshot_tools", "tests.test_vol_term_structure",
+                  "tests.test_snapshot_tools", "tests.test_snapshot_tenors", "tests.test_vol_term_structure",
                   "tests.test_ecoinometrics", "tests.test_eco_charts",
                   "tests.test_eco_refresh", "tests.test_ibit_flow",
                   "tests.test_eco_new_charts", "tests.test_blast",

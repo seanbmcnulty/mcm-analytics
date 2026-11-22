@@ -52,13 +52,13 @@ def read_csv(path_or_text, is_text: bool = False) -> pd.DataFrame | None:
     try:
         if is_text:
             return _with_ts(pd.read_csv(io.StringIO(path_or_text),
-                                        dtype={"timestamp": str, history.SOURCE_COL: str}))
+                                        dtype={"timestamp": str, history.SOURCE_COL: str, history.TENOR_FLAGS_COL: str}))
         p = Path(path_or_text)
         if not p.exists():
             return None
         if p.suffix == ".parquet":
             return _with_ts(pd.read_parquet(p))
-        return _with_ts(pd.read_csv(p, dtype={"timestamp": str, history.SOURCE_COL: str}))
+        return _with_ts(pd.read_csv(p, dtype={"timestamp": str, history.SOURCE_COL: str, history.TENOR_FLAGS_COL: str}))
     except Exception:
         return None
 
@@ -72,7 +72,20 @@ def read_asset(directory, asset: str) -> pd.DataFrame | None:
 
 
 def _iv_cols(df: pd.DataFrame) -> list[str]:
-    return [c for c in df.columns if c not in ("timestamp", "_ts", history.SOURCE_COL)]
+    return [c for c in df.columns
+            if c not in ("timestamp", "_ts") and c not in history.META_COLS]
+
+
+def _header_ok(old_cols: list[str], new_cols: list[str]) -> bool:
+    """True if the IV schema is unchanged; new meta columns (source, tenor_flags) may be added."""
+    if new_cols == old_cols:
+        return True
+    # Legacy allowance: adding only the source column at the end.
+    if new_cols == old_cols + [history.SOURCE_COL]:
+        return True
+    def core(cols):
+        return [c for c in cols if c not in history.META_COLS]
+    return core(old_cols) == core(new_cols) and set(old_cols) <= set(new_cols)
 
 
 # --------------------------------------------------------------------------- validate
@@ -96,7 +109,7 @@ def validate_asset(old: pd.DataFrame | None, new: pd.DataFrame | None,
     new_cols = [c for c in new.columns if c != "_ts"]
     added_rows = new
     if old is not None and not old.empty:
-        if new_cols != old_cols and new_cols != old_cols + [history.SOURCE_COL]:
+        if not _header_ok(old_cols, new_cols):
             errs.append(f"header changed ({len(old_cols)} -> {len(new_cols)} columns)")
         old_ts, new_ts = set(old["_ts"].dropna()), set(new["_ts"].dropna())
         dropped = sorted(old_ts - new_ts)
@@ -241,9 +254,10 @@ def merge_frames(base: pd.DataFrame | None, incoming: pd.DataFrame | None) -> pd
         for c in f.columns:
             if c not in cols and c != "_ts":
                 cols.append(c)
-    if history.SOURCE_COL in cols:  # keep source last
-        cols.remove(history.SOURCE_COL)
-    cols.append(history.SOURCE_COL)
+    for meta in (history.SOURCE_COL, history.TENOR_FLAGS_COL):
+        if meta in cols:
+            cols.remove(meta)
+        cols.append(meta)
     df = pd.concat(frames, ignore_index=True)  # base first -> base wins
     df = df.dropna(subset=["_ts"])
     df = df[~df["_ts"].duplicated(keep="first")].sort_values("_ts")
@@ -251,6 +265,10 @@ def merge_frames(base: pd.DataFrame | None, incoming: pd.DataFrame | None) -> pd
         df[history.SOURCE_COL] = None
     df[history.SOURCE_COL] = df[history.SOURCE_COL].where(
         df[history.SOURCE_COL].notna(), df["timestamp"].map(history.infer_source))
+    if history.TENOR_FLAGS_COL not in df:
+        df[history.TENOR_FLAGS_COL] = ""
+    else:
+        df[history.TENOR_FLAGS_COL] = df[history.TENOR_FLAGS_COL].fillna("").astype(str)
     return df[cols + ["_ts"]]
 
 

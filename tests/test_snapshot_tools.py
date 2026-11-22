@@ -144,7 +144,7 @@ def test_merge_is_append_only_and_tags():
                     "2026-10-15T02:00:00.1+00:00,0.9,0.9,0.9",
                     "2026-10-15T03:00:00.1+00:00,0.6,0.6,0.6"], source=False))
     out = st.merge_frames(base, inc)
-    assert len(out) == 4 and list(out.columns)[-2:] == ["source", "_ts"]
+    assert len(out) == 4 and list(out.columns)[-3:] == ["source", "tenor_flags", "_ts"]
     assert float(out.loc[out["timestamp"].str.startswith("2026-10-15T02"), "atm_7"].iloc[0]) == 0.5
     assert out["source"].tolist() == ["seed", "seed", "live", "live"]
     assert st.validate_asset(base, out, max_added=None, allow_insert=True) == []
