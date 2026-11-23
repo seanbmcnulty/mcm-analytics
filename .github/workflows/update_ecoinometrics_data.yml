@@ -74,7 +74,7 @@ jobs:
           git config user.name "mcm-ecoinometrics-data-bot"
           git config user.email "actions@users.noreply.github.com"
           git add -- data/fred_DFF.csv data/fred_NASDAQCOM.csv data/fred_CPIAUCSL.csv data/fred_DGS10.csv data/fed_tone.csv
-          for f in data/etf_flows.csv data/fred_NASDAQ100.csv data/strategy_funding.csv; do
+          for f in data/etf_flows.csv data/fred_NASDAQ100.csv data/strategy_funding.csv data/yield_curve.csv; do
             if [ -f "$f" ]; then
               git add -- "$f"
             fi
