@@ -16,6 +16,14 @@ a Nasdaq panel under BTC vs 200DMA, the 30-session ETF flow line coloured by
 price, BTC returns on Nasdaq-100 down days, BTC drawdown duration vs depth,
 and Strategy's weekly funding breakdown parsed from its SEC 8-K
 (lib/strategy_8k.py; SEC EDGAR is one more approved external source).
+
+Added 2026-11-23 from the 15-23 Nov 2026 issues (Sean approved all five):
+the Treasury curve now vs a year ago (FRED, falling back to home.treasury.gov),
+daily ETF flow dots with the month-to-date total, year-to-date price returns
+for BTC / gold (GLD) / Nasdaq-100, cumulative BTC ETF vs GLD flows, and ARIMA
+flow scenarios. Data and maths in lib/eco_more.py, figures in
+lib/eco_more_charts.py. SPDR Gold Shares (GLD archive) and home.treasury.gov
+are new approved external sources.
 """
 import sys
 from pathlib import Path
@@ -33,6 +41,8 @@ from lib import ecoinometrics as eco
 from lib import eco_charts
 from lib import eco_refresh
 from lib import eco_style as es
+from lib import eco_more
+from lib import eco_more_charts
 from lib import fx_style
 from lib import strategy_8k
 from lib import blast, freshness
@@ -63,6 +73,10 @@ def _fresh_lib_modules():
                      "figure_etf_flow_regime"),
         eco_refresh: ("build_strategy_funding", "build_fred_cache", "summary_caption"),
         strategy_8k: ("load_result", "from_frame"),
+        eco_more: ("fetch_yield_curve_result", "curve_compare", "flow_dots", "fetch_gld_result",
+                   "gld_flows_usd", "cumulative_flows", "ytd_returns", "simulate_flow_scenarios"),
+        eco_more_charts: ("figure_yield_curve", "figure_flow_dots", "figure_ytd_returns",
+                          "figure_btc_gold_flows", "figure_flow_scenarios"),
     }
     reloaded = []
     stale = False
@@ -92,7 +106,8 @@ st.set_page_config(page_title="Ecoinometrics Charts", page_icon="📰",
                    layout="wide", initial_sidebar_state="expanded")
 st.title("📰 Ecoinometrics-style charts")
 st.caption("Our own versions of recurring Ecoinometrics charts, plus extras. Sources: Farside, "
-           "Deribit BTC-PERP, Bitstamp (pre-2018), FRED, federalreserve.gov, SEC EDGAR. "
+           "Deribit BTC-PERP, Bitstamp (pre-2018), FRED, home.treasury.gov, SPDR Gold Shares (GLD), "
+           "federalreserve.gov, SEC EDGAR. "
            "The flow-regime colours are an MCM approximation, not the Ecoinometrics model.")
 
 with st.sidebar:
@@ -128,7 +143,8 @@ st.sidebar.caption(
 # Home chart blast (lib/blast.py "eco.*"): while a step runs, each chart shown
 # is remembered under its tab and the selected tabs are sent at the bottom.
 ECO_TAB_KEYS = ("etf_streaks", "hacks", "fed_tone", "btc_200dma", "nasdaq_corr", "inflation",
-                "ratio_200dma", "etf_regime", "etf_30d", "nasdaq_down", "drawdowns", "strategy")
+                "ratio_200dma", "etf_regime", "etf_30d", "nasdaq_down", "drawdowns", "strategy",
+                "yield_curve", "etf_dots", "ytd_returns", "btc_gold_flows", "etf_scenarios")
 _blast_step = blast.active_step("eco")   # clears the flag if Telegram isn't configured
 _cur_tab = None
 _SHOWN: list = []
@@ -184,6 +200,22 @@ def _hacks_cached():
 @st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Reading Strategy's latest 8-K from SEC EDGAR…")
 def _strategy_cached():
     return strategy_8k.load_result()
+
+
+@st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Fetching Treasury yields (FRED, then home.treasury.gov)…")
+def _yield_cached():
+    return eco_more.fetch_yield_curve_result()
+
+
+@st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Fetching the SPDR GLD historical archive…")
+def _gld_cached():
+    return eco_more.fetch_gld_result()
+
+
+@st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Simulating ETF flow scenarios…", max_entries=4)
+def _scenarios_cached(flows_btc: pd.DataFrame, n_paths: int):
+    # Keyed on the flow table itself, so a new Farside session reruns the fit.
+    return eco_more.simulate_flow_scenarios(flows_btc, n_paths=n_paths)
 
 
 def _paint_status():
@@ -256,6 +288,14 @@ def _load_strategy():
     return _use("strategy", _strategy_cached)
 
 
+def _load_yield_curve():
+    return _use("yield_curve", _yield_cached)
+
+
+def _load_gld():
+    return _use("gld", _gld_cached)
+
+
 def _clear_loader(key):
     try:
         if key == "etf_flows":
@@ -272,6 +312,10 @@ def _clear_loader(key):
             _hacks_cached.clear()
         elif key == "strategy":
             _strategy_cached.clear()
+        elif key == "yield_curve":
+            _yield_cached.clear()
+        elif key == "gld":
+            _gld_cached.clear()
     except Exception:
         pass
 
@@ -505,7 +549,9 @@ with st.expander("Refresh data", expanded=True):
 tabs = st.tabs(["ETF flow streaks", "Exchange hacks", "Fed tone", "BTC vs 200DMA",
                 "BTC–Nasdaq correlation", "Inflation & yields",
                 "BTC / 200DMA ratio", "ETF flow regime",
-                "30-day ETF flow", "Nasdaq down days", "Drawdowns", "Strategy funding"])
+                "30-day ETF flow", "Nasdaq down days", "Drawdowns", "Strategy funding",
+                "Yield curve", "Daily ETF flows", "YTD returns", "BTC vs gold ETF flows",
+                "ETF flow scenarios"])
 px = _load_btc()
 
 # ------------------------------------------------------------------ ETF flows
@@ -945,6 +991,176 @@ with tabs[11]:
     except Exception as ex:
         st.error(f"The Strategy funding chart could not be drawn: {type(ex).__name__}: {ex}")
 
+# ------------------------------------------- Treasury curve now vs a year ago
+with tabs[12]:
+    _tab(12)
+    try:
+        st.caption(
+            "US Treasury constant-maturity yields, 3-month to 30-year, on the latest date with a full curve "
+            "against the last full curve on or before the same date a year earlier. Inspired by the 20 Nov 2026 "
+            "Ecoinometrics chart \"One Year In The Bear Market, Rates Are The Big Difference\". "
+            "Source: FRED (DGS3MO to DGS30). If FRED does not answer, the US Treasury par yield curve CSV from "
+            "home.treasury.gov is used (the same yields, published a little earlier), then the committed "
+            "data/yield_curve.csv. The average change is the plain mean of the ten tenor changes."
+        )
+        try:
+            ycr = _yield_cached()
+        except Exception as ex:
+            ycr = None
+            st.error(f"Treasury yields unavailable: {ex}")
+        if ycr is not None and not ycr.ok:
+            st.error(ycr.message)
+        elif ycr is not None:
+            _remember_shown("yield_curve", ycr)
+            cc = eco_more.curve_compare(ycr.df)
+            if cc is None:
+                st.warning("No full curve a year before the latest date in this data, so nothing is compared.")
+            else:
+                c = st.columns(3)
+                c[0].metric("Average change (pp)", f"{cc.avg_change:+.2f}")
+                c[1].metric("10-year now", f"{cc.table.set_index('tenor').loc['10Y', 'now']:.2f}%",
+                            f"{cc.table.set_index('tenor').loc['10Y', 'change']:+.2f} pp")
+                c[2].metric("2-year now", f"{cc.table.set_index('tenor').loc['2Y', 'now']:.2f}%",
+                            f"{cc.table.set_index('tenor').loc['2Y', 'change']:+.2f} pp")
+                src = ycr.origin or ""
+                src_label = ("FRED (DGS3MO-DGS30)" if "fred" in src.lower()
+                             else "US Treasury par yield curve" if "treasury" in src.lower()
+                             else f"{src} (committed copy)")
+                st.caption(f"Data: {ycr.message} Curves dated {cc.now_date:%d %b %Y} and {cc.ago_date:%d %b %Y} "
+                           "(US dates).")
+                show(eco_more_charts.figure_yield_curve(cc, src_label))
+    except Exception as ex:
+        st.error(f"The yield-curve chart could not be drawn: {type(ex).__name__}: {ex}")
+
+# ------------------------------------------------- daily ETF flow dots
+with tabs[13]:
+    _tab(13)
+    try:
+        st.caption(
+            "Every session's net flow into US spot Bitcoin ETFs, in BTC, inside the sidebar window; the current "
+            "month is circled and totalled. Inspired by the 20 Nov 2026 Ecoinometrics chart \"Only Two Days Of "
+            "Inflows For The Bitcoin ETFs In November\". Caveat: ours converts each day's Farside US$ total to BTC "
+            "at that UTC day's Deribit close. Ecoinometrics uses the change in BTC held by the ETFs, so the dots "
+            "are close to theirs but not the same."
+        )
+        flows = _safe(_load_etf)
+        if flows is None or px is None:
+            st.error("Needs the Farside flow table and Deribit BTC-PERP daily closes.")
+        else:
+            fb_all = eco.flows_to_btc(flows, px)
+            dots, mstats = eco_more.flow_dots(fb_all[fb_all["date"] >= cutoff].reset_index(drop=True))
+            if mstats:
+                c = st.columns(3)
+                c[0].metric(f"{mstats['month']:%B} to date", f"{mstats['total']:+,.0f} BTC")
+                c[1].metric("Inflow / outflow days", f"{mstats['inflow_days']} / {mstats['outflow_days']}")
+                c[2].metric("Latest session", f"{mstats['last_date']:%d %b %Y}")
+            show(eco_more_charts.figure_flow_dots(dots, mstats))
+    except Exception as ex:
+        st.error(f"The daily ETF flow chart could not be drawn: {type(ex).__name__}: {ex}")
+
+# ------------------------------------------------- YTD returns
+with tabs[14]:
+    _tab(14)
+    try:
+        st.caption(
+            "Year-to-date price returns from the last close of the previous year. Inspired by the 18 Nov 2026 "
+            "Ecoinometrics chart \"Bitcoin Isn't Alone In A Downtrend\". These are price returns, not total "
+            "returns (no dividends). Bitcoin: Deribit BTC-PERP daily close (UTC bar; the latest bar is still open until 16:00 SGT). Gold: the GLD share price "
+            "from the SPDR Gold Shares historical archive, which also carries GLD's 0.40% yearly fee. "
+            "Nasdaq-100: FRED NASDAQ100 (price index). Each line ends on its own latest print."
+        )
+        series = {}
+        if px is not None:
+            series["Bitcoin"] = eco.daily_closes(px)
+        gld = None
+        try:
+            gld = _load_gld()
+        except Exception as ex:
+            st.warning(f"Gold left out: {ex}")
+        if gld is not None:
+            series["Gold (GLD)"] = gld.dropna(subset=["close"]).set_index("date")["close"]
+        ndx = _safe(_load_fred, "NASDAQ100")
+        if ndx is not None:
+            series["Nasdaq-100"] = ndx.set_index("date")["value"]
+        ytd_year = int(as_of_date.year)
+        ytd, ytd_info = eco_more.ytd_returns(series, ytd_year)
+        if ytd_info:
+            c = st.columns(len(ytd_info))
+            for i, (name, v) in enumerate(ytd_info.items()):
+                c[i].metric(name, f"{v['ret']:+.1f}%", help=f"{v['base_date']:%d %b %Y} close {v['base']:,.2f} → "
+                                                              f"{v['last_date']:%d %b %Y} close {v['last']:,.2f}")
+        show(eco_more_charts.figure_ytd_returns(ytd, ytd_info, ytd_year))
+    except Exception as ex:
+        st.error(f"The YTD returns chart could not be drawn: {type(ex).__name__}: {ex}")
+
+# ------------------------------------------------- BTC vs gold ETF flows
+with tabs[15]:
+    _tab(15)
+    try:
+        st.caption(
+            "Cumulative net flows in US$ since the spot Bitcoin ETF approval on 10 Jan 2024 (first session "
+            "11 Jan). Inspired by the 20 Nov 2026 Ecoinometrics chart \"Bitcoin And Gold On The Decline\". "
+            "Bitcoin: the Farside daily total for all US spot BTC ETFs. Gold: an estimate for GLD only, the daily "
+            "change in GLD shares outstanding (total NAV ÷ NAV per share, from the SPDR Gold Shares archive) times "
+            "that day's NAV per share. Caveat: IAU and every other gold ETF are left out, because iShares does not "
+            "serve a free daily shares-outstanding history we can reach, so this gold line is well below the "
+            "all-gold-ETF total Ecoinometrics shows."
+        )
+        flows = _safe(_load_etf)
+        gld_flow, gold_note = None, None
+        try:
+            gld_flow = eco_more.gld_flows_usd(_load_gld())
+        except Exception as ex:
+            gold_note = "Gold side missing this session: SPDR archive unavailable."
+            st.warning(f"Gold side left out: {ex}")
+        cum = eco_more.cumulative_flows(flows, gld_flow)
+        if len(cum):
+            lasts = cum.groupby("series").tail(1).set_index("series")
+            c = st.columns(2)
+            if "btc" in lasts.index:
+                c[0].metric("Spot BTC ETFs, cumulative", f"${lasts.loc['btc', 'cum_bn']:,.1f}B",
+                            help=f"Through {lasts.loc['btc', 'date']:%d %b %Y}")
+            if "gold" in lasts.index:
+                c[1].metric("GLD, cumulative (estimate)", f"${lasts.loc['gold', 'cum_bn']:,.1f}B",
+                            help=f"Through {lasts.loc['gold', 'date']:%d %b %Y}")
+        show(eco_more_charts.figure_btc_gold_flows(cum, gold_note))
+    except Exception as ex:
+        st.error(f"The BTC vs gold flow chart could not be drawn: {type(ex).__name__}: {ex}")
+
+# ------------------------------------------------- ETF flow scenarios
+with tabs[16]:
+    _tab(16)
+    try:
+        st.caption(
+            "The actual rolling 30-session net flow into US spot Bitcoin ETFs (BTC), plus simulated paths for the "
+            "next 30 weekdays. Inspired by the 16 Nov 2026 Ecoinometrics chart \"Bitcoin ETF Flows On The Bearish "
+            "Trajectory\". Method: an ARIMA model with a constant is fitted to the last 252 daily flows (the lowest "
+            "AIC of four small orders), 10,000 paths are simulated with normal shocks and a fixed seed, and the paths "
+            "are split into thirds by their 30-session total: upside, continuation and downside. Each line is that "
+            "third's median and the band its 5th to 95th percentile. Caveats: Ecoinometrics runs 1M paths and does "
+            "not publish how it buckets them, so these numbers will not match theirs. The axis counts weekdays and "
+            "does not skip US market holidays. Daily flows are Farside US$ converted at the Deribit close."
+        )
+        flows = _safe(_load_etf)
+        if flows is None or px is None:
+            st.error("Needs the Farside flow table and Deribit BTC-PERP daily closes.")
+        else:
+            fb_all = eco.flows_to_btc(flows, px)
+            sc = _scenarios_cached(fb_all, 10_000)
+            act = sc.actual.dropna(subset=["roll"])
+            c = st.columns(4)
+            c[0].metric("Actual 30-session flow", f"{act['roll'].iloc[-1]:+,.0f} BTC",
+                        help=f"Through {act['date'].iloc[-1]:%d %b %Y}")
+            for i, name in enumerate(("upside", "continuation", "downside"), start=1):
+                c[i].metric(f"{eco_more_charts.SCENARIO_LABELS[name]} (median)", f"{sc.finals[name]:+,.0f} BTC",
+                            help=f"30-session flow on {pd.Timestamp(sc.future_dates[-1]):%d %b %Y}")
+            st.caption(f"Model ARIMA{sc.order}, AIC {sc.aic:,.0f}, fitted {sc.fit_from:%d %b %Y} to "
+                       f"{sc.fit_to:%d %b %Y}. Tercile cut-offs on the 30-session outcome: "
+                       f"{sc.cutoffs[0]:+,.0f} and {sc.cutoffs[1]:+,.0f} BTC.")
+            show(eco_more_charts.figure_flow_scenarios(sc, cutoff))
+    except Exception as ex:
+        st.error(f"The ETF flow scenario chart could not be drawn: {type(ex).__name__}: {ex}")
+
 st.divider()
 st.caption(
     "Our own charts inspired by the Ecoinometrics newsletter, built from public data. "
@@ -960,7 +1176,8 @@ if _blast_step is not None:
     _titles = dict(zip(ECO_TAB_KEYS, ["ETF flow streaks", "Exchange hacks", "Fed tone", "BTC vs 200DMA",
                                       "BTC–Nasdaq correlation", "Inflation & yields", "BTC / 200DMA ratio",
                                       "ETF flow regime", "30-day ETF flow", "Nasdaq down days", "Drawdowns",
-                                      "Strategy funding"]))
+                                      "Strategy funding", "Yield curve", "Daily ETF flows", "YTD returns",
+                                      "BTC vs gold ETF flows", "ETF flow scenarios"]))
     _pairs = [(f, f"Ecoinometrics — {_titles[k]}") for k, f in _SHOWN if k in _want]
     with st.spinner("Sending Ecoinometrics charts to Telegram…"):
         _sent, _failed = blast.send_figs(_pairs, light_theme=False)
