@@ -53,6 +53,9 @@ st.set_page_config(
 REGIME_ASSETS = regime.REGIME_ASSETS  # ["BTC", "ETH"]
 REGIME_COLORS = {"Low": "#4CAF50", "Moderate": "#FFC107", "High": "#F44336"}
 ASSET_NAMES = {"BTC": "₿ Bitcoin (BTC)", "ETH": "⟠ Ethereum (ETH)"}
+# How many completed-or-current spells the horizontal history timeline shows.
+# Height scales with this count so 20 bars stay as readable as the old 10.
+TIMELINE_LAST_N = 20
 
 
 def _show(fig: go.Figure | None, key: str) -> None:
@@ -192,13 +195,20 @@ def create_regime_timeline(df: pd.DataFrame, asset: str = "BTC") -> go.Figure:
         fig.update_layout(**PLOTLY_LAYOUT, height=400)
         return fig
     fig = go.Figure()
-    for period in periods[-10:]:
+    shown = periods[-TIMELINE_LAST_N:]
+    for period in shown:
         color = REGIME_COLORS.get(period["regime"], "#9aa4b2")
+        # Short spells are too thin for inside labels (a 1d bar is ~1/60 of the
+        # axis when a 2-month spell is on the chart). Put those labels outside.
+        textpos = "outside" if period["duration"] < 4 else "inside"
         fig.add_trace(go.Bar(x=[period["duration"]], y=[f"{period['start']:%Y-%m-%d} to {period['end']:%Y-%m-%d}"],
                               orientation="h", marker_color=color, name=period["regime"],
-                              text=f"{period['duration']}d ({period['regime']})", textposition="inside", showlegend=False))
-    fig.update_layout(**PLOTLY_LAYOUT, title="Regime History Timeline (Last 10 Periods)",
-                       xaxis_title="Duration (Days)", height=max(400, len(periods[-10:]) * 40))
+                              text=f"{period['duration']}d ({period['regime']})", textposition=textpos,
+                              constraintext="none", cliponaxis=False, showlegend=False))
+    fig.update_layout(**PLOTLY_LAYOUT, title=f"Regime History Timeline (Last {TIMELINE_LAST_N} Periods)",
+                       xaxis_title="Duration (Days)",
+                       height=max(400, len(shown) * 40),
+                       yaxis=dict(automargin=True, dtick=1))
     return fig
 
 
