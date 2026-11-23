@@ -38,6 +38,12 @@ from lib.telegram import send_message, is_configured
 from lib import cache as cache_lib
 from lib import fx_style
 from lib import fng
+from lib.fng import (
+    merge_price_fng,
+    add_bucket,
+    add_forward_returns,
+    compute_equity_curve,
+)
 from lib import blast, freshness
 
 freshness.reload_if_changed(blast)
@@ -196,33 +202,8 @@ if price_df is None or price_df.empty:
 # Computation
 # ---------------------------------------------------------------------------
 
-def merge_price_fng(price_df: pd.DataFrame, fng_df: pd.DataFrame) -> pd.DataFrame:
-    """Inner-join daily perp close against the daily F&G reading for the
-    same UTC calendar date."""
-    p = price_df.copy()
-    p["date"] = pd.to_datetime(p["timestamp"]).dt.normalize()
-    f = fng_df.copy()
-    f["date"] = pd.to_datetime(f["timestamp"]).dt.normalize()
-    merged = pd.merge(
-        p[["date", "close"]], f[["date", "value", "classification"]],
-        on="date", how="inner",
-    )
-    return merged.sort_values("date").reset_index(drop=True)
-
-
-def add_bucket(merged: pd.DataFrame, thresholds: dict) -> pd.DataFrame:
-    out = merged.copy()
-    out["bucket"] = out["value"].apply(lambda v: fng.classify(v, thresholds))
-    out["signal"] = out["bucket"].map(BUCKET_SIGNAL)
-    return out
-
-
-def add_forward_returns(merged: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
-    out = merged.copy()
-    for h in horizons:
-        out[f"fwd_{h}"] = out["close"].shift(-h) / out["close"] - 1
-    return out
-
+# merge_price_fng / add_bucket / add_forward_returns / compute_equity_curve
+# live in lib/fng.py so the equity curve can be unit-tested without Streamlit.
 
 def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     """Wilson score interval for a binomial proportion — better-behaved
@@ -307,19 +288,6 @@ def regression_stats(merged: pd.DataFrame, horizon: int) -> dict | None:
         "slope": res.slope, "intercept": res.intercept, "r": res.rvalue,
         "r2": res.rvalue ** 2, "p_value": res.pvalue, "n": len(sub),
     }
-
-
-def compute_equity_curve(merged: pd.DataFrame) -> pd.DataFrame:
-    """Daily-rebalanced: hold position = bucket signal (±1 extreme, ±0.5
-    fear/greed, 0 neutral) determined at day t's close, realized over that
-    day's 1-day forward return (fwd_1 = close(t+1)/close(t) - 1). These
-    windows are contiguous, not overlapping, so compounding day-by-day is
-    valid even though the longer-horizon stats above overlap."""
-    d = merged[["date", "signal", "fwd_1"]].dropna(subset=["fwd_1"]).copy()
-    d["strat_ret"] = d["signal"] * d["fwd_1"]
-    d["strategy_equity"] = (1 + d["strat_ret"]).cumprod()
-    d["buyhold_equity"] = (1 + d["fwd_1"]).cumprod()
-    return d
 
 
 merged = merge_price_fng(price_df, fng_df)
@@ -583,23 +551,29 @@ st.caption(
     "this isolates the directional signal only, not a tradable strategy."
 )
 
-fig5 = go.Figure()
-fig5.add_trace(go.Scatter(x=equity_df["date"], y=equity_df["strategy_equity"],
-                           name="F&G contrarian signal", line=dict(color="#26a69a", width=2)))
-fig5.add_trace(go.Scatter(x=equity_df["date"], y=equity_df["buyhold_equity"],
-                           name="Buy & hold", line=dict(color=ASSET_COLORS.get(selected_asset, "#fff"), width=1.5, dash="dot")))
-fig5.update_layout(**PLOTLY_LAYOUT, height=380, yaxis_title="Growth of $1", hovermode="x unified",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5))
-fx_style.add_watermark(fig5)
-st.plotly_chart(fx_style.apply_theme(fig5), width="stretch")
+if equity_df.empty:
+    st.info(
+        "Not enough overlapping Fear & Greed and price days to build the "
+        "daily equity curve (need at least two consecutive dates)."
+    )
+else:
+    fig5 = go.Figure()
+    fig5.add_trace(go.Scatter(x=equity_df["date"], y=equity_df["strategy_equity"],
+                               name="F&G contrarian signal", line=dict(color="#26a69a", width=2)))
+    fig5.add_trace(go.Scatter(x=equity_df["date"], y=equity_df["buyhold_equity"],
+                               name="Buy & hold", line=dict(color=ASSET_COLORS.get(selected_asset, "#fff"), width=1.5, dash="dot")))
+    fig5.update_layout(**PLOTLY_LAYOUT, height=380, yaxis_title="Growth of $1", hovermode="x unified",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5))
+    fx_style.add_watermark(fig5)
+    st.plotly_chart(fx_style.apply_theme(fig5), width="stretch")
 
-eq_cols = st.columns(3)
-if len(equity_df) > 1:
-    strat_total = equity_df["strategy_equity"].iloc[-1] - 1
-    bh_total = equity_df["buyhold_equity"].iloc[-1] - 1
-    eq_cols[0].metric("Signal total return", f"{strat_total * 100:+.1f}%")
-    eq_cols[1].metric("Buy & hold total return", f"{bh_total * 100:+.1f}%")
-    eq_cols[2].metric("Days in backtest", f"{len(equity_df)}")
+    eq_cols = st.columns(3)
+    if len(equity_df) > 1:
+        strat_total = equity_df["strategy_equity"].iloc[-1] - 1
+        bh_total = equity_df["buyhold_equity"].iloc[-1] - 1
+        eq_cols[0].metric("Signal total return", f"{strat_total * 100:+.1f}%")
+        eq_cols[1].metric("Buy & hold total return", f"{bh_total * 100:+.1f}%")
+        eq_cols[2].metric("Days in backtest", f"{len(equity_df)}")
 
 # ---------------------------------------------------------------------------
 # Telegram
