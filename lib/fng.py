@@ -123,3 +123,69 @@ def get_fng_history(limit: int = 0) -> pd.DataFrame | None:
         return df
     except Exception:
         return None
+
+
+def merge_price_fng(price_df: pd.DataFrame, fng_df: pd.DataFrame) -> pd.DataFrame:
+    """Inner-join daily perp close against the daily F&G reading for the
+    same UTC calendar date."""
+    p = price_df.copy()
+    p["date"] = pd.to_datetime(p["timestamp"]).dt.normalize()
+    f = fng_df.copy()
+    f["date"] = pd.to_datetime(f["timestamp"]).dt.normalize()
+    merged = pd.merge(
+        p[["date", "close"]], f[["date", "value", "classification"]],
+        on="date", how="inner",
+    )
+    return merged.sort_values("date").reset_index(drop=True)
+
+
+def add_bucket(merged: pd.DataFrame, thresholds: dict) -> pd.DataFrame:
+    out = merged.copy()
+    out["bucket"] = out["value"].apply(lambda v: classify(v, thresholds))
+    out["signal"] = out["bucket"].map(BUCKET_SIGNAL)
+    return out
+
+
+def add_forward_returns(merged: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
+    """Add close-to-close forward-return columns for each requested horizon.
+
+    The 1-day return (fwd_1) is always computed, even if 1 is not among the
+    selected stats horizons. The equity-curve backtest compounds contiguous
+    daily returns, so it cannot depend on the sidebar multiselect.
+    """
+    out = merged.copy()
+    needed = list(dict.fromkeys([1, *horizons]))
+    for h in needed:
+        out[f"fwd_{h}"] = out["close"].shift(-h) / out["close"] - 1
+    return out
+
+
+def compute_equity_curve(merged: pd.DataFrame) -> pd.DataFrame:
+    """Daily-rebalanced: hold position = bucket signal (±1 extreme, ±0.5
+    fear/greed, 0 neutral) determined at day t's close, realized over that
+    day's 1-day forward return (fwd_1 = close(t+1)/close(t) - 1). These
+    windows are contiguous, not overlapping, so compounding day-by-day is
+    valid even though the longer-horizon stats above overlap.
+
+    If fwd_1 is missing, it is derived from close so the curve still runs
+    when the caller did not request a 1-day stats horizon. Returns an empty
+    frame with the expected columns when there is no realizable 1-day
+    return (for example a single overlapping date).
+    """
+    d = merged.copy()
+    if "fwd_1" not in d.columns:
+        if "close" not in d.columns:
+            return pd.DataFrame(columns=["date", "signal", "fwd_1",
+                                         "strat_ret", "strategy_equity", "buyhold_equity"])
+        d["fwd_1"] = d["close"].shift(-1) / d["close"] - 1
+    missing = [c for c in ("date", "signal", "fwd_1") if c not in d.columns]
+    if missing:
+        return pd.DataFrame(columns=["date", "signal", "fwd_1",
+                                     "strat_ret", "strategy_equity", "buyhold_equity"])
+    d = d[["date", "signal", "fwd_1"]].dropna(subset=["fwd_1"]).copy()
+    if d.empty:
+        return d
+    d["strat_ret"] = d["signal"] * d["fwd_1"]
+    d["strategy_equity"] = (1 + d["strat_ret"]).cumprod()
+    d["buyhold_equity"] = (1 + d["fwd_1"]).cumprod()
+    return d
