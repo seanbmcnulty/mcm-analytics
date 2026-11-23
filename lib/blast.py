@@ -308,12 +308,17 @@ GROUPS = [
             ("drawdowns", "Drawdowns"),
             ("hacks", "Exchange hacks"),
             ("strategy", "Strategy funding"),
+            ("etf_dots", "Daily ETF flows"),
+            ("btc_gold_flows", "BTC vs gold ETF flows"),
+            ("etf_scenarios", "ETF flow scenarios"),
         ])),
         ("Macro", _items("eco", False, [
             ("fed_tone", "Fed tone"),
             ("nasdaq_corr", "BTC–Nasdaq correlation"),
             ("nasdaq_down", "Nasdaq down days"),
             ("inflation", "Inflation & yields"),
+            ("yield_curve", "Yield curve vs a year ago"),
+            ("ytd_returns", "YTD returns: BTC, gold, Nasdaq-100"),
         ])),
     ]),
     ("vixdvol", "📉 TradFi vol vs DVOL", [

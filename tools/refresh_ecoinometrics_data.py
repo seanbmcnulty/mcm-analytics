@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib import ecoinometrics as eco
+from lib import eco_more
 from lib.eco_refresh import (DISPATCH_DATASETS, build_etf_flows, build_fed_tone, build_fred_cache,
                              build_strategy_funding)
 
@@ -40,6 +41,9 @@ def main(argv=None) -> int:
             ok = any(item.ok for item in results.values())
             if not ok:
                 print("FRED: every series failed")
+            # Treasury curve fallback for the yield-curve tab (FRED, then home.treasury.gov).
+            curve = eco_more.build_yield_curve_csv(log=print)
+            ok = ok or curve.ok
         elif name == "strategy":
             result = build_strategy_funding(log=print)
             ok = result.ok

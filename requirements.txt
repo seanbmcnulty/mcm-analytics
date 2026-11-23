@@ -33,6 +33,11 @@ toml>=0.10.2
 kaleido>=0.2.1,<0.3.0
 streamlit-autorefresh>=1.0.1
 lxml>=4.9.0  # pandas.read_html (Farside ETF flows scrape, lib/ecoinometrics.py)
+# pandas.read_excel for the SPDR GLD historical archive xlsx (lib/eco_more.py).
+openpyxl>=3.1.0
+# ARIMA ETF flow scenarios (lib/eco_more.py). arch already pulls it in; pinned
+# so the Ecoinometrics page does not depend on that transitive install.
+statsmodels>=0.14.0
 # Fed press-conference PDFs for the in-app Fed tone refresh and
 # tools/build_fed_tone.py. Imported only when that refresh runs.
 pypdf>=4.0.0
