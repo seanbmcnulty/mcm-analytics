@@ -6,7 +6,7 @@ Mirrors the FalconX bot's command surface, backed entirely by Deribit data.
 
 from __future__ import annotations
 
-from lib import cmd_market, cmd_vol
+from lib import cmd_market, cmd_vol, snapfallback
 
 # Commands that take an expiry / DTE choice.
 EXPIRY_COMMANDS = {
@@ -115,7 +115,24 @@ def run_command(asset: str, command: str, expiry_target_days: int | None = None)
     kwargs = {}
     if name in EXPIRY_COMMANDS and expiry_target_days is not None:
         kwargs["dte"] = int(expiry_target_days)
+    snapfallback.begin()
     try:
-        return handler(asset, **kwargs)
+        fig, df, text = handler(asset, **kwargs)
     except Exception as exc:  # noqa: BLE001 - surfaced to the UI as text
         return None, None, f"/{name} failed: {short_error(exc)}"
+    return _label_if_delayed(fig, df, text)
+
+
+def _label_if_delayed(fig, df, text):
+    """If the command was served from the 15-min snapshot store (live Deribit
+    unreachable), put the 'Delayed — as of' label in every figure title (so
+    Telegram captions carry it too) and in front of the text."""
+    ts = snapfallback.used()
+    if ts is None:
+        return fig, df, text
+    for f in (fig if isinstance(fig, (list, tuple)) else [fig]):
+        if f is not None and hasattr(f, "update_layout"):
+            snapfallback.stamp_title(f, ts)
+    note = f"⚠ {snapfallback.label(ts)} (live Deribit unreachable)"
+    text = f"{note}\n\n{text}" if text else note
+    return fig, df, text

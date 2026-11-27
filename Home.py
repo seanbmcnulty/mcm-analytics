@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from lib.deribit import get_index_price, get_option_chain, get_ticker
 from lib import deribit as deribit_lib
+from lib import snapfallback
 from lib.constants import ASSET_CONFIG, ASSETS
 from lib.telegram import is_configured
 from lib import cache as cache_lib
@@ -42,16 +43,35 @@ st.subheader("Market Overview")
 # this server, say why once and skip the per-asset calls instead of letting
 # each one wait out its own timeouts.
 _dbt_ok, _dbt_reason, _ = deribit_lib.probe()
+# Live Deribit blocked: fall back to the latest 15-min snapshot recorded by
+# GitHub Actions (real Deribit data, flagged as delayed). Never synthesized.
+_snap = {} if _dbt_ok else {a: snapfallback.latest_market(a) for a in ASSETS}
+_snap_ts = [ts for _, ts in _snap.values() if ts is not None]
+_snap_asof = min(_snap_ts) if _snap_ts else None
 if not _dbt_ok:
-    st.warning(f"Deribit API unreachable from this server ({_dbt_reason}) — live prices, "
-               "funding and option activity are unavailable until it answers. "
-               "Use 🔄 refresh / rerun to retry.")
+    if _snap_asof is not None:
+        st.warning(f"⚠ {snapfallback.banner(_snap_asof, _dbt_reason)}. Prices, funding and "
+                   "option activity below are from the 15-minute snapshot recorder, not live.")
+    else:
+        st.warning(f"Deribit API unreachable from this server ({_dbt_reason}) and no recent "
+                   "snapshot is available — live prices, funding and option activity are blank "
+                   "until it answers. Use 🔄 refresh / rerun to retry.")
 
 cols = st.columns(len(ASSETS))
 for i, asset in enumerate(ASSETS):
     cfg = ASSET_CONFIG[asset]
     with cols[i]:
-        price = get_index_price(cfg["index"]) if _dbt_ok else None
+        if not _dbt_ok:
+            _vals, _ts = _snap.get(asset, ({}, None))
+            if _vals.get("index"):
+                _f = _vals.get("funding")
+                st.metric(label=f"{asset} (delayed)",
+                          value=f"${_vals['index']:,.{cfg['price_dp']}f}",
+                          delta=f"Funding: {_f * 100:+.4f}%/8h" if _f is not None else None)
+            else:
+                st.metric(label=asset, value="—")
+            continue
+        price = get_index_price(cfg["index"])
         if price:
             # Get perp data for funding + OI
             ticker = get_ticker(cfg["perp"])
@@ -78,9 +98,26 @@ headers = ["Currency", "Total OI (contracts)", "24h Volume", "Active Instruments
 for col, h in zip(option_cols, headers):
     col.markdown(f"**{h}**")
 
-for asset in ASSETS:
+if not _dbt_ok:
+    _any_opt = False
+    for asset in ASSETS:
+        _vals, _ts = _snap.get(asset, ({}, None))
+        if "opt_oi" not in _vals:
+            continue
+        _any_opt = True
+        row_cols = st.columns(4)
+        row_cols[0].markdown(f"**{asset}** (delayed)")
+        row_cols[1].markdown(f"{_vals['opt_oi']:,.0f}")
+        row_cols[2].markdown(f"{_vals.get('opt_volume', 0):,.0f}")
+        row_cols[3].markdown(f"{_vals.get('opt_count', 0):,.0f}")
+    if _any_opt and _snap_asof is not None:
+        st.caption(f"⚠ {snapfallback.label(_snap_asof)}")
+    elif not _any_opt:
+        st.caption("No option activity: live Deribit unreachable and no recent snapshot.")
+
+for asset in (ASSETS if _dbt_ok else []):
     cfg = ASSET_CONFIG[asset]
-    chain = get_option_chain(cfg["deribit_ccy"], "option") if _dbt_ok else None
+    chain = get_option_chain(cfg["deribit_ccy"], "option")
     if chain:
         # Filter to this asset's prefix
         prefix = cfg["deribit_prefix"]
@@ -118,6 +155,10 @@ with status_cols[1]:
     if _dbt_ok:
         st.success("✅ Connected")
         st.caption(f"get_index_price {_dbt_reason}")
+    elif _snap_asof is not None:
+        st.warning(f"⚠️ Unreachable — using snapshots (as of "
+                   f"{_snap_asof.tz_convert(snapfallback.SGT).strftime('%H:%M')} SGT)")
+        st.caption(f"Live call: {_dbt_reason}")
     else:
         st.error(f"❌ Unreachable — {_dbt_reason}")
         st.caption(f"{deribit_lib.BASE_URL} · checked "

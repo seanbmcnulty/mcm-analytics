@@ -789,7 +789,7 @@ def cmd_vol_run(asset: str, **kwargs):
     df = pd.DataFrame(rows)
 
     # Header banner.
-    spot = surface.deribit.get_index_price(cfg["index"])
+    spot = surface.spot_price(asset)
     perp = surface.perp_mark(asset)
     dvol = surface.dvol_now(asset)
     rv = history.latest_rv(asset)

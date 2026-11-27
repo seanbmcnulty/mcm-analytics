@@ -704,6 +704,30 @@ st.caption("Crypto derivatives analytics · Deribit public API · "
            f"{fx_style.local_now():%d-%b-%Y %H:%M} "
            f"{fx_style.DISPLAY_TZ_LABEL} time")
 
+# Live-Deribit check (memoised 60 s per session). When Streamlit Cloud can't
+# reach Deribit, the vol-surface reports fall back to the 15-minute snapshot
+# store and every such chart's title says "Delayed — Deribit snapshot as of …".
+def _deribit_probe():
+    import time as _time
+    from lib import deribit as _deribit
+    memo = st.session_state.get("_deribit_probe")
+    if memo is None or _time.time() - memo[0] > 60:
+        ok, reason, _ = _deribit.probe()
+        memo = (_time.time(), ok, reason)
+        st.session_state["_deribit_probe"] = memo
+    return memo[1], memo[2]
+
+
+_dbt_ok, _dbt_reason = _deribit_probe()
+if not _dbt_ok:
+    from lib import snapfallback as _snapfb
+    _sv, _sts = _snapfb.latest_expiry_vols("BTC")
+    _asof = f" (latest snapshot {_snapfb.as_of_text(_sts)})" if _sts is not None else ""
+    st.warning(f"⚠ Live Deribit unreachable from this server: {_dbt_reason}. Vol-surface reports "
+               f"(vol run, term structures, skew, butterflies, forward vols, smiles, time series) use "
+               f"the 15-minute snapshot recorder{_asof} and are labelled **Delayed** in their titles. "
+               "Funding, basis, RV, moon phase and block trades need live Deribit and stay blank.")
+
 with st.expander("What each report shows"):
     st.markdown("""
 | Command | What it shows |
