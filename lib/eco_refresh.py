@@ -214,6 +214,30 @@ def build_etf_flows(*, write: bool = True, data_dir: Path | None = None, timeout
     return result
 
 
+def build_deribit_btc(*, get_ohlc=None, write: bool = True, data_dir: Path | None = None,
+                      start: str | None = None, now_ms: int | None = None, now=None,
+                      log=None) -> eco.FetchResult:
+    """Live Deribit BTC-PERP daily closes. A failed pull does not re-read the CSV."""
+    if get_ohlc is None:
+        from lib.deribit import get_tradingview_ohlc
+        get_ohlc = get_tradingview_ohlc
+    kwargs = {"live": True, "allow_csv": False, "now": now, "data_dir": _dir(data_dir)}
+    if start is not None:
+        kwargs["start"] = start
+    if now_ms is not None:
+        kwargs["now_ms"] = now_ms
+    result = eco.fetch_deribit_btc_daily(get_ohlc, **kwargs)
+    if not result.ok:
+        _log(log, result.message)
+        return result
+    note = "In-session only (file write skipped)."
+    if write:
+        note = eco.write_deribit_btc_daily_csv(result.df, _dir(data_dir) / eco.DERIBIT_BTC_DAILY_CSV)
+    result.message = f"{result.message} {note}"
+    _log(log, result.message)
+    return result
+
+
 def build_fred_cache(series=FRED_SERIES, *, write: bool = True, data_dir: Path | None = None,
                      fetcher=None, now=None, log=None, on_progress=None) -> dict[str, eco.FetchResult]:
     """Fetch each FRED series live and, on success, rewrite ``data/fred_<ID>.csv``.

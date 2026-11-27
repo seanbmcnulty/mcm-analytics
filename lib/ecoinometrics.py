@@ -337,37 +337,117 @@ def fetch_bitstamp_daily_result(start: str = BITSTAMP_START, end: str = BITSTAMP
     )
 
 
+DERIBIT_BTC_DAILY_CSV = "deribit_btc_daily.csv"
+
+
+def _dir(data_dir: Path | None) -> Path:
+    return Path(data_dir) if data_dir is not None else DATA_DIR
+
+
+def read_deribit_btc_daily_csv(path: Path) -> pd.DataFrame:
+    """``data/deribit_btc_daily.csv`` -> DataFrame[timestamp, close]."""
+    df = pd.read_csv(path, parse_dates=["timestamp"])
+    return (
+        df[["timestamp", "close"]]
+        .dropna()
+        .drop_duplicates("timestamp")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+
+def write_deribit_btc_daily_csv(df: pd.DataFrame, path: Path) -> str:
+    """Write daily BTC-PERP closes. Timestamps stay UTC wall time (no tz suffix)."""
+    ready = df[["timestamp", "close"]].copy()
+    ts = pd.to_datetime(ready["timestamp"], utc=True, errors="coerce")
+    ready["timestamp"] = ts.dt.tz_convert("UTC").dt.strftime("%Y-%m-%d %H:%M:%S")
+    ready = ready.dropna().drop_duplicates("timestamp").sort_values("timestamp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ready.to_csv(path, index=False)
+    back = pd.read_csv(path)
+    if len(back) != len(ready):
+        return f"Wrote {path.name} but read back {len(back)} rows, expected {len(ready)}."
+    return (
+        f"Wrote {path.name} ({len(ready)} rows) on this machine; "
+        "a redeploy drops it unless the file is committed."
+    )
+
+
 def fetch_deribit_btc_daily(get_ohlc, start: str = DERIBIT_BTC_DAILY_START,
-                            now_ms: int | None = None, now=None) -> FetchResult:
-    """Paginate Deribit BTC-PERPETUAL daily closes.
+                            now_ms: int | None = None, now=None, *,
+                            live: bool = True, allow_csv: bool = True,
+                            data_dir: Path | None = None) -> FetchResult:
+    """Paginate Deribit BTC-PERPETUAL daily closes, then fall back to CSV.
 
     ``get_ohlc(instrument, resolution, start_ms, end_ms)`` is
-    ``lib.deribit.get_tradingview_ohlc``. One thousand daily bars per call,
-    matching the page's previous loop. A failure leaves the caller on whatever
-    frame it already had; this function does not write a file.
+    ``lib.deribit.get_tradingview_ohlc``. One thousand daily bars per call.
+    Streamlit Community Cloud is often blocked by Deribit's Cloudflare check,
+    so a failed or empty live pull uses ``data/deribit_btc_daily.csv``.
+    A refresh passes ``allow_csv=False`` so a dead pull is a failure instead
+    of a silent re-read of the fallback file.
     """
     fetched_at = _now(now)
     origin = "Deribit tradingview BTC-PERPETUAL 1D"
-    start_ms = int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
-    end = int(time.time() * 1000) if now_ms is None else int(now_ms)
-    out = []
-    cur = start_ms
-    try:
-        while cur < end:
-            nxt = min(cur + 1000 * 86_400_000, end)
-            df = get_ohlc("BTC-PERPETUAL", "1D", cur, nxt)
-            if df is not None and len(df):
-                out.append(df)
-            cur = nxt
-    except Exception as ex:
-        return _fail(["timestamp", "close"], origin, fetched_at, f"Deribit BTC-PERP fetch failed: {ex}")
-    if not out:
-        return _fail(["timestamp", "close"], origin, fetched_at, "No BTC-PERP daily candles returned.")
-    px = pd.concat(out).drop_duplicates("timestamp")[["timestamp", "close"]]
-    return FetchResult(
-        px, "live", origin, fetched_at, _as_of(px, "timestamp"), True,
-        f"Deribit {len(px)} daily closes. In-session only.",
+    err = None
+    if live:
+        start_ms = int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
+        end = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        out = []
+        cur = start_ms
+        try:
+            while cur < end:
+                nxt = min(cur + 1000 * 86_400_000, end)
+                df = get_ohlc("BTC-PERPETUAL", "1D", cur, nxt)
+                if df is not None and len(df):
+                    out.append(df)
+                cur = nxt
+            if out:
+                px = pd.concat(out).drop_duplicates("timestamp")[["timestamp", "close"]]
+                px = px.sort_values("timestamp").reset_index(drop=True)
+                return FetchResult(
+                    px, "live", origin, fetched_at, _as_of(px, "timestamp"), True,
+                    f"Deribit {len(px)} daily closes.",
+                )
+            err = "No BTC-PERP daily candles returned."
+        except Exception as ex:
+            err = f"Deribit BTC-PERP fetch failed: {ex}"
+    path = _dir(data_dir) / DERIBIT_BTC_DAILY_CSV
+    if not allow_csv:
+        return _fail(
+            ["timestamp", "close"], origin, fetched_at,
+            f"{err} CSV fallback was not used." if err else "CSV fallback was not used.",
+        )
+    if path.exists():
+        try:
+            px = read_deribit_btc_daily_csv(path)
+        except Exception as e:
+            return _fail(
+                ["timestamp", "close"], f"data/{DERIBIT_BTC_DAILY_CSV}",
+                file_mtime(path) or fetched_at,
+                f"{err or 'Deribit unavailable'} and data/{DERIBIT_BTC_DAILY_CSV} could not be read ({e})",
+            )
+        if len(px):
+            why = err or "live Deribit was not requested"
+            return FetchResult(
+                px, "csv", f"data/{DERIBIT_BTC_DAILY_CSV}",
+                file_mtime(path) or fetched_at, _as_of(px, "timestamp"), True,
+                f"Deribit unavailable ({why}); using data/{DERIBIT_BTC_DAILY_CSV}.",
+            )
+        return _fail(
+            ["timestamp", "close"], f"data/{DERIBIT_BTC_DAILY_CSV}",
+            file_mtime(path) or fetched_at,
+            f"{err or 'Deribit unavailable'} and data/{DERIBIT_BTC_DAILY_CSV} is empty.",
+        )
+    return _fail(
+        ["timestamp", "close"], f"data/{DERIBIT_BTC_DAILY_CSV}", fetched_at,
+        f"{err or 'Deribit unavailable'} and no data/{DERIBIT_BTC_DAILY_CSV}",
     )
+
+
+def anchor(*parts) -> str:
+    """URL fragment for a section or chart header on the scrolling page."""
+    slug = re.sub(r"[^a-z0-9]+", "-", "-".join(str(p) for p in parts).lower()).strip("-")
+    return "eco-" + slug
 
 
 def _utc_calendar_date(series: pd.Series) -> pd.Series:

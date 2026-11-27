@@ -312,13 +312,78 @@ def test_bitstamp_and_deribit_results():
     assert got.ok and got.source == "live" and got.rows == 1
     assert abs(got.df["close"].iloc[0] - 100) < 1e-9
     end_ms = int(pd.Timestamp("2020-01-05", tz="UTC").timestamp() * 1000)
-    empty = eco.fetch_deribit_btc_daily(lambda *a, **k: None, start=start, now_ms=end_ms)
+    empty = eco.fetch_deribit_btc_daily(
+        lambda *a, **k: None, start=start, now_ms=end_ms, allow_csv=False,
+    )
     assert not empty.ok and "No BTC-PERP" in empty.message
     failed = eco.fetch_deribit_btc_daily(
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")),
-        start=start, now_ms=end_ms,
+        start=start, now_ms=end_ms, allow_csv=False,
     )
     assert not failed.ok and "down" in failed.message
+
+
+def test_deribit_btc_daily_falls_back_to_csv():
+    start = "2020-01-01"
+    end_ms = int(pd.Timestamp("2020-01-05", tz="UTC").timestamp() * 1000)
+    rows = pd.DataFrame({
+        "timestamp": pd.to_datetime(["2018-08-14 08:00:00", "2024-01-11 08:00:00"]),
+        "close": [6403.0, 46300.0],
+    })
+    with tempfile.TemporaryDirectory() as raw:
+        tmp_path = Path(raw)
+        note = eco.write_deribit_btc_daily_csv(rows, tmp_path / eco.DERIBIT_BTC_DAILY_CSV)
+        assert "deribit_btc_daily.csv" in note
+
+        fallback = eco.fetch_deribit_btc_daily(
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("blocked")),
+            start=start, now_ms=end_ms, now=NOW, data_dir=tmp_path,
+        )
+        assert fallback.ok and fallback.source == "csv"
+        assert fallback.rows == 2
+        assert "blocked" in fallback.message
+        assert abs(fallback.df["close"].iloc[-1] - 46300) < 1e-9
+
+        no_file = eco.fetch_deribit_btc_daily(
+            lambda *a, **k: None, start=start, now_ms=end_ms, now=NOW, data_dir=tmp_path / "empty",
+        )
+        assert not no_file.ok and "no data/deribit_btc_daily.csv" in no_file.message
+
+        built = eco_refresh.build_deribit_btc(
+            get_ohlc=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")),
+            write=True, data_dir=tmp_path, start=start, now_ms=end_ms, now=NOW,
+        )
+        assert not built.ok and "down" in built.message
+
+        def get_ohlc(name, resolution, _start, _end):
+            return pd.DataFrame({
+                "timestamp": pd.to_datetime(["2020-01-01 08:00"]),
+                "open": [1], "high": [1], "low": [1], "close": [100.0], "volume": [1],
+            })
+
+        start_ms = int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
+        written = eco_refresh.build_deribit_btc(
+            get_ohlc=get_ohlc, write=True, data_dir=tmp_path,
+            start=start, now_ms=start_ms + 86_400_000, now=NOW,
+        )
+        assert written.ok and written.source == "live" and "Wrote" in written.message
+        back = eco.read_deribit_btc_daily_csv(tmp_path / eco.DERIBIT_BTC_DAILY_CSV)
+        assert len(back) == 1 and abs(back["close"].iloc[0] - 100) < 1e-9
+
+
+def test_committed_deribit_csv_aligns_etf_flows_for_streaks():
+    """The live streaks chart needs both committed files when Deribit is blocked."""
+    px = eco.read_deribit_btc_daily_csv(ROOT / "data" / eco.DERIBIT_BTC_DAILY_CSV)
+    flows = pd.read_csv(ROOT / "data" / "etf_flows.csv", parse_dates=["date"])
+    assert len(px) >= 2000
+    assert px["timestamp"].min() < pd.Timestamp("2019-01-01")
+    fb = eco.flows_to_btc(flows, px)
+    assert len(fb) == len(flows)
+    sp = eco.streak_paths(fb)
+    streaks = eco.flow_streaks(fb)
+    assert len(sp) >= 100 and len(streaks) >= 20
+    cur = streaks.iloc[-1]
+    assert cur["days"] >= 1 and pd.notna(cur["total"])
 
 
 def test_lock_blocks_a_second_refresh_and_releases_on_error():
@@ -499,3 +564,29 @@ def test_page_builders_run_only_from_the_refresh_handler():
 
 def test_import_does_not_start_a_refresh():
     assert eco_refresh.refresh_busy() is False
+
+
+def test_scroll_page_layout_and_anchors():
+    assert eco.anchor("Bitcoin ETF flows") == "eco-bitcoin-etf-flows"
+    assert eco.anchor("Bitcoin ETF flows", "ETF flow streaks") == "eco-bitcoin-etf-flows-etf-flow-streaks"
+    src = (ROOT / "pages" / "13_Ecoinometrics_Charts.py").read_text(encoding="utf-8")
+    assert "st.tabs(" not in src
+    assert 'with st.expander("Refresh data", expanded=False):' in src
+    assert "#### Contents" in src
+    assert "ECO_SECTIONS" in src
+    keys = (
+        "etf_streaks", "etf_regime", "etf_30d", "etf_dots", "btc_gold_flows", "etf_scenarios",
+        "btc_200dma", "ratio_200dma", "drawdowns", "hacks", "strategy",
+        "fed_tone", "nasdaq_corr", "nasdaq_down", "inflation", "yield_curve", "ytd_returns",
+    )
+    for key in keys:
+        assert f'"{key}"' in src, key
+    # every blast key is drawn on the scrolling page
+    import re
+    listed = re.search(r"ECO_TAB_KEYS = \((.*?)\)", src, re.S)
+    tab_keys = tuple(re.findall(r'"(\w+)"', listed.group(1)))
+    section_block = re.search(r"ECO_SECTIONS = \[(.*?)\]", src, re.S).group(1)
+    section_keys = [k for k in re.findall(r'"(\w+)"', section_block) if k in keys]
+    assert set(tab_keys) == set(keys)
+    assert set(section_keys) == set(keys)
+    assert (ROOT / "data" / "deribit_btc_daily.csv").is_file()
