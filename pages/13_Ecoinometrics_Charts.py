@@ -6,7 +6,7 @@ Exceptions to "Deribit-only" (user-approved 2026-11-01): Farside ETF flows, Bits
 closes (hack events before Aug 2018 only), FRED (fed funds, Nasdaq, CPI, 10Y), and
 federalreserve.gov transcripts. Fed tone is a lexicon proxy, NOT their Fed Communication Index.
 
-The "BTC / 200DMA ratio" and "ETF flow regime" tabs (2026-11-09) are extra views
+The "BTC / 200DMA ratio" and "ETF flow regime" charts (2026-11-09) are extra views
 inspired by the 6 Nov 2026 Ecoinometrics issue. The ratio is the Deribit daily
 close over a 200-calendar-day average. The flow colours are MCM's own regime,
 not the unpublished Ecoinometrics model. Both are drawn with fx_style.
@@ -64,14 +64,14 @@ def _fresh_lib_modules():
     import os
     need = {
         fx_style: (),
-        eco: ("sma_rows", "rolling_flow_with_price", "daily_closes", "btc_on_nasdaq_down_days",
+        eco: ("anchor", "sma_rows", "rolling_flow_with_price", "daily_closes", "btc_on_nasdaq_down_days",
               "bucket_stats", "drawdown_episodes", "drawdown_trend", "NASDAQ_BUCKET_LABELS",
               "price_sma_ratio", "etf_flow_regime", "display_from"),
         es: ("hack_scatter",),
         eco_charts: ("figure_nasdaq_sma", "figure_rolling_flow_price", "figure_nasdaq_down_days",
                      "figure_drawdowns", "figure_strategy_funding", "figure_price_sma_ratio",
                      "figure_etf_flow_regime"),
-        eco_refresh: ("build_strategy_funding", "build_fred_cache", "summary_caption"),
+        eco_refresh: ("build_strategy_funding", "build_fred_cache", "build_deribit_btc", "summary_caption"),
         strategy_8k: ("load_result", "from_frame"),
         eco_more: ("fetch_yield_curve_result", "curve_compare", "flow_dots", "fetch_gld_result",
                    "gld_flows_usd", "cumulative_flows", "ytd_returns", "simulate_flow_scenarios"),
@@ -105,10 +105,12 @@ _RELOADED = _fresh_lib_modules() + freshness.reload_if_changed(blast)
 st.set_page_config(page_title="Ecoinometrics Charts", page_icon="📰",
                    layout="wide", initial_sidebar_state="expanded")
 st.title("📰 Ecoinometrics-style charts")
-st.caption("Our own versions of recurring Ecoinometrics charts, plus extras. Sources: Farside, "
-           "Deribit BTC-PERP, Bitstamp (pre-2018), FRED, home.treasury.gov, SPDR Gold Shares (GLD), "
+st.caption("Our own versions of recurring Ecoinometrics charts, plus extras, on one scrolling page. Sources: Farside, "
+           "Deribit BTC-PERP (live, or a committed CSV of real daily closes if Deribit is blocked), "
+           "Bitstamp (pre-2018), FRED, home.treasury.gov, SPDR Gold Shares (GLD), "
            "federalreserve.gov, SEC EDGAR. "
-           "The flow-regime colours are an MCM approximation, not the Ecoinometrics model.")
+           "The flow-regime colours are an MCM approximation, not the Ecoinometrics model. "
+           "Use Refresh data (collapsed below) to re-fetch a source.")
 
 with st.sidebar:
     st.header("Parameters")
@@ -141,7 +143,7 @@ st.sidebar.caption(
 
 
 # Home chart blast (lib/blast.py "eco.*"): while a step runs, each chart shown
-# is remembered under its tab and the selected tabs are sent at the bottom.
+# is remembered under its chart key and the selected charts are sent at the bottom.
 ECO_TAB_KEYS = ("etf_streaks", "hacks", "fed_tone", "btc_200dma", "nasdaq_corr", "inflation",
                 "ratio_200dma", "etf_regime", "etf_30d", "nasdaq_down", "drawdowns", "strategy",
                 "yield_curve", "etf_dots", "ytd_returns", "btc_gold_flows", "etf_scenarios")
@@ -151,7 +153,7 @@ _SHOWN: list = []
 
 
 if _blast_step is not None:
-    blast.banner(_blast_step, "drawing the charts and sending the selected tabs to Telegram…")
+    blast.banner(_blast_step, "drawing the charts and sending the selected charts to Telegram…")
 
 
 def _tab(i: int) -> None:
@@ -375,7 +377,7 @@ def _on_refresh(which: str) -> None:
             _store("bitstamp", result)
             return result
         if which == "deribit_btc":
-            result = eco.fetch_deribit_btc_daily(get_tradingview_ohlc)
+            result = eco_refresh.build_deribit_btc()
             _store("deribit_btc", result)
             return result
         if which == "hacks":
@@ -409,7 +411,7 @@ def _on_refresh(which: str) -> None:
             bitstamp = eco.fetch_bitstamp_daily_result()
             _store("bitstamp", bitstamp)
             on_progress(4, 7, "Deribit BTC-PERP")
-            deribit = eco.fetch_deribit_btc_daily(get_tradingview_ohlc)
+            deribit = eco_refresh.build_deribit_btc()
             _store("deribit_btc", deribit)
             on_progress(5, 7, "Exchange hacks")
             hacks_result = eco.load_hacks_result()
@@ -476,8 +478,24 @@ def _safe(fn, *a):
         return None
 
 
+def _btc_closes_since_2013():
+    """Bitstamp (2013 to Jul 2018) spliced with Deribit BTC-PERP; Deribit wins on overlap."""
+    early = None
+    try:
+        early = _load_bitstamp()
+    except Exception as ex:
+        st.warning(f"Bitstamp unavailable ({ex}); using Deribit only, from Aug 2018.")
+    if early is not None and len(early):
+        first = pd.to_datetime(early["timestamp"]).min()
+        if first > pd.Timestamp("2014-01-01"):
+            st.warning(
+                f"Bitstamp history in this session starts {first:%d %b %Y}, after 1 Jan 2014. "
+                "Use Refresh data → Bitstamp to load from 2013."
+            )
+    return eco.daily_closes(early, px)
+
 _summary_slot = st.empty()
-with st.expander("Refresh data", expanded=True):
+with st.expander("Refresh data", expanded=False):
     _detail_slot = st.empty()
     st.caption(
         "Buttons re-fetch that dataset and redraw the charts for this session. "
@@ -520,7 +538,7 @@ with st.expander("Refresh data", expanded=True):
         _on_refresh("bitstamp")
     if row2[0].button(
         "Deribit BTC", key="eco_refresh_deribit", width="stretch",
-        help="Re-fetch BTC-PERPETUAL daily closes. In-session only.",
+        help="Re-fetch BTC-PERPETUAL daily closes and rewrite data/deribit_btc_daily.csv when the live pull works. If Deribit is blocked, charts use the committed CSV.",
     ):
         _on_refresh("deribit_btc")
     if row2[1].button(
@@ -546,589 +564,616 @@ with st.expander("Refresh data", expanded=True):
     ):
         _on_refresh("strategy")
 
-tabs = st.tabs(["ETF flow streaks", "Exchange hacks", "Fed tone", "BTC vs 200DMA",
-                "BTC–Nasdaq correlation", "Inflation & yields",
-                "BTC / 200DMA ratio", "ETF flow regime",
-                "30-day ETF flow", "Nasdaq down days", "Drawdowns", "Strategy funding",
-                "Yield curve", "Daily ETF flows", "YTD returns", "BTC vs gold ETF flows",
-                "ETF flow scenarios"])
-px = _load_btc()
 
-# ------------------------------------------------------------------ ETF flows
-with tabs[0]:
+ECO_SECTIONS = [
+    ("Bitcoin ETF flows", ("etf_streaks", "etf_regime", "etf_30d", "etf_dots", "btc_gold_flows", "etf_scenarios")),
+    ("Bitcoin price", ("btc_200dma", "ratio_200dma", "drawdowns", "hacks", "strategy")),
+    ("Macro", ("fed_tone", "nasdaq_corr", "nasdaq_down", "inflation", "yield_curve", "ytd_returns")),
+]
+
+
+def _chart_etf_streaks():
     _tab(0)
-    flows = _safe(_load_etf)
-    if flows is not None and px is not None:
-        fb = eco.flows_to_btc(flows, px)
-        fb = fb[fb["date"] >= cutoff]
-        sp = eco.streak_paths(fb)
-        sp = sp[sp.groupby("streak")["date"].transform("size") >= min_streak]
-        r30 = eco.rolling_flow(fb, 30)
-        cur = eco.flow_streaks(fb).iloc[-1]
-        c = st.columns(3)
-        c[0].metric("30d net (BTC)", f"{r30.iloc[-1]:,.0f}")
-        c[1].metric("Current streak", f"{int(cur['days'])}d {'in' if cur['total'] > 0 else 'out'}", f"{cur['total']:,.0f} BTC")
-        c[2].metric("Last day (BTC)", f"{fb.iloc[-1]['flow']:,.0f}")
-        fig = go.Figure()
-        for sign, col in ((1, es.RED), (-1, es.TEAL)):
-            xs, ys = [], []
-            for _, g in sp[sp["sign"] == sign].groupby("streak"):
-                xs += [g["date"].iloc[0], *g["date"], None]
-                ys += [0, *g["cum"], None]
-            fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(color=col, width=2.5),
-                                     hovertemplate="%{x|%d %b %Y}: %{y:,.0f} BTC<extra></extra>"))
-        tot = sp.groupby("streak").agg(end=("date", "last"), cum=("cum", "last"))
-        if len(tot):
-            hi, lo = tot["cum"].idxmax(), tot["cum"].idxmin()
-            es.note(fig, tot.loc[hi, "end"], tot.loc[hi, "cum"], "Strongest inflow streak<br>in window", color=es.RED, ay=-40, ax=-60)
-            es.note(fig, tot.loc[lo, "end"], tot.loc[lo, "cum"], "Worst outflow streak<br>in window", color=es.TEAL, ay=40, ax=-60)
-        es.style(fig, "Bitcoin ETF Flows by Streak", "Bitcoin",
-                 f"Cumulative inflows/outflows over consecutive trading-day streaks. 30-day net flow: {r30.iloc[-1]:,.0f} BTC.",
-                 "Notes: daily Farside US$ totals converted to BTC at that day's close. Source: Farside, Deribit. Not Ecoinometrics' data.",
-                 yfmt=",.0f")
-        fig.update_yaxes(title_text="Cumulative inflows/outflows by streak (BTC)", title_font=dict(size=14))
-        show(fig)
-
-# ----------------------------------------------------------------- Hacks study
-with tabs[1]:
-    _tab(1)
-    try:
-        hacks = _load_hacks()
-    except Exception as ex:
-        st.error(f"Exchange hacks CSV unavailable: {ex}")
-        hacks = pd.DataFrame(columns=["date"])
-    early = _safe(_load_bitstamp) if len(hacks) and (hacks["date"] < "2018-08-02").any() else None
-    parts = [d for d in (early, px) if d is not None and len(d)]
-    if not parts:
-        st.error("No BTC price history available.")
-    else:
-        allpx = pd.concat(parts).assign(d=lambda x: pd.to_datetime(x["timestamp"]).dt.normalize()) \
-                  .drop_duplicates("d", keep="last").drop(columns="d")
-        res = eco.hack_event_returns(allpx, hacks, int(horizon))
-        if res.empty:
-            st.warning("No events overlap the price history.")
-        else:
-            show(es.hack_scatter(res, int(horizon)))
-
-# --------------------------------------------------------------------- Fed tone
-with tabs[2]:
-    _tab(2)
-    try:
-        ft = _load_fed()
-    except Exception as ex:
-        ft = pd.DataFrame()
-        _fed_load_error = ex
-    else:
-        _fed_load_error = None
-    if ft.empty:
-        detail = f" ({_fed_load_error})" if _fed_load_error else ""
-        st.info(
-            "No data/fed_tone.csv yet. Use Refresh data → Fed tone "
-            "(downloads federalreserve.gov transcripts; needs pypdf), "
-            "or run `python tools/build_fed_tone.py 2019` locally and push."
-            + detail
-        )
-    else:
-        dff = _safe(_load_fred, "DFF")
-        if dff is not None:
-            ft = eco.add_fed_funds(ft, dff)
-        fig = go.Figure()
-        have = "ffr" in ft
-        # colour driver: fed funds when FRED is available, else the tone level itself
-        drv = ft["ffr"] if have else ft["avg6"]
-        lo, hi = (0.0, max(5.5, float(drv.max()))) if have else (-50.0, 100.0)
-        ramp = [[0, "#1B4F72"], [0.2, es.TEAL], [0.4, "#8CC7A1"], [0.55, es.YELLOW],
-                [0.78, "#F08A0A"], [1, "#B3123F"]]
-        def _col(v):
-            t = min(1.0, max(0.0, (v - lo) / (hi - lo)))
-            for (t0, c0), (t1, c1) in zip(ramp, ramp[1:]):
-                if t <= t1:
-                    f = (t - t0) / (t1 - t0) if t1 > t0 else 0
-                    a_, b_ = [int(c0[i:i + 2], 16) for i in (1, 3, 5)], [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
-                    return "#%02X%02X%02X" % tuple(round(x + (y - x) * f) for x, y in zip(a_, b_))
-            return ramp[-1][1]
-        ymax = float(max(100, ft["idx"].max() + 5)); ymin = float(min(-50, ft["idx"].min() - 5))
-        fig.add_hrect(y0=0, y1=ymax, fillcolor="#F51E0A", opacity=0.06, line_width=0,
-                      annotation_text="HAWKISH", annotation_position="top right",
-                      annotation_font=dict(color="#B3123F", size=11))
-        fig.add_hrect(y0=ymin, y1=0, fillcolor="#4A9AB5", opacity=0.12, line_width=0,
-                      annotation_text="DOVISH", annotation_position="bottom right",
-                      annotation_font=dict(color="#1B4F72", size=11))
-        # lollipop stems from zero to each meeting's score
-        for d, v, c in zip(ft["date"], ft["idx"], drv):
-            fig.add_shape(type="line", x0=d, x1=d, y0=0, y1=v, line=dict(color=_col(c), width=1.5), opacity=0.45)
-        # smoothed line: one glowing segment per meeting pair
-        for i in range(1, len(ft)):
-            seg = dict(x=ft["date"].iloc[i - 1:i + 1], y=ft["avg6"].iloc[i - 1:i + 1], mode="lines",
-                       hoverinfo="skip", showlegend=False)
-            fig.add_trace(go.Scatter(**seg, line=dict(color=_col(drv.iloc[i]), width=11), opacity=0.18))
-            fig.add_trace(go.Scatter(**seg, line=dict(color=_col(drv.iloc[i]), width=4)))
-        fig.add_trace(go.Scatter(
-            x=ft["date"], y=ft["idx"], mode="markers", showlegend=False,
-            marker=dict(size=11, symbol=["triangle-up" if v > 0 else "triangle-down" for v in ft["idx"]],
-                        color=drv, colorscale=ramp, cmin=lo, cmax=hi,
-                        line=dict(color="white", width=1.2),
-                        showscale=True, colorbar=dict(title="Fed funds %" if have else "Tone", orientation="h",
-                                                      y=1.02, len=0.4, thickness=10, x=0.35)),
-            hovertemplate="%{x|%d %b %Y}: %{y:.1f}<extra></extra>"))
-        es.style(fig, "Fed Press-Conference Tone", "Tone",
-                 "Hawkish minus dovish language in the Chair's FOMC press-conference remarks; line is the six-meeting average.",
-                 "Notes: lexicon proxy (phrase lists in lib/ecoinometrics.py), not the Ecoinometrics Fed Communication Index. "
-                 "Source: federalreserve.gov, FRED.")
-        fig.update_yaxes(title_text="Tone index (hawkish +, dovish −)")
-        show(fig)
-
-# ------------------------------------------------------------------ 200DMA
-with tabs[3]:
-    _tab(3)
-    if px is not None:
-        g = eco.sma_gap(px, 200)
-        gw = g[g["date"] >= cutoff]
-        last = g.dropna().iloc[-1]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=gw["date"], y=gw["sma"], line=dict(color=es.ORANGE, width=3), name="200DMA"))
-        fig.add_trace(go.Scatter(x=gw["date"], y=gw["close"], line=dict(color=es.INK, width=2), name="BTC"))
-        es.style(fig, "Bitcoin vs Its 200-Day Average", "Bitcoin",
-                 f"Bitcoin trades {last['gap']:+.1%} versus its 200-day moving average ({last['close']:,.0f} vs {last['sma']:,.0f}).",
-                 "Notes: Deribit BTC-PERPETUAL daily closes. Source: Deribit.", yfmt=",.0f")
-        fig.update_layout(showlegend=True, legend=dict(orientation="h", y=1.04, x=0.6))
-        if len(gw):
-            fig.update_xaxes(range=[gw["date"].min(), gw["date"].max()])
-        show(fig)
-    try:
-        nq_panel = _safe(_load_fred, "NASDAQCOM")
-        if nq_panel is not None:
-            x0 = gw["date"].min() if px is not None and len(gw) else cutoff
-            x1 = gw["date"].max() if px is not None and len(gw) else as_of_date
-            show(eco_charts.figure_nasdaq_sma(eco.sma_rows(nq_panel, 200), x0, x1))
-            st.caption(
-                "Same date range as the Bitcoin panel. FRED's Nasdaq only prints on trading days, so its 200-day "
-                "average spans 200 trading days (about 40 weeks); the Bitcoin average spans 200 daily bars "
-                "including weekends (about 29 weeks)."
-            )
-    except Exception as ex:
-        st.error(f"The Nasdaq panel could not be drawn: {type(ex).__name__}: {ex}")
-
-# ------------------------------------------------------------ Nasdaq correlation
-with tabs[4]:
-    _tab(4)
-    nq = _safe(_load_fred, "NASDAQCOM")
-    if nq is not None and px is not None:
-        c = eco.rolling_corr(px, nq, int(corr_win))
-        cw = c[c["date"] >= cutoff]
-        avg = c["corr"].mean()
-        fig = go.Figure(go.Scatter(x=cw["date"], y=cw["corr"], line=dict(color=es.ORANGE, width=3)))
-        fig.add_hline(y=avg, line_dash="dash", line_color=es.TEAL)
-        es.note(fig, cw["date"].iloc[len(cw) // 8], avg, f"Long-run average {avg:.2f}", color=es.TEAL, ay=-35)
-        es.style(fig, "Bitcoin and the Nasdaq", "Bitcoin",
-                 f"{corr_win}-day correlation of daily returns is {c['corr'].iloc[-1]:.2f} versus an average of {avg:.2f} since 2018.",
-                 "Notes: rolling correlation of daily log returns on Nasdaq trading days. Source: Deribit, FRED (NASDAQCOM).",
-                 yfmt=".1f")
-        show(fig)
-
-# ------------------------------------------------------------- Inflation / yields
-with tabs[5]:
-    _tab(5)
-    cpi, y10 = _safe(_load_fred, "CPIAUCSL"), _safe(_load_fred, "DGS10")
-    if cpi is not None:
-        cpi = cpi.assign(yoy=cpi["value"].pct_change(12) * 100).dropna()
-        cw = cpi[cpi["date"] >= cutoff - pd.Timedelta(days=365)]
-        fig = go.Figure(go.Bar(x=cw["date"], y=cw["yoy"], marker_color=[es.RED if v > 2 else es.TEAL for v in cw["yoy"]]))
-        fig.add_hline(y=2, line_dash="dash", line_color=es.MUTED)
-        es.style(fig, "US Inflation", "Inflation",
-                 f"Headline CPI is running at {cw['yoy'].iloc[-1]:.1f}% year on year versus the 2% target.",
-                 "Notes: CPIAUCSL, 12-month change. Source: FRED.", height=520)
-        fig.update_yaxes(ticksuffix="%")
-        show(fig)
-    if y10 is not None:
-        yw = y10[y10["date"] >= cutoff]
-        fig = go.Figure(go.Scatter(x=yw["date"], y=yw["value"], line=dict(color=es.RED, width=3)))
-        es.style(fig, "The 10-Year Treasury Yield", "10-Year",
-                 f"The 10-year yield is {yw['value'].iloc[-1]:.2f}%, a key competitor for capital.",
-                 "Notes: DGS10. Source: FRED.", height=520)
-        fig.update_yaxes(ticksuffix="%")
-        show(fig)
-
-# ------------------------------------------------------- close / 200-day ratio
-with tabs[6]:
-    _tab(6)
-    st.caption(
-        "Bitcoin close divided by its 200-calendar-day average, coloured by the close. "
-        "Inspired by the 6 Nov 2026 Ecoinometrics chart "
-        "\"Bitcoin On Its Way To Retest The Long Term Trend\". "
-        f"As of {_now_sgt:%d %b %Y %H:%M} SGT."
-    )
-    if px is None:
-        st.error("No Deribit BTC-PERP daily history, so the ratio cannot be computed.")
-    else:
-        ratio_full = eco.price_sma_ratio(px, eco.SMA_CALENDAR_DAYS)
-        ratio_view = eco.display_from(ratio_full, cutoff)
-        valid = ratio_view.dropna(subset=["ratio"])
-        if valid.empty:
-            st.info(
-                f"No complete {eco.SMA_CALENDAR_DAYS}-calendar-day window inside this display range. "
-                "The average is left blank until every day in it has a real close."
-            )
-        else:
-            last = valid.iloc[-1]
-            c = st.columns(3)
-            c[0].metric("Close / 200-day average", f"{last['ratio']:.3f}")
-            c[1].metric("BTC close", f"{last['close']:,.0f} USD")
-            c[2].metric("200-day average", f"{last['sma']:,.0f} USD")
-            st.caption(
-                f"Latest valid session {pd.Timestamp(last['date']):%d %b %Y} "
-                f"(UTC date of the daily bar; Deribit stamps it at 08:00 UTC, "
-                f"16:00 SGT the same calendar date). "
-                f"The close is {last['ratio'] - 1:+.1%} versus the average."
-            )
-        show(eco_charts.figure_price_sma_ratio(ratio_view))
-    with st.expander("How the 200-day ratio is calculated"):
-        st.markdown(eco.sma_ratio_methodology())
-
-# ------------------------------------------------------- ETF flow regime
-with tabs[7]:
-    _tab(7)
-    st.caption(
-        "Daily US spot BTC ETF net flow in BTC, coloured by MCM's trailing-flow regime. "
-        "Inspired by the 6 Nov 2026 Ecoinometrics chart "
-        "\"Bitcoin ETFs Regime Has Switched To Strong Outflows\". "
-        "The regime is our approximation, not their unpublished model. "
-        f"As of {_now_sgt:%d %b %Y %H:%M} SGT."
-    )
-    flows = _safe(_load_etf)
-    if flows is None or px is None:
-        st.error("The flow regime needs the Farside total and Deribit BTC-PERP daily closes.")
-    else:
-        btc_flow = eco.flows_to_btc(flows, px)
-        if btc_flow.empty:
-            st.warning(
-                "No Farside session shared a UTC date with a positive Deribit close, "
-                "so no bar was converted. Missing prices were not filled with zero or with an earlier close."
-            )
-        else:
-            regime_full = eco.etf_flow_regime(btc_flow)
-            regime_view = eco.display_from(regime_full, cutoff)
-            if regime_view.empty:
-                st.info("No aligned sessions inside this display window.")
-            else:
-                last = regime_view.iloc[-1]
-                label = eco_charts.REGIME_LABELS.get(str(last["regime"]), str(last["regime"]))
-                c = st.columns(3)
-                c[0].metric("Latest daily flow", f"{last['flow']:,.0f} BTC")
-                c[1].metric("MCM regime", label)
-                sum_txt = "warmup" if pd.isna(last["sum_window"]) else f"{last['sum_window']:,.0f} BTC"
-                c[2].metric(f"{eco.FLOW_REGIME_WINDOW}-session sum", sum_txt)
-                if pd.notna(last["scale_median"]):
-                    st.caption(
-                        f"Session {pd.Timestamp(last['date']):%d %b %Y}. "
-                        f"Scale median {last['scale_median']:,.0f} BTC. "
-                        f"Mild cutoff ±{last['mild_cutoff']:,.0f} BTC. "
-                        f"Strong cutoff ±{last['strong_cutoff']:,.0f} BTC. "
-                        f"{len(regime_full)} aligned sessions in the full tape; "
-                        f"the first {eco.FLOW_REGIME_SCALE - 1} stay unclassified."
-                    )
-                else:
-                    st.caption(
-                        f"Session {pd.Timestamp(last['date']):%d %b %Y} is unclassified. "
-                        f"The scale median needs {eco.FLOW_REGIME_SCALE} aligned sessions; "
-                        f"the tape has {len(regime_full)}."
-                    )
-                audit = regime_view.tail(12).copy()
-                audit["date"] = pd.to_datetime(audit["date"]).dt.strftime("%d %b %Y")
-                audit["regime"] = audit["regime"].map(lambda r: eco_charts.REGIME_LABELS.get(str(r), str(r)))
-                show_cols = ["date", "flow", "sum_window", "scale_median", "mild_cutoff", "strong_cutoff", "regime"]
-                st.dataframe(
-                    audit[show_cols].rename(columns={
-                        "date": "Session",
-                        "flow": "Daily flow (BTC)",
-                        "sum_window": f"{eco.FLOW_REGIME_WINDOW}-session sum (BTC)",
-                        "scale_median": f"{eco.FLOW_REGIME_SCALE}-session median |flow| (BTC)",
-                        "mild_cutoff": "Mild cutoff (BTC)",
-                        "strong_cutoff": "Strong cutoff (BTC)",
-                        "regime": "Regime",
-                    }),
-                    width="stretch", hide_index=True,
-                )
-            show(eco_charts.figure_etf_flow_regime(regime_view))
-    with st.expander("How the flow regime is calculated"):
-        st.markdown(eco.flow_regime_methodology())
-
-
-def _btc_closes_since_2013():
-    """Bitstamp (2013 to Jul 2018) spliced with Deribit BTC-PERP; Deribit wins on overlap."""
-    early = None
-    try:
-        early = _load_bitstamp()
-    except Exception as ex:
-        st.warning(f"Bitstamp unavailable ({ex}); using Deribit only, from Aug 2018.")
-    if early is not None and len(early):
-        first = pd.to_datetime(early["timestamp"]).min()
-        if first > pd.Timestamp("2014-01-01"):
-            st.warning(
-                f"Bitstamp history in this session starts {first:%d %b %Y}, after 1 Jan 2014. "
-                "Use Refresh data → Bitstamp to load from 2013."
-            )
-    return eco.daily_closes(early, px)
-
-
-# --------------------------------------------------- 30-session ETF flow line
-with tabs[8]:
-    _tab(8)
     try:
         st.caption(
-            "Rolling 30-session net flow into US spot BTC ETFs, in BTC, with the line coloured by the BTC price. "
-            "Inspired by the 13 Nov 2026 Ecoinometrics chart in \"Bitcoin's Recovery Has Failed\". "
-            "Ours converts each day's Farside US$ flow at that day's Deribit close; theirs is the change in BTC "
-            "held by the ETFs, so the levels will not match exactly."
+            "Cumulative US spot BTC ETF flows over consecutive same-sign trading days, "
+            "converted to BTC at each day's Deribit close."
         )
         flows = _safe(_load_etf)
         if flows is None or px is None:
             st.error("Needs the Farside flow table and Deribit BTC-PERP daily closes.")
         else:
-            rf = eco.rolling_flow_with_price(eco.flows_to_btc(flows, px), px, 30)
-            view = eco.display_from(rf, cutoff)
-            valid = view.dropna(subset=["roll"])
-            if len(valid):
+            fb = eco.flows_to_btc(flows, px)
+            fb = fb[fb["date"] >= cutoff]
+            sp = eco.streak_paths(fb)
+            sp = sp[sp.groupby("streak")["date"].transform("size") >= min_streak]
+            r30 = eco.rolling_flow(fb, 30)
+            streaks = eco.flow_streaks(fb)
+            if fb.empty or streaks.empty or r30.dropna().empty:
+                st.warning("Not enough aligned ETF flow and BTC close sessions in this window.")
+            else:
+                cur = streaks.iloc[-1]
+                c = st.columns(3)
+                c[0].metric("30d net (BTC)", f"{r30.dropna().iloc[-1]:,.0f}")
+                c[1].metric("Current streak", f"{int(cur['days'])}d {'in' if cur['total'] > 0 else 'out'}", f"{cur['total']:,.0f} BTC")
+                c[2].metric("Last day (BTC)", f"{fb.iloc[-1]['flow']:,.0f}")
+                fig = go.Figure()
+                for sign, col in ((1, es.RED), (-1, es.TEAL)):
+                    xs, ys = [], []
+                    for _, g in sp[sp["sign"] == sign].groupby("streak"):
+                        xs += [g["date"].iloc[0], *g["date"], None]
+                        ys += [0, *g["cum"], None]
+                    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(color=col, width=2.5),
+                                             hovertemplate="%{x|%d %b %Y}: %{y:,.0f} BTC<extra></extra>"))
+                tot = sp.groupby("streak").agg(end=("date", "last"), cum=("cum", "last"))
+                if len(tot):
+                    hi, lo = tot["cum"].idxmax(), tot["cum"].idxmin()
+                    es.note(fig, tot.loc[hi, "end"], tot.loc[hi, "cum"], "Strongest inflow streak<br>in window", color=es.RED, ay=-40, ax=-60)
+                    es.note(fig, tot.loc[lo, "end"], tot.loc[lo, "cum"], "Worst outflow streak<br>in window", color=es.TEAL, ay=40, ax=-60)
+                es.style(fig, "Bitcoin ETF Flows by Streak", "Bitcoin",
+                         f"Cumulative inflows/outflows over consecutive trading-day streaks. 30-day net flow: {r30.dropna().iloc[-1]:,.0f} BTC.",
+                         "Notes: daily Farside US$ totals converted to BTC at that day's close. Source: Farside, Deribit. Not Ecoinometrics' data.",
+                         yfmt=",.0f")
+                fig.update_yaxes(title_text="Cumulative inflows/outflows by streak (BTC)", title_font=dict(size=14))
+                show(fig)
+    except Exception as ex:
+        st.error(f"The ETF flow streaks chart could not be drawn: {type(ex).__name__}: {ex}")
+
+
+def _chart_hacks():
+        _tab(1)
+        try:
+            hacks = _load_hacks()
+        except Exception as ex:
+            st.error(f"Exchange hacks CSV unavailable: {ex}")
+            hacks = pd.DataFrame(columns=["date"])
+        early = _safe(_load_bitstamp) if len(hacks) and (hacks["date"] < "2018-08-02").any() else None
+        parts = [d for d in (early, px) if d is not None and len(d)]
+        if not parts:
+            st.error("No BTC price history available.")
+        else:
+            allpx = pd.concat(parts).assign(d=lambda x: pd.to_datetime(x["timestamp"]).dt.normalize()) \
+                      .drop_duplicates("d", keep="last").drop(columns="d")
+            res = eco.hack_event_returns(allpx, hacks, int(horizon))
+            if res.empty:
+                st.warning("No events overlap the price history.")
+            else:
+                show(es.hack_scatter(res, int(horizon)))
+
+    # --------------------------------------------------------------------- Fed tone
+
+
+def _chart_fed_tone():
+        _tab(2)
+        try:
+            ft = _load_fed()
+        except Exception as ex:
+            ft = pd.DataFrame()
+            _fed_load_error = ex
+        else:
+            _fed_load_error = None
+        if ft.empty:
+            detail = f" ({_fed_load_error})" if _fed_load_error else ""
+            st.info(
+                "No data/fed_tone.csv yet. Use Refresh data → Fed tone "
+                "(downloads federalreserve.gov transcripts; needs pypdf), "
+                "or run `python tools/build_fed_tone.py 2019` locally and push."
+                + detail
+            )
+        else:
+            dff = _safe(_load_fred, "DFF")
+            if dff is not None:
+                ft = eco.add_fed_funds(ft, dff)
+            fig = go.Figure()
+            have = "ffr" in ft
+            # colour driver: fed funds when FRED is available, else the tone level itself
+            drv = ft["ffr"] if have else ft["avg6"]
+            lo, hi = (0.0, max(5.5, float(drv.max()))) if have else (-50.0, 100.0)
+            ramp = [[0, "#1B4F72"], [0.2, es.TEAL], [0.4, "#8CC7A1"], [0.55, es.YELLOW],
+                    [0.78, "#F08A0A"], [1, "#B3123F"]]
+            def _col(v):
+                t = min(1.0, max(0.0, (v - lo) / (hi - lo)))
+                for (t0, c0), (t1, c1) in zip(ramp, ramp[1:]):
+                    if t <= t1:
+                        f = (t - t0) / (t1 - t0) if t1 > t0 else 0
+                        a_, b_ = [int(c0[i:i + 2], 16) for i in (1, 3, 5)], [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+                        return "#%02X%02X%02X" % tuple(round(x + (y - x) * f) for x, y in zip(a_, b_))
+                return ramp[-1][1]
+            ymax = float(max(100, ft["idx"].max() + 5)); ymin = float(min(-50, ft["idx"].min() - 5))
+            fig.add_hrect(y0=0, y1=ymax, fillcolor="#F51E0A", opacity=0.06, line_width=0,
+                          annotation_text="HAWKISH", annotation_position="top right",
+                          annotation_font=dict(color="#B3123F", size=11))
+            fig.add_hrect(y0=ymin, y1=0, fillcolor="#4A9AB5", opacity=0.12, line_width=0,
+                          annotation_text="DOVISH", annotation_position="bottom right",
+                          annotation_font=dict(color="#1B4F72", size=11))
+            # lollipop stems from zero to each meeting's score
+            for d, v, c in zip(ft["date"], ft["idx"], drv):
+                fig.add_shape(type="line", x0=d, x1=d, y0=0, y1=v, line=dict(color=_col(c), width=1.5), opacity=0.45)
+            # smoothed line: one glowing segment per meeting pair
+            for i in range(1, len(ft)):
+                seg = dict(x=ft["date"].iloc[i - 1:i + 1], y=ft["avg6"].iloc[i - 1:i + 1], mode="lines",
+                           hoverinfo="skip", showlegend=False)
+                fig.add_trace(go.Scatter(**seg, line=dict(color=_col(drv.iloc[i]), width=11), opacity=0.18))
+                fig.add_trace(go.Scatter(**seg, line=dict(color=_col(drv.iloc[i]), width=4)))
+            fig.add_trace(go.Scatter(
+                x=ft["date"], y=ft["idx"], mode="markers", showlegend=False,
+                marker=dict(size=11, symbol=["triangle-up" if v > 0 else "triangle-down" for v in ft["idx"]],
+                            color=drv, colorscale=ramp, cmin=lo, cmax=hi,
+                            line=dict(color="white", width=1.2),
+                            showscale=True, colorbar=dict(title="Fed funds %" if have else "Tone", orientation="h",
+                                                          y=1.02, len=0.4, thickness=10, x=0.35)),
+                hovertemplate="%{x|%d %b %Y}: %{y:.1f}<extra></extra>"))
+            es.style(fig, "Fed Press-Conference Tone", "Tone",
+                     "Hawkish minus dovish language in the Chair's FOMC press-conference remarks; line is the six-meeting average.",
+                     "Notes: lexicon proxy (phrase lists in lib/ecoinometrics.py), not the Ecoinometrics Fed Communication Index. "
+                     "Source: federalreserve.gov, FRED.")
+            fig.update_yaxes(title_text="Tone index (hawkish +, dovish −)")
+            show(fig)
+
+    # ------------------------------------------------------------------ 200DMA
+
+
+def _chart_btc_200dma():
+        _tab(3)
+        if px is not None:
+            g = eco.sma_gap(px, 200)
+            gw = g[g["date"] >= cutoff]
+            last = g.dropna().iloc[-1]
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=gw["date"], y=gw["sma"], line=dict(color=es.ORANGE, width=3), name="200DMA"))
+            fig.add_trace(go.Scatter(x=gw["date"], y=gw["close"], line=dict(color=es.INK, width=2), name="BTC"))
+            es.style(fig, "Bitcoin vs Its 200-Day Average", "Bitcoin",
+                     f"Bitcoin trades {last['gap']:+.1%} versus its 200-day moving average ({last['close']:,.0f} vs {last['sma']:,.0f}).",
+                     "Notes: Deribit BTC-PERPETUAL daily closes. Source: Deribit.", yfmt=",.0f")
+            fig.update_layout(showlegend=True, legend=dict(orientation="h", y=1.04, x=0.6))
+            if len(gw):
+                fig.update_xaxes(range=[gw["date"].min(), gw["date"].max()])
+            show(fig)
+        try:
+            nq_panel = _safe(_load_fred, "NASDAQCOM")
+            if nq_panel is not None:
+                x0 = gw["date"].min() if px is not None and len(gw) else cutoff
+                x1 = gw["date"].max() if px is not None and len(gw) else as_of_date
+                show(eco_charts.figure_nasdaq_sma(eco.sma_rows(nq_panel, 200), x0, x1))
+                st.caption(
+                    "Same date range as the Bitcoin panel. FRED's Nasdaq only prints on trading days, so its 200-day "
+                    "average spans 200 trading days (about 40 weeks); the Bitcoin average spans 200 daily bars "
+                    "including weekends (about 29 weeks)."
+                )
+        except Exception as ex:
+            st.error(f"The Nasdaq panel could not be drawn: {type(ex).__name__}: {ex}")
+
+    # ------------------------------------------------------------ Nasdaq correlation
+
+
+def _chart_nasdaq_corr():
+        _tab(4)
+        nq = _safe(_load_fred, "NASDAQCOM")
+        if nq is not None and px is not None:
+            c = eco.rolling_corr(px, nq, int(corr_win))
+            cw = c[c["date"] >= cutoff]
+            avg = c["corr"].mean()
+            fig = go.Figure(go.Scatter(x=cw["date"], y=cw["corr"], line=dict(color=es.ORANGE, width=3)))
+            fig.add_hline(y=avg, line_dash="dash", line_color=es.TEAL)
+            es.note(fig, cw["date"].iloc[len(cw) // 8], avg, f"Long-run average {avg:.2f}", color=es.TEAL, ay=-35)
+            es.style(fig, "Bitcoin and the Nasdaq", "Bitcoin",
+                     f"{corr_win}-day correlation of daily returns is {c['corr'].iloc[-1]:.2f} versus an average of {avg:.2f} since 2018.",
+                     "Notes: rolling correlation of daily log returns on Nasdaq trading days. Source: Deribit, FRED (NASDAQCOM).",
+                     yfmt=".1f")
+            show(fig)
+
+    # ------------------------------------------------------------- Inflation / yields
+
+
+def _chart_inflation():
+        _tab(5)
+        cpi, y10 = _safe(_load_fred, "CPIAUCSL"), _safe(_load_fred, "DGS10")
+        if cpi is not None:
+            cpi = cpi.assign(yoy=cpi["value"].pct_change(12) * 100).dropna()
+            cw = cpi[cpi["date"] >= cutoff - pd.Timedelta(days=365)]
+            fig = go.Figure(go.Bar(x=cw["date"], y=cw["yoy"], marker_color=[es.RED if v > 2 else es.TEAL for v in cw["yoy"]]))
+            fig.add_hline(y=2, line_dash="dash", line_color=es.MUTED)
+            es.style(fig, "US Inflation", "Inflation",
+                     f"Headline CPI is running at {cw['yoy'].iloc[-1]:.1f}% year on year versus the 2% target.",
+                     "Notes: CPIAUCSL, 12-month change. Source: FRED.", height=520)
+            fig.update_yaxes(ticksuffix="%")
+            show(fig)
+        if y10 is not None:
+            yw = y10[y10["date"] >= cutoff]
+            fig = go.Figure(go.Scatter(x=yw["date"], y=yw["value"], line=dict(color=es.RED, width=3)))
+            es.style(fig, "The 10-Year Treasury Yield", "10-Year",
+                     f"The 10-year yield is {yw['value'].iloc[-1]:.2f}%, a key competitor for capital.",
+                     "Notes: DGS10. Source: FRED.", height=520)
+            fig.update_yaxes(ticksuffix="%")
+            show(fig)
+
+    # ------------------------------------------------------- close / 200-day ratio
+
+
+def _chart_ratio_200dma():
+        _tab(6)
+        st.caption(
+            "Bitcoin close divided by its 200-calendar-day average, coloured by the close. "
+            "Inspired by the 6 Nov 2026 Ecoinometrics chart "
+            "\"Bitcoin On Its Way To Retest The Long Term Trend\". "
+            f"As of {_now_sgt:%d %b %Y %H:%M} SGT."
+        )
+        if px is None:
+            st.error("No Deribit BTC-PERP daily history, so the ratio cannot be computed.")
+        else:
+            ratio_full = eco.price_sma_ratio(px, eco.SMA_CALENDAR_DAYS)
+            ratio_view = eco.display_from(ratio_full, cutoff)
+            valid = ratio_view.dropna(subset=["ratio"])
+            if valid.empty:
+                st.info(
+                    f"No complete {eco.SMA_CALENDAR_DAYS}-calendar-day window inside this display range. "
+                    "The average is left blank until every day in it has a real close."
+                )
+            else:
                 last = valid.iloc[-1]
                 c = st.columns(3)
-                c[0].metric("30-session net flow", f"{last['roll']:,.0f} BTC")
-                c[1].metric("Window low", f"{valid['roll'].min():,.0f} BTC")
-                c[2].metric("Window high", f"{valid['roll'].max():,.0f} BTC")
-            show(eco_charts.figure_rolling_flow_price(view, 30))
-    except Exception as ex:
-        st.error(f"The 30-day ETF flow chart could not be drawn: {type(ex).__name__}: {ex}")
-
-# ------------------------------------------------------ Nasdaq down days
-with tabs[9]:
-    _tab(9)
-    try:
-        st.caption(
-            "Bitcoin's same-day return on every Nasdaq-100 down day since 2014, grouped by how far the Nasdaq-100 fell. "
-            "Inspired by the 9 Nov 2026 Ecoinometrics chart in \"Bitcoin's Recovery Is at Risk as the Nasdaq Weakens\". "
-            "Matching rule: for Nasdaq trading date D (close-to-close, so Monday covers the weekend), the BTC return is "
-            "the UTC daily bar stamped D over the bar stamped D−1. Bitstamp bars (to Jul 2018) run 00:00-24:00 UTC and "
-            "Deribit BTC-PERP bars run 08:00 UTC to 08:00 UTC the next day, so the 13:30-20:00 UTC Nasdaq session falls "
-            "inside the BTC bar either way. Buckets include their lower bound (−4% sits in −4% to −2%). "
-            "This ignores the window lookback; it always uses 2014 onward."
-        )
-        ndx = _safe(_load_fred, "NASDAQ100")
-        if ndx is not None and px is not None:
-            closes = _btc_closes_since_2013()
-            dd_days = eco.btc_on_nasdaq_down_days(ndx, closes, "2014-01-01")
-            stats = eco.bucket_stats(dd_days)
-            show(eco_charts.figure_nasdaq_down_days(dd_days, stats))
-            if not stats.empty:
-                t = stats.copy()
-                t["share_down"] = (t["share_down"] * 100).round(0)
-                st.dataframe(
-                    t.rename(columns={"bucket": "Nasdaq-100 day", "n": "Days", "median": "Median BTC %",
-                                      "mean": "Mean BTC %", "share_down": "% of days BTC fell"})
-                     .style.format({"Median BTC %": "{:+.2f}", "Mean BTC %": "{:+.2f}", "% of days BTC fell": "{:.0f}"}),
-                    width="stretch", hide_index=True,
+                c[0].metric("Close / 200-day average", f"{last['ratio']:.3f}")
+                c[1].metric("BTC close", f"{last['close']:,.0f} USD")
+                c[2].metric("200-day average", f"{last['sma']:,.0f} USD")
+                st.caption(
+                    f"Latest valid session {pd.Timestamp(last['date']):%d %b %Y} "
+                    f"(UTC date of the daily bar; Deribit stamps it at 08:00 UTC, "
+                    f"16:00 SGT the same calendar date). "
+                    f"The close is {last['ratio'] - 1:+.1%} versus the average."
                 )
-    except Exception as ex:
-        st.error(f"The Nasdaq down-day chart could not be drawn: {type(ex).__name__}: {ex}")
+            show(eco_charts.figure_price_sma_ratio(ratio_view))
+        with st.expander("How the 200-day ratio is calculated"):
+            st.markdown(eco.sma_ratio_methodology())
 
-# --------------------------------------------------------- Drawdowns
-with tabs[10]:
-    _tab(10)
-    try:
-        st.caption(
-            "Every Bitcoin drawdown since 2014, duration against depth. Inspired by the 13 Nov 2026 Ecoinometrics chart. "
-            "Rules: daily closes (Bitstamp to Jul 2018, Deribit BTC-PERP after). A drawdown starts at an all-time-high "
-            "close and ends on the first close back at or above that peak; depth is the lowest close in between. "
-            f"Only drawdowns of {dd_min:.0%} or more (sidebar slider) that were still open on or after 1 Jan 2014, so the "
-            "Dec 2013 peak counts. Smaller dips inside a bigger drawdown are part of it. The open drawdown is measured "
-            "to the latest close, including today's unfinished Deribit bar. Ecoinometrics does not publish its rules, so "
-            "our dots will not sit exactly on theirs."
-        )
-        if px is not None:
-            closes = _btc_closes_since_2013()
-            dd = eco.drawdown_episodes(closes, dd_min)
-            show(eco_charts.figure_drawdowns(dd, eco.drawdown_trend(dd), dd_min))
-            if len(dd):
-                t = dd.copy()
-                for col in ("peak_date", "trough_date", "recovered"):
-                    t[col] = pd.to_datetime(t[col]).dt.strftime("%d %b %Y").fillna("ongoing")
-                t["depth"] = (t["depth"] * 100).round(1)
-                st.dataframe(
-                    t.rename(columns={"peak_date": "Peak", "peak": "Peak close", "trough_date": "Low",
-                                      "trough": "Low close", "recovered": "Recovered", "days": "Days",
-                                      "depth": "Max drawdown %", "ongoing": "Ongoing"}),
-                    width="stretch", hide_index=True,
-                )
-        else:
-            st.error("No Deribit BTC-PERP daily history.")
-    except Exception as ex:
-        st.error(f"The drawdown chart could not be drawn: {type(ex).__name__}: {ex}")
+    # ------------------------------------------------------- ETF flow regime
 
-# --------------------------------------------------- Strategy funding
-with tabs[11]:
-    _tab(11)
-    try:
-        st.caption(
-            "Where Strategy (MSTR) raised money and what it spent it on in the week covered by its latest Monday 8-K. "
-            "Inspired by the 11 Nov 2026 Ecoinometrics chart in \"Bitcoin's Corporate Buyers Are Pulling Back\". "
-            "Parsed live from SEC EDGAR (CIK 0001050446); if EDGAR is unreachable or the format changes, the page falls "
-            "back to the last good parse in data/strategy_funding.csv and says so in Refresh data."
-        )
-        try:
-            sf = _load_strategy()
-            funding = strategy_8k.from_frame(sf)
-        except Exception as ex:
-            st.error(f"Could not read Strategy's weekly 8-K: {str(ex).rstrip('.')}. Try Refresh data → Strategy 8-K.")
-            funding = None
-        if funding is not None:
-            c = st.columns(4)
-            c[0].metric("Raised (net, US$)", f"{funding.total_raised:,.1f}M")
-            c[1].metric("BTC bought", f"{funding.btc_bought:,.0f}" if funding.btc_bought is not None else "—")
-            c[2].metric("BTC held", f"{funding.btc_holdings:,.0f}" if funding.btc_holdings is not None else "—")
-            c[3].metric("USD Cash / USD Reserve",
-                        (f"{funding.usd_cash_m:,.0f}M / {funding.usd_reserve_b:,.2f}B"
-                         if funding.usd_cash_m is not None and funding.usd_reserve_b is not None else "—"))
-            show(eco_charts.figure_strategy_funding(funding))
-            st.caption(f"Filing: [{funding.accession}]({funding.url}), filed {funding.filed} (US Eastern date).")
-    except Exception as ex:
-        st.error(f"The Strategy funding chart could not be drawn: {type(ex).__name__}: {ex}")
 
-# ------------------------------------------- Treasury curve now vs a year ago
-with tabs[12]:
-    _tab(12)
-    try:
+def _chart_etf_regime():
+        _tab(7)
         st.caption(
-            "US Treasury constant-maturity yields, 3-month to 30-year, on the latest date with a full curve "
-            "against the last full curve on or before the same date a year earlier. Inspired by the 20 Nov 2026 "
-            "Ecoinometrics chart \"One Year In The Bear Market, Rates Are The Big Difference\". "
-            "Source: FRED (DGS3MO to DGS30). If FRED does not answer, the US Treasury par yield curve CSV from "
-            "home.treasury.gov is used (the same yields, published a little earlier), then the committed "
-            "data/yield_curve.csv. The average change is the plain mean of the ten tenor changes."
-        )
-        try:
-            ycr = _yield_cached()
-        except Exception as ex:
-            ycr = None
-            st.error(f"Treasury yields unavailable: {ex}")
-        if ycr is not None and not ycr.ok:
-            st.error(ycr.message)
-        elif ycr is not None:
-            _remember_shown("yield_curve", ycr)
-            cc = eco_more.curve_compare(ycr.df)
-            if cc is None:
-                st.warning("No full curve a year before the latest date in this data, so nothing is compared.")
-            else:
-                c = st.columns(3)
-                c[0].metric("Average change (pp)", f"{cc.avg_change:+.2f}")
-                c[1].metric("10-year now", f"{cc.table.set_index('tenor').loc['10Y', 'now']:.2f}%",
-                            f"{cc.table.set_index('tenor').loc['10Y', 'change']:+.2f} pp")
-                c[2].metric("2-year now", f"{cc.table.set_index('tenor').loc['2Y', 'now']:.2f}%",
-                            f"{cc.table.set_index('tenor').loc['2Y', 'change']:+.2f} pp")
-                src = ycr.origin or ""
-                src_label = ("FRED (DGS3MO-DGS30)" if "fred" in src.lower()
-                             else "US Treasury par yield curve" if "treasury" in src.lower()
-                             else f"{src} (committed copy)")
-                st.caption(f"Data: {ycr.message} Curves dated {cc.now_date:%d %b %Y} and {cc.ago_date:%d %b %Y} "
-                           "(US dates).")
-                show(eco_more_charts.figure_yield_curve(cc, src_label))
-    except Exception as ex:
-        st.error(f"The yield-curve chart could not be drawn: {type(ex).__name__}: {ex}")
-
-# ------------------------------------------------- daily ETF flow dots
-with tabs[13]:
-    _tab(13)
-    try:
-        st.caption(
-            "Every session's net flow into US spot Bitcoin ETFs, in BTC, inside the sidebar window; the current "
-            "month is circled and totalled. Inspired by the 20 Nov 2026 Ecoinometrics chart \"Only Two Days Of "
-            "Inflows For The Bitcoin ETFs In November\". Caveat: ours converts each day's Farside US$ total to BTC "
-            "at that UTC day's Deribit close. Ecoinometrics uses the change in BTC held by the ETFs, so the dots "
-            "are close to theirs but not the same."
+            "Daily US spot BTC ETF net flow in BTC, coloured by MCM's trailing-flow regime. "
+            "Inspired by the 6 Nov 2026 Ecoinometrics chart "
+            "\"Bitcoin ETFs Regime Has Switched To Strong Outflows\". "
+            "The regime is our approximation, not their unpublished model. "
+            f"As of {_now_sgt:%d %b %Y %H:%M} SGT."
         )
         flows = _safe(_load_etf)
         if flows is None or px is None:
-            st.error("Needs the Farside flow table and Deribit BTC-PERP daily closes.")
+            st.error("The flow regime needs the Farside total and Deribit BTC-PERP daily closes.")
         else:
-            fb_all = eco.flows_to_btc(flows, px)
-            dots, mstats = eco_more.flow_dots(fb_all[fb_all["date"] >= cutoff].reset_index(drop=True))
-            if mstats:
-                c = st.columns(3)
-                c[0].metric(f"{mstats['month']:%B} to date", f"{mstats['total']:+,.0f} BTC")
-                c[1].metric("Inflow / outflow days", f"{mstats['inflow_days']} / {mstats['outflow_days']}")
-                c[2].metric("Latest session", f"{mstats['last_date']:%d %b %Y}")
-            show(eco_more_charts.figure_flow_dots(dots, mstats))
-    except Exception as ex:
-        st.error(f"The daily ETF flow chart could not be drawn: {type(ex).__name__}: {ex}")
+            btc_flow = eco.flows_to_btc(flows, px)
+            if btc_flow.empty:
+                st.warning(
+                    "No Farside session shared a UTC date with a positive Deribit close, "
+                    "so no bar was converted. Missing prices were not filled with zero or with an earlier close."
+                )
+            else:
+                regime_full = eco.etf_flow_regime(btc_flow)
+                regime_view = eco.display_from(regime_full, cutoff)
+                if regime_view.empty:
+                    st.info("No aligned sessions inside this display window.")
+                else:
+                    last = regime_view.iloc[-1]
+                    label = eco_charts.REGIME_LABELS.get(str(last["regime"]), str(last["regime"]))
+                    c = st.columns(3)
+                    c[0].metric("Latest daily flow", f"{last['flow']:,.0f} BTC")
+                    c[1].metric("MCM regime", label)
+                    sum_txt = "warmup" if pd.isna(last["sum_window"]) else f"{last['sum_window']:,.0f} BTC"
+                    c[2].metric(f"{eco.FLOW_REGIME_WINDOW}-session sum", sum_txt)
+                    if pd.notna(last["scale_median"]):
+                        st.caption(
+                            f"Session {pd.Timestamp(last['date']):%d %b %Y}. "
+                            f"Scale median {last['scale_median']:,.0f} BTC. "
+                            f"Mild cutoff ±{last['mild_cutoff']:,.0f} BTC. "
+                            f"Strong cutoff ±{last['strong_cutoff']:,.0f} BTC. "
+                            f"{len(regime_full)} aligned sessions in the full tape; "
+                            f"the first {eco.FLOW_REGIME_SCALE - 1} stay unclassified."
+                        )
+                    else:
+                        st.caption(
+                            f"Session {pd.Timestamp(last['date']):%d %b %Y} is unclassified. "
+                            f"The scale median needs {eco.FLOW_REGIME_SCALE} aligned sessions; "
+                            f"the tape has {len(regime_full)}."
+                        )
+                    audit = regime_view.tail(12).copy()
+                    audit["date"] = pd.to_datetime(audit["date"]).dt.strftime("%d %b %Y")
+                    audit["regime"] = audit["regime"].map(lambda r: eco_charts.REGIME_LABELS.get(str(r), str(r)))
+                    show_cols = ["date", "flow", "sum_window", "scale_median", "mild_cutoff", "strong_cutoff", "regime"]
+                    st.dataframe(
+                        audit[show_cols].rename(columns={
+                            "date": "Session",
+                            "flow": "Daily flow (BTC)",
+                            "sum_window": f"{eco.FLOW_REGIME_WINDOW}-session sum (BTC)",
+                            "scale_median": f"{eco.FLOW_REGIME_SCALE}-session median |flow| (BTC)",
+                            "mild_cutoff": "Mild cutoff (BTC)",
+                            "strong_cutoff": "Strong cutoff (BTC)",
+                            "regime": "Regime",
+                        }),
+                        width="stretch", hide_index=True,
+                    )
+                show(eco_charts.figure_etf_flow_regime(regime_view))
+        with st.expander("How the flow regime is calculated"):
+            st.markdown(eco.flow_regime_methodology())
 
-# ------------------------------------------------- YTD returns
-with tabs[14]:
-    _tab(14)
-    try:
-        st.caption(
-            "Year-to-date price returns from the last close of the previous year. Inspired by the 18 Nov 2026 "
-            "Ecoinometrics chart \"Bitcoin Isn't Alone In A Downtrend\". These are price returns, not total "
-            "returns (no dividends). Bitcoin: Deribit BTC-PERP daily close (UTC bar; the latest bar is still open until 16:00 SGT). Gold: the GLD share price "
-            "from the SPDR Gold Shares historical archive, which also carries GLD's 0.40% yearly fee. "
-            "Nasdaq-100: FRED NASDAQ100 (price index). Each line ends on its own latest print."
-        )
-        series = {}
-        if px is not None:
-            series["Bitcoin"] = eco.daily_closes(px)
-        gld = None
+
+
+
+    # --------------------------------------------------- 30-session ETF flow line
+
+
+def _chart_etf_30d():
+        _tab(8)
         try:
-            gld = _load_gld()
+            st.caption(
+                "Rolling 30-session net flow into US spot BTC ETFs, in BTC, with the line coloured by the BTC price. "
+                "Inspired by the 13 Nov 2026 Ecoinometrics chart in \"Bitcoin's Recovery Has Failed\". "
+                "Ours converts each day's Farside US$ flow at that day's Deribit close; theirs is the change in BTC "
+                "held by the ETFs, so the levels will not match exactly."
+            )
+            flows = _safe(_load_etf)
+            if flows is None or px is None:
+                st.error("Needs the Farside flow table and Deribit BTC-PERP daily closes.")
+            else:
+                rf = eco.rolling_flow_with_price(eco.flows_to_btc(flows, px), px, 30)
+                view = eco.display_from(rf, cutoff)
+                valid = view.dropna(subset=["roll"])
+                if len(valid):
+                    last = valid.iloc[-1]
+                    c = st.columns(3)
+                    c[0].metric("30-session net flow", f"{last['roll']:,.0f} BTC")
+                    c[1].metric("Window low", f"{valid['roll'].min():,.0f} BTC")
+                    c[2].metric("Window high", f"{valid['roll'].max():,.0f} BTC")
+                show(eco_charts.figure_rolling_flow_price(view, 30))
         except Exception as ex:
-            st.warning(f"Gold left out: {ex}")
-        if gld is not None:
-            series["Gold (GLD)"] = gld.dropna(subset=["close"]).set_index("date")["close"]
-        ndx = _safe(_load_fred, "NASDAQ100")
-        if ndx is not None:
-            series["Nasdaq-100"] = ndx.set_index("date")["value"]
-        ytd_year = int(as_of_date.year)
-        ytd, ytd_info = eco_more.ytd_returns(series, ytd_year)
-        if ytd_info:
-            c = st.columns(len(ytd_info))
-            for i, (name, v) in enumerate(ytd_info.items()):
-                c[i].metric(name, f"{v['ret']:+.1f}%", help=f"{v['base_date']:%d %b %Y} close {v['base']:,.2f} → "
-                                                              f"{v['last_date']:%d %b %Y} close {v['last']:,.2f}")
-        show(eco_more_charts.figure_ytd_returns(ytd, ytd_info, ytd_year))
-    except Exception as ex:
-        st.error(f"The YTD returns chart could not be drawn: {type(ex).__name__}: {ex}")
+            st.error(f"The 30-day ETF flow chart could not be drawn: {type(ex).__name__}: {ex}")
 
-# ------------------------------------------------- BTC vs gold ETF flows
-with tabs[15]:
-    _tab(15)
-    try:
-        st.caption(
-            "Cumulative net flows in US$ since the spot Bitcoin ETF approval on 10 Jan 2024 (first session "
-            "11 Jan). Inspired by the 20 Nov 2026 Ecoinometrics chart \"Bitcoin And Gold On The Decline\". "
-            "Bitcoin: the Farside daily total for all US spot BTC ETFs. Gold: an estimate for GLD only, the daily "
-            "change in GLD shares outstanding (total NAV ÷ NAV per share, from the SPDR Gold Shares archive) times "
-            "that day's NAV per share. Caveat: IAU and every other gold ETF are left out, because iShares does not "
-            "serve a free daily shares-outstanding history we can reach, so this gold line is well below the "
-            "all-gold-ETF total Ecoinometrics shows."
-        )
-        flows = _safe(_load_etf)
-        gld_flow, gold_note = None, None
+    # ------------------------------------------------------ Nasdaq down days
+
+
+def _chart_nasdaq_down():
+        _tab(9)
         try:
-            gld_flow = eco_more.gld_flows_usd(_load_gld())
+            st.caption(
+                "Bitcoin's same-day return on every Nasdaq-100 down day since 2014, grouped by how far the Nasdaq-100 fell. "
+                "Inspired by the 9 Nov 2026 Ecoinometrics chart in \"Bitcoin's Recovery Is at Risk as the Nasdaq Weakens\". "
+                "Matching rule: for Nasdaq trading date D (close-to-close, so Monday covers the weekend), the BTC return is "
+                "the UTC daily bar stamped D over the bar stamped D−1. Bitstamp bars (to Jul 2018) run 00:00-24:00 UTC and "
+                "Deribit BTC-PERP bars run 08:00 UTC to 08:00 UTC the next day, so the 13:30-20:00 UTC Nasdaq session falls "
+                "inside the BTC bar either way. Buckets include their lower bound (−4% sits in −4% to −2%). "
+                "This ignores the window lookback; it always uses 2014 onward."
+            )
+            ndx = _safe(_load_fred, "NASDAQ100")
+            if ndx is not None and px is not None:
+                closes = _btc_closes_since_2013()
+                dd_days = eco.btc_on_nasdaq_down_days(ndx, closes, "2014-01-01")
+                stats = eco.bucket_stats(dd_days)
+                show(eco_charts.figure_nasdaq_down_days(dd_days, stats))
+                if not stats.empty:
+                    t = stats.copy()
+                    t["share_down"] = (t["share_down"] * 100).round(0)
+                    st.dataframe(
+                        t.rename(columns={"bucket": "Nasdaq-100 day", "n": "Days", "median": "Median BTC %",
+                                          "mean": "Mean BTC %", "share_down": "% of days BTC fell"})
+                         .style.format({"Median BTC %": "{:+.2f}", "Mean BTC %": "{:+.2f}", "% of days BTC fell": "{:.0f}"}),
+                        width="stretch", hide_index=True,
+                    )
         except Exception as ex:
-            gold_note = "Gold side missing this session: SPDR archive unavailable."
-            st.warning(f"Gold side left out: {ex}")
-        cum = eco_more.cumulative_flows(flows, gld_flow)
-        if len(cum):
-            lasts = cum.groupby("series").tail(1).set_index("series")
-            c = st.columns(2)
-            if "btc" in lasts.index:
-                c[0].metric("Spot BTC ETFs, cumulative", f"${lasts.loc['btc', 'cum_bn']:,.1f}B",
-                            help=f"Through {lasts.loc['btc', 'date']:%d %b %Y}")
-            if "gold" in lasts.index:
-                c[1].metric("GLD, cumulative (estimate)", f"${lasts.loc['gold', 'cum_bn']:,.1f}B",
-                            help=f"Through {lasts.loc['gold', 'date']:%d %b %Y}")
-        show(eco_more_charts.figure_btc_gold_flows(cum, gold_note))
-    except Exception as ex:
-        st.error(f"The BTC vs gold flow chart could not be drawn: {type(ex).__name__}: {ex}")
+            st.error(f"The Nasdaq down-day chart could not be drawn: {type(ex).__name__}: {ex}")
 
-# ------------------------------------------------- ETF flow scenarios
-with tabs[16]:
+    # --------------------------------------------------------- Drawdowns
+
+
+def _chart_drawdowns():
+        _tab(10)
+        try:
+            st.caption(
+                "Every Bitcoin drawdown since 2014, duration against depth. Inspired by the 13 Nov 2026 Ecoinometrics chart. "
+                "Rules: daily closes (Bitstamp to Jul 2018, Deribit BTC-PERP after). A drawdown starts at an all-time-high "
+                "close and ends on the first close back at or above that peak; depth is the lowest close in between. "
+                f"Only drawdowns of {dd_min:.0%} or more (sidebar slider) that were still open on or after 1 Jan 2014, so the "
+                "Dec 2013 peak counts. Smaller dips inside a bigger drawdown are part of it. The open drawdown is measured "
+                "to the latest close, including today's unfinished Deribit bar. Ecoinometrics does not publish its rules, so "
+                "our dots will not sit exactly on theirs."
+            )
+            if px is not None:
+                closes = _btc_closes_since_2013()
+                dd = eco.drawdown_episodes(closes, dd_min)
+                show(eco_charts.figure_drawdowns(dd, eco.drawdown_trend(dd), dd_min))
+                if len(dd):
+                    t = dd.copy()
+                    for col in ("peak_date", "trough_date", "recovered"):
+                        t[col] = pd.to_datetime(t[col]).dt.strftime("%d %b %Y").fillna("ongoing")
+                    t["depth"] = (t["depth"] * 100).round(1)
+                    st.dataframe(
+                        t.rename(columns={"peak_date": "Peak", "peak": "Peak close", "trough_date": "Low",
+                                          "trough": "Low close", "recovered": "Recovered", "days": "Days",
+                                          "depth": "Max drawdown %", "ongoing": "Ongoing"}),
+                        width="stretch", hide_index=True,
+                    )
+            else:
+                st.error("No Deribit BTC-PERP daily history.")
+        except Exception as ex:
+            st.error(f"The drawdown chart could not be drawn: {type(ex).__name__}: {ex}")
+
+    # --------------------------------------------------- Strategy funding
+
+
+def _chart_strategy():
+        _tab(11)
+        try:
+            st.caption(
+                "Where Strategy (MSTR) raised money and what it spent it on in the week covered by its latest Monday 8-K. "
+                "Inspired by the 11 Nov 2026 Ecoinometrics chart in \"Bitcoin's Corporate Buyers Are Pulling Back\". "
+                "Parsed live from SEC EDGAR (CIK 0001050446); if EDGAR is unreachable or the format changes, the page falls "
+                "back to the last good parse in data/strategy_funding.csv and says so in Refresh data."
+            )
+            try:
+                sf = _load_strategy()
+                funding = strategy_8k.from_frame(sf)
+            except Exception as ex:
+                st.error(f"Could not read Strategy's weekly 8-K: {str(ex).rstrip('.')}. Try Refresh data → Strategy 8-K.")
+                funding = None
+            if funding is not None:
+                c = st.columns(4)
+                c[0].metric("Raised (net, US$)", f"{funding.total_raised:,.1f}M")
+                c[1].metric("BTC bought", f"{funding.btc_bought:,.0f}" if funding.btc_bought is not None else "—")
+                c[2].metric("BTC held", f"{funding.btc_holdings:,.0f}" if funding.btc_holdings is not None else "—")
+                c[3].metric("USD Cash / USD Reserve",
+                            (f"{funding.usd_cash_m:,.0f}M / {funding.usd_reserve_b:,.2f}B"
+                             if funding.usd_cash_m is not None and funding.usd_reserve_b is not None else "—"))
+                show(eco_charts.figure_strategy_funding(funding))
+                st.caption(f"Filing: [{funding.accession}]({funding.url}), filed {funding.filed} (US Eastern date).")
+        except Exception as ex:
+            st.error(f"The Strategy funding chart could not be drawn: {type(ex).__name__}: {ex}")
+
+    # ------------------------------------------- Treasury curve now vs a year ago
+
+
+def _chart_yield_curve():
+        _tab(12)
+        try:
+            st.caption(
+                "US Treasury constant-maturity yields, 3-month to 30-year, on the latest date with a full curve "
+                "against the last full curve on or before the same date a year earlier. Inspired by the 20 Nov 2026 "
+                "Ecoinometrics chart \"One Year In The Bear Market, Rates Are The Big Difference\". "
+                "Source: FRED (DGS3MO to DGS30). If FRED does not answer, the US Treasury par yield curve CSV from "
+                "home.treasury.gov is used (the same yields, published a little earlier), then the committed "
+                "data/yield_curve.csv. The average change is the plain mean of the ten tenor changes."
+            )
+            try:
+                ycr = _yield_cached()
+            except Exception as ex:
+                ycr = None
+                st.error(f"Treasury yields unavailable: {ex}")
+            if ycr is not None and not ycr.ok:
+                st.error(ycr.message)
+            elif ycr is not None:
+                _remember_shown("yield_curve", ycr)
+                cc = eco_more.curve_compare(ycr.df)
+                if cc is None:
+                    st.warning("No full curve a year before the latest date in this data, so nothing is compared.")
+                else:
+                    c = st.columns(3)
+                    c[0].metric("Average change (pp)", f"{cc.avg_change:+.2f}")
+                    c[1].metric("10-year now", f"{cc.table.set_index('tenor').loc['10Y', 'now']:.2f}%",
+                                f"{cc.table.set_index('tenor').loc['10Y', 'change']:+.2f} pp")
+                    c[2].metric("2-year now", f"{cc.table.set_index('tenor').loc['2Y', 'now']:.2f}%",
+                                f"{cc.table.set_index('tenor').loc['2Y', 'change']:+.2f} pp")
+                    src = ycr.origin or ""
+                    src_label = ("FRED (DGS3MO-DGS30)" if "fred" in src.lower()
+                                 else "US Treasury par yield curve" if "treasury" in src.lower()
+                                 else f"{src} (committed copy)")
+                    st.caption(f"Data: {ycr.message} Curves dated {cc.now_date:%d %b %Y} and {cc.ago_date:%d %b %Y} "
+                               "(US dates).")
+                    show(eco_more_charts.figure_yield_curve(cc, src_label))
+        except Exception as ex:
+            st.error(f"The yield-curve chart could not be drawn: {type(ex).__name__}: {ex}")
+
+    # ------------------------------------------------- daily ETF flow dots
+
+
+def _chart_etf_dots():
+        _tab(13)
+        try:
+            st.caption(
+                "Every session's net flow into US spot Bitcoin ETFs, in BTC, inside the sidebar window; the current "
+                "month is circled and totalled. Inspired by the 20 Nov 2026 Ecoinometrics chart \"Only Two Days Of "
+                "Inflows For The Bitcoin ETFs In November\". Caveat: ours converts each day's Farside US$ total to BTC "
+                "at that UTC day's Deribit close. Ecoinometrics uses the change in BTC held by the ETFs, so the dots "
+                "are close to theirs but not the same."
+            )
+            flows = _safe(_load_etf)
+            if flows is None or px is None:
+                st.error("Needs the Farside flow table and Deribit BTC-PERP daily closes.")
+            else:
+                fb_all = eco.flows_to_btc(flows, px)
+                dots, mstats = eco_more.flow_dots(fb_all[fb_all["date"] >= cutoff].reset_index(drop=True))
+                if mstats:
+                    c = st.columns(3)
+                    c[0].metric(f"{mstats['month']:%B} to date", f"{mstats['total']:+,.0f} BTC")
+                    c[1].metric("Inflow / outflow days", f"{mstats['inflow_days']} / {mstats['outflow_days']}")
+                    c[2].metric("Latest session", f"{mstats['last_date']:%d %b %Y}")
+                show(eco_more_charts.figure_flow_dots(dots, mstats))
+        except Exception as ex:
+            st.error(f"The daily ETF flow chart could not be drawn: {type(ex).__name__}: {ex}")
+
+    # ------------------------------------------------- YTD returns
+
+
+def _chart_ytd_returns():
+        _tab(14)
+        try:
+            st.caption(
+                "Year-to-date price returns from the last close of the previous year. Inspired by the 18 Nov 2026 "
+                "Ecoinometrics chart \"Bitcoin Isn't Alone In A Downtrend\". These are price returns, not total "
+                "returns (no dividends). Bitcoin: Deribit BTC-PERP daily close (UTC bar; the latest bar is still open until 16:00 SGT). Gold: the GLD share price "
+                "from the SPDR Gold Shares historical archive, which also carries GLD's 0.40% yearly fee. "
+                "Nasdaq-100: FRED NASDAQ100 (price index). Each line ends on its own latest print."
+            )
+            series = {}
+            if px is not None:
+                series["Bitcoin"] = eco.daily_closes(px)
+            gld = None
+            try:
+                gld = _load_gld()
+            except Exception as ex:
+                st.warning(f"Gold left out: {ex}")
+            if gld is not None:
+                series["Gold (GLD)"] = gld.dropna(subset=["close"]).set_index("date")["close"]
+            ndx = _safe(_load_fred, "NASDAQ100")
+            if ndx is not None:
+                series["Nasdaq-100"] = ndx.set_index("date")["value"]
+            ytd_year = int(as_of_date.year)
+            ytd, ytd_info = eco_more.ytd_returns(series, ytd_year)
+            if ytd_info:
+                c = st.columns(len(ytd_info))
+                for i, (name, v) in enumerate(ytd_info.items()):
+                    c[i].metric(name, f"{v['ret']:+.1f}%", help=f"{v['base_date']:%d %b %Y} close {v['base']:,.2f} → "
+                                                                  f"{v['last_date']:%d %b %Y} close {v['last']:,.2f}")
+            show(eco_more_charts.figure_ytd_returns(ytd, ytd_info, ytd_year))
+        except Exception as ex:
+            st.error(f"The YTD returns chart could not be drawn: {type(ex).__name__}: {ex}")
+
+    # ------------------------------------------------- BTC vs gold ETF flows
+
+
+def _chart_btc_gold_flows():
+        _tab(15)
+        try:
+            st.caption(
+                "Cumulative net flows in US$ since the spot Bitcoin ETF approval on 10 Jan 2024 (first session "
+                "11 Jan). Inspired by the 20 Nov 2026 Ecoinometrics chart \"Bitcoin And Gold On The Decline\". "
+                "Bitcoin: the Farside daily total for all US spot BTC ETFs. Gold: an estimate for GLD only, the daily "
+                "change in GLD shares outstanding (total NAV ÷ NAV per share, from the SPDR Gold Shares archive) times "
+                "that day's NAV per share. Caveat: IAU and every other gold ETF are left out, because iShares does not "
+                "serve a free daily shares-outstanding history we can reach, so this gold line is well below the "
+                "all-gold-ETF total Ecoinometrics shows."
+            )
+            flows = _safe(_load_etf)
+            gld_flow, gold_note = None, None
+            try:
+                gld_flow = eco_more.gld_flows_usd(_load_gld())
+            except Exception as ex:
+                gold_note = "Gold side missing this session: SPDR archive unavailable."
+                st.warning(f"Gold side left out: {ex}")
+            cum = eco_more.cumulative_flows(flows, gld_flow)
+            if len(cum):
+                lasts = cum.groupby("series").tail(1).set_index("series")
+                c = st.columns(2)
+                if "btc" in lasts.index:
+                    c[0].metric("Spot BTC ETFs, cumulative", f"${lasts.loc['btc', 'cum_bn']:,.1f}B",
+                                help=f"Through {lasts.loc['btc', 'date']:%d %b %Y}")
+                if "gold" in lasts.index:
+                    c[1].metric("GLD, cumulative (estimate)", f"${lasts.loc['gold', 'cum_bn']:,.1f}B",
+                                help=f"Through {lasts.loc['gold', 'date']:%d %b %Y}")
+            show(eco_more_charts.figure_btc_gold_flows(cum, gold_note))
+        except Exception as ex:
+            st.error(f"The BTC vs gold flow chart could not be drawn: {type(ex).__name__}: {ex}")
+
+    # ------------------------------------------------- ETF flow scenarios
+
+
+def _chart_etf_scenarios():
     _tab(16)
     try:
         st.caption(
@@ -1160,6 +1205,45 @@ with tabs[16]:
             show(eco_more_charts.figure_flow_scenarios(sc, cutoff))
     except Exception as ex:
         st.error(f"The ETF flow scenario chart could not be drawn: {type(ex).__name__}: {ex}")
+
+
+_CHARTS = {
+    "etf_streaks": (_chart_etf_streaks, "ETF flow streaks"),
+    "hacks": (_chart_hacks, "Exchange hacks"),
+    "fed_tone": (_chart_fed_tone, "Fed tone"),
+    "btc_200dma": (_chart_btc_200dma, "BTC vs 200DMA"),
+    "nasdaq_corr": (_chart_nasdaq_corr, "BTC–Nasdaq correlation"),
+    "inflation": (_chart_inflation, "Inflation & yields"),
+    "ratio_200dma": (_chart_ratio_200dma, "BTC / 200DMA ratio"),
+    "etf_regime": (_chart_etf_regime, "ETF flow regime"),
+    "etf_30d": (_chart_etf_30d, "30-day ETF flow"),
+    "nasdaq_down": (_chart_nasdaq_down, "Nasdaq down days"),
+    "drawdowns": (_chart_drawdowns, "Drawdowns"),
+    "strategy": (_chart_strategy, "Strategy funding"),
+    "yield_curve": (_chart_yield_curve, "Yield curve"),
+    "etf_dots": (_chart_etf_dots, "Daily ETF flows"),
+    "ytd_returns": (_chart_ytd_returns, "YTD returns"),
+    "btc_gold_flows": (_chart_btc_gold_flows, "BTC vs gold ETF flows"),
+    "etf_scenarios": (_chart_etf_scenarios, "ETF flow scenarios"),
+}
+
+
+# ------------------------------------------------------------------ page body
+px = _load_btc()
+
+_contents = []
+for _sec, _keys in ECO_SECTIONS:
+    _bits = " · ".join(f"[{_CHARTS[k][1]}](#{eco.anchor(_sec, _CHARTS[k][1])})" for k in _keys)
+    _contents.append(f"**[{_sec}](#{eco.anchor(_sec)})** — {_bits}")
+st.markdown("#### Contents\n" + "\n\n".join(_contents))
+
+for _sec, _keys in ECO_SECTIONS:
+    st.divider()
+    st.header(_sec, anchor=eco.anchor(_sec))
+    for _k in _keys:
+        _fn, _title = _CHARTS[_k]
+        st.subheader(_title, anchor=eco.anchor(_sec, _title))
+        _fn()
 
 st.divider()
 st.caption(
