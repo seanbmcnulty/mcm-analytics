@@ -137,3 +137,14 @@ def test_builders_draw_from_committed_csv():
     for c in tenx.REGISTRY:
         fig, st = tenx_charts.BUILDERS[c.key](pr)
         assert len(fig.data) >= 2 and st
+
+
+def test_registry_keyed_by_post():
+    by = tenx.charts_by_post()
+    assert "2026-11-27 | Bitcoin and Gold: The Thanksgiving Charts" in by
+    assert tenx.has_post("2026-11-27", "Bitcoin  and Gold: The Thanksgiving Charts")
+    assert not tenx.has_post("2026-11-26", "Bitcoin and Gold: The Thanksgiving Charts")
+    pairs = [(c.post_id, c.exhibit) for c in tenx.REGISTRY]
+    assert len(pairs) == len(set(pairs)), "same exhibit from the same post registered twice"
+    for pid, charts in by.items():
+        assert len({c.post_url for c in charts}) == 1
