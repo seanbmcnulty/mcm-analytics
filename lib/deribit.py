@@ -46,14 +46,25 @@ _tls = threading.local()
 # (Cloudflare in front of Deribit is more likely to challenge the bare default).
 USER_AGENT = "Mozilla/5.0 (compatible; mcm-analytics/1.0; +https://mcm-analytics.streamlit.app)"
 HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+# Full browser header set, tried when Cloudflare answers 403 to the plain one.
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.deribit.com/",
+    "Origin": "https://www.deribit.com",
+}
+_header_sets = [HEADERS, BROWSER_HEADERS]
+_header_idx = 0  # which set new sessions use; bumped by probe() on a 403
 
 
 def _session() -> requests.Session:
     s = getattr(_tls, "session", None)
-    if s is None:
+    if s is None or getattr(_tls, "header_idx", None) != _header_idx:
         s = requests.Session()
-        s.headers.update(HEADERS)
-        _tls.session = s
+        s.headers.update(_header_sets[_header_idx])
+        _tls.session, _tls.header_idx = s, _header_idx
     return s
 
 # (connect, read) seconds. A short connect timeout so a blocked / black-holed
@@ -138,6 +149,23 @@ def probe(index_name: str = "btc_usd", timeout: tuple = (4.0, 6.0)) -> tuple[boo
     Returns ``(ok, reason, index_price)``; ``reason`` is e.g. ``"200 in 180 ms"``,
     ``"HTTP 403 · Cloudflare access denied"`` or ``"ConnectTimeout"``.
     """
+    global _header_idx
+    ok, reason, px = _probe_once(index_name, timeout)
+    if not ok and reason.startswith("HTTP 403"):
+        # Cloudflare block on this header set: try the other one once and keep
+        # whichever works for the rest of the process.
+        prev = _header_idx
+        _header_idx = (prev + 1) % len(_header_sets)
+        ok2, reason2, px2 = _probe_once(index_name, timeout)
+        if ok2:
+            return True, f"{reason2} (browser headers; plain UA got {reason})" if _header_idx else reason2, px2
+        _header_idx = prev
+        reason = f"{reason}; alt headers: {reason2}"
+        _set_status(False, reason)
+    return ok, reason, px
+
+
+def _probe_once(index_name: str, timeout: tuple) -> tuple[bool, str, float | None]:
     global _breaker_until
     t0 = time.time()
     try:
