@@ -81,7 +81,8 @@ def figure_btc_rsi(df: pd.DataFrame, stats: dict, source: str) -> go.Figure:
              f"RSI at or below {st['lo']:g} crosses up through its MA (one per 20 days). Source: {source}.")
     style(fig, title, sub, notes)
     fig.update_yaxes(tickformat=",.0f", secondary_y=False, showgrid=False, tickfont=dict(color=INK))
-    fig.update_yaxes(range=[5, 95], secondary_y=True, showgrid=False, tickfont=dict(color=INK))
+    fig.update_yaxes(range=[5, 95], tickmode="linear", tick0=10, dtick=10, secondary_y=True,
+                     showgrid=False, tickfont=dict(color=INK))
     return fig
 
 
@@ -117,7 +118,8 @@ def figure_gold_channel(df: pd.DataFrame, stats: dict, source: str) -> go.Figure
              f"{st['rel_days']}-day return minus Bitcoin's, percentage points. Source: {source}.")
     style(fig, title, sub, notes)
     fig.update_yaxes(tickformat=",.0f", secondary_y=False, showgrid=False, tickfont=dict(color=INK))
-    fig.update_yaxes(ticksuffix="%", secondary_y=True, showgrid=False, tickfont=dict(color=INK))
+    fig.update_yaxes(ticksuffix="%", tickmode="auto", nticks=10, secondary_y=True, showgrid=False,
+                     tickfont=dict(color=INK))
     return fig
 
 
@@ -141,7 +143,8 @@ def figure_btc_coin(df: pd.DataFrame, stats: dict, source: str) -> go.Figure:
              f"Source: {source}.")
     style(fig, title, sub, notes)
     fig.update_yaxes(tickformat=",.0f", secondary_y=False, showgrid=False, tickfont=dict(color=INK))
-    fig.update_yaxes(tickformat=",.0f", secondary_y=True, showgrid=False, tickfont=dict(color=INK))
+    fig.update_yaxes(tickformat=",.0f", tickmode="auto", nticks=10, secondary_y=True, showgrid=False,
+                     tickfont=dict(color=INK))
     return fig
 
 
