@@ -215,10 +215,25 @@ def option_vols_by_dte(asset: str) -> dict[str, dict[int, float]]:
     """
     hit = _VOLS_CACHE.get(asset)
     if hit is not None and (time.time() - hit[0]) < _VOLS_TTL:
+        if len(hit) > 2 and hit[2] is not None:
+            _snap().mark(hit[2])
         return hit[1]
     out = _option_vols_by_dte_uncached(asset)
-    _VOLS_CACHE[asset] = (time.time(), out)
+    snap_ts = None
+    if not out.get("atm") and _snap().deribit_blocked():
+        # Live chain unavailable (Deribit blocked / down): serve the latest
+        # 15-min snapshot recorded by GitHub Actions, flagged as delayed.
+        snap, snap_ts = _snap().latest_expiry_vols(asset)
+        if snap:
+            out = snap
+            _snap().mark(snap_ts)
+    _VOLS_CACHE[asset] = (time.time(), out, snap_ts)
     return out
+
+
+def _snap():
+    from lib import snapfallback
+    return snapfallback
 
 
 def _option_vols_by_dte_uncached(asset: str) -> dict[str, dict[int, float]]:
@@ -351,6 +366,11 @@ def listed_expiries(asset: str) -> list[int]:
             _, by_dte = parse_chain(asset)
             dtes = {d for d in by_dte if d >= 0}
 
+    if not dtes and _snap().deribit_blocked():
+        snap, ts = _snap().latest_expiry_vols(asset)
+        if snap:
+            _snap().mark(ts)
+            dtes = set(snap["atm"])
     return sorted(dtes) if dtes else [7, 30, 90]
 
 
@@ -576,7 +596,7 @@ def dvol_now(asset: str) -> float | None:
     df = deribit.get_dvol(cfg["deribit_ccy"], resolution=60,
                           start_ms=end_ms - 6 * 3600 * 1000, end_ms=end_ms)
     if df is None or df.empty or "close" not in df:
-        return None
+        return _snap().market_value(asset, "dvol") if _snap().deribit_blocked() else None
     try:
         v = float(df["close"].dropna().iloc[-1])
     except (IndexError, ValueError, TypeError):
@@ -587,9 +607,17 @@ def dvol_now(asset: str) -> float | None:
 def perp_mark(asset: str) -> float | None:
     t = deribit.get_ticker(acfg(asset)["perp"])
     if not t:
-        return None
+        return _snap().market_value(asset, "perp_mark") if _snap().deribit_blocked() else None
     v = t.get("mark_price")
     return float(v) if finite(v) else None
+
+
+def spot_price(asset: str) -> float | None:
+    """Live index price; the latest snapshot's (flagged delayed) when Deribit is blocked."""
+    v = deribit.get_index_price(acfg(asset)["index"])
+    if v:
+        return v
+    return _snap().market_value(asset, "index") if _snap().deribit_blocked() else None
 
 
 def clear_cache():

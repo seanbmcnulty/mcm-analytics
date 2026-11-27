@@ -164,3 +164,11 @@ def test_probe_switches_to_browser_headers_on_403(monkeypatch):
     ok, reason, px = deribit.probe()
     assert ok and px == 61000.0 and seen == [0, 1]
     assert deribit._header_idx == 1 and "browser headers" in reason
+
+
+def teardown_function(_fn):
+    # Don't leak a "Deribit down" status into other test modules (it would
+    # switch surface lookups to the snapshot fallback).
+    deribit._set_status(True, "test reset")
+    deribit.reset_breaker()
+    deribit._header_idx = 0
