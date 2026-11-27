@@ -187,9 +187,11 @@ def build_defensive_rotation(ctx: Ctx):
 
 
 def build_cpi_2y(ctx: Ctx):
-    head, core = ds.yoy(ctx.fred.df["CPIAUCSL"]), ds.yoy(ctx.fred.df["CPILFESL"])
-    head, core = head[head.index >= "2021-01-01"], core[core.index >= "2021-01-01"]
     two = _yld(ctx, "2Y")
+    # The Treasury curve covers ~2 years; start CPI there too so both share the x-axis.
+    start = (two.index[0] - pd.offsets.MonthBegin(1)) if len(two) else pd.Timestamp("2021-01-01")
+    head, core = ds.yoy(ctx.fred.df["CPIAUCSL"]), ds.yoy(ctx.fred.df["CPILFESL"])
+    head, core = head[head.index >= start], core[core.index >= start]
     stats = {"cpi": head.iloc[-1], "core": core.iloc[-1], "cpi_date": head.index[-1],
              "two": two.iloc[-1] if len(two) else np.nan, "two_date": two.index[-1] if len(two) else None}
     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -203,8 +205,8 @@ def build_cpi_2y(ctx: Ctx):
     style(fig, "US inflation and the 2-year Treasury yield",
           f"CPI {stats['cpi']:.1f}% y/y, core {stats['core']:.1f}% in {stats['cpi_date']:%b %Y}{two_txt}.",
           _src(ctx, fred=["CPIAUCSL", "CPILFESL"], yields=True))
-    fig.update_yaxes(ticksuffix="%", secondary_y=False)
-    fig.update_yaxes(ticksuffix="%", showgrid=False, secondary_y=True)
+    fig.update_yaxes(ticksuffix="%", tickformat=".1f", secondary_y=False)
+    fig.update_yaxes(ticksuffix="%", tickformat=".1f", showgrid=False, secondary_y=True)
     fig.update_xaxes(tickformat="%b-%y")
     return fig, stats
 
@@ -297,7 +299,7 @@ def build_tech_treasuries(ctx: Ctx):
     style(fig, "Tech rout and the 10-year Treasury yield",
           f"Nasdaq 100 {stats['ndx_last']:,.0f}; 10-year yield {stats['ten_last']:.2f}%. Dotted line: "
           "22 Oct 2026, the session the issue covers.", _src(ctx, ["NDX"], yields=True))
-    fig.update_yaxes(ticksuffix="%", showgrid=False, secondary_y=True)
+    fig.update_yaxes(ticksuffix="%", tickformat=".2f", showgrid=False, secondary_y=True)
     fig.update_xaxes(tickformat="%d %b")
     fig.update_xaxes(rangebreaks=WEEKENDS)
     return fig, stats
