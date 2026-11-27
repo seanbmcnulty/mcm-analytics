@@ -17,6 +17,11 @@ Adding a chart from a new email
 3. Put a ``TenXChart`` at the TOP of ``REGISTRY`` (newest first) and map its
    ``key`` to the builder in ``lib.tenx_charts.BUILDERS``.
 
+The registry is keyed by post: ``post_id`` is "YYYY-MM-DD | post title" (date
+the email arrived, SGT). Before adding a chart, check ``has_post(date, title)``
+so a re-run of the daily 10x check never adds the same post twice;
+``charts_by_post()`` groups the registry per post, newest first.
+
 Data
 ----
 Daily closes come from Yahoo Finance's chart API (live, the same endpoint
@@ -60,6 +65,10 @@ class TenXChart:
     summary: str          # our own one-line description of the chart
     series: tuple = field(default_factory=tuple)  # columns of the prices frame it needs
 
+    @property
+    def post_id(self) -> str:
+        return post_id(self.post_date, self.post_title)
+
 
 REGISTRY: tuple[TenXChart, ...] = (
     TenXChart(
@@ -99,8 +108,25 @@ REGISTRY: tuple[TenXChart, ...] = (
 )
 
 
+def post_id(post_date: str, post_title: str) -> str:
+    """Registry key for one 10x post: "YYYY-MM-DD | title" (whitespace-normalised)."""
+    return f"{pd.Timestamp(post_date):%Y-%m-%d} | {' '.join(str(post_title).split())}"
+
+
 def registry_keys() -> list[str]:
     return [c.key for c in REGISTRY]
+
+
+def charts_by_post() -> dict[str, list[TenXChart]]:
+    """post_id -> its charts, posts newest first (registry order kept within a post)."""
+    out: dict[str, list[TenXChart]] = {}
+    for c in sorted(REGISTRY, key=lambda c: c.post_date, reverse=True):
+        out.setdefault(c.post_id, []).append(c)
+    return out
+
+
+def has_post(post_date: str, post_title: str) -> bool:
+    return post_id(post_date, post_title) in charts_by_post()
 
 
 # ---------------------------------------------------------------------- data
