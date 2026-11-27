@@ -78,3 +78,60 @@ def test_funding_plot_makes_one_history_call(monkeypatch):
     fig, df, text = cmd_market.cmd_plot_funding_rates("BTC")
     assert fig is not None and text is None
     assert len(calls) == 1
+
+
+class _ErrResp:
+    def __init__(self, code, text="", headers=None, body=None):
+        self.status_code, self.text, self.headers, self._body = code, text, headers or {}, body
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("not json")
+        return self._body
+
+
+def test_describe_response_names_cloudflare_block_and_jsonrpc_error():
+    r = _ErrResp(403, "<html><title>Access denied | deribit.com used Cloudflare</title>Error 1020</html>",
+                 {"server": "cloudflare"})
+    assert deribit._describe_response(r) == "HTTP 403 · Cloudflare access denied"
+    r = _ErrResp(400, body={"error": {"message": "Method not found", "code": -32601}})
+    assert deribit._describe_response(r) == "HTTP 400 · Method not found (code -32601)"
+
+
+def test_session_sends_descriptive_user_agent():
+    s = deribit._session()
+    assert "mcm-analytics" in s.headers["User-Agent"]
+
+
+def test_breaker_fails_fast_after_network_errors(monkeypatch):
+    import requests
+    calls = {"n": 0}
+
+    class _Dead:
+        def get(self, url, params=None, timeout=None):
+            calls["n"] += 1
+            raise requests.ConnectTimeout("timed out")
+
+    monkeypatch.setattr(deribit, "_session", lambda: _Dead())
+    monkeypatch.setattr(deribit, "RETRY_BACKOFF_S", (0.0, 0.0, 0.0))
+    deribit.clear_cache()
+    assert deribit._request("get_index_price", {"index_name": "zz_a"}, ttl=30) is None
+    assert calls["n"] == 3
+    st = deribit.last_status()
+    assert st["ok"] is False and st["breaker_open"] and "ConnectTimeout" in st["reason"]
+    t0 = time.time()
+    assert deribit._request("get_index_price", {"index_name": "zz_b"}, ttl=30) is None
+    assert calls["n"] == 3 and time.time() - t0 < 0.5  # no new network call
+    deribit.clear_cache()  # refresh closes the breaker
+    assert not deribit.last_status()["breaker_open"]
+
+
+def test_probe_reports_http_status(monkeypatch):
+    class _Blocked:
+        def get(self, url, params=None, timeout=None):
+            return _ErrResp(403, "<title>Attention Required! | Cloudflare</title>", {"server": "cloudflare"})
+
+    monkeypatch.setattr(deribit, "_session", lambda: _Blocked())
+    ok, reason, px = deribit.probe()
+    assert (ok, px) == (False, None)
+    assert reason == "HTTP 403 · Cloudflare bot check"

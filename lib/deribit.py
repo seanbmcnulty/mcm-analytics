@@ -42,17 +42,140 @@ _inflight_lock = threading.Lock()
 _tls = threading.local()
 
 
+# A descriptive User-Agent instead of requests' default "python-requests/x.y"
+# (Cloudflare in front of Deribit is more likely to challenge the bare default).
+USER_AGENT = "Mozilla/5.0 (compatible; mcm-analytics/1.0; +https://mcm-analytics.streamlit.app)"
+HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+
+
 def _session() -> requests.Session:
     s = getattr(_tls, "session", None)
     if s is None:
         s = requests.Session()
+        s.headers.update(HEADERS)
         _tls.session = s
     return s
 
-DEFAULT_TIMEOUT = 15  # seconds
-# Backoff between attempts (3 attempts total -> waits 2s, then 5s; a third
+# (connect, read) seconds. A short connect timeout so a blocked / black-holed
+# route fails in seconds instead of hanging the page; reads can take longer
+# (full option books are a few MB).
+DEFAULT_TIMEOUT = (4.0, 12.0)
+_TOTAL_TIMEOUT = sum(DEFAULT_TIMEOUT)
+# Backoff between attempts (3 attempts total -> waits 0.5s, then 1.5s; a third
 # entry is used if retries is raised above 3).
-RETRY_BACKOFF_S = (2.0, 5.0, 15.0)
+RETRY_BACKOFF_S = (0.5, 1.5, 4.0)
+
+# Circuit breaker: after a request fails on every attempt with a network-level
+# error (timeout / connection refused / reset) or a block (403/451/503), skip
+# the network for BREAKER_S so the next dozen calls on the page fail at once
+# instead of each waiting out its own timeouts. Any success closes it.
+BREAKER_S = 30.0
+_breaker_until = 0.0
+
+# Last outcome of a real network call, for the Home "System Status" box.
+_status_lock = threading.Lock()
+_last_status: dict = {"ok": None, "reason": "no request yet", "at": 0.0}
+
+
+def _describe_response(resp) -> str:
+    """Short, human reason for a non-200 / non-result Deribit response."""
+    code = getattr(resp, "status_code", None)
+    bits = [f"HTTP {code}"]
+    headers = getattr(resp, "headers", None) or {}
+    try:
+        if str(headers.get("cf-mitigated", "")).lower() == "challenge":
+            bits.append("Cloudflare challenge")
+        server = str(headers.get("server", ""))
+    except Exception:  # noqa: BLE001
+        server = ""
+    msg = ""
+    try:
+        data = resp.json()
+        err = data.get("error") if isinstance(data, dict) else None
+        if isinstance(err, dict):
+            msg = f"{err.get('message', '')} (code {err.get('code', '?')})".strip()
+    except Exception:  # noqa: BLE001
+        text = (getattr(resp, "text", "") or "")[:2000]
+        low = text.lower()
+        if "cloudflare" in low or "cloudflare" in server.lower():
+            if "access denied" in low or "error 1020" in low:
+                msg = "Cloudflare access denied"
+            elif "attention required" in low or "just a moment" in low:
+                msg = "Cloudflare bot check"
+            elif "error 1009" in low:
+                msg = "Cloudflare country block"
+            else:
+                msg = "Cloudflare"
+        elif "maintenance" in low:
+            msg = "maintenance page"
+    if msg:
+        bits.append(msg[:120])
+    return " · ".join(bits)
+
+
+def _set_status(ok: bool, reason: str, elapsed: float | None = None):
+    with _status_lock:
+        _last_status.update(ok=ok, reason=reason, at=time.time(), elapsed=elapsed)
+
+
+def last_status() -> dict:
+    """Outcome of the most recent Deribit network call: ``ok``, ``reason``,
+    ``at`` (epoch s), ``elapsed`` (s), ``breaker_open``."""
+    with _status_lock:
+        out = dict(_last_status)
+    out["breaker_open"] = time.time() < _breaker_until
+    return out
+
+
+def reset_breaker():
+    global _breaker_until
+    _breaker_until = 0.0
+
+
+def probe(index_name: str = "btc_usd", timeout: tuple = (4.0, 6.0)) -> tuple[bool, str, float | None]:
+    """One uncached, un-breakered call for the status box.
+
+    Returns ``(ok, reason, index_price)``; ``reason`` is e.g. ``"200 in 180 ms"``,
+    ``"HTTP 403 · Cloudflare access denied"`` or ``"ConnectTimeout"``.
+    """
+    global _breaker_until
+    t0 = time.time()
+    try:
+        resp = _session().get(f"{BASE_URL}/get_index_price",
+                              params={"index_name": index_name}, timeout=timeout)
+    except requests.RequestException as e:
+        reason = _exc_reason(e)
+        _set_status(False, reason, time.time() - t0)
+        return False, reason, None
+    elapsed = time.time() - t0
+    if resp.status_code == 200:
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        res = data.get("result") if isinstance(data, dict) else None
+        if isinstance(res, dict) and res.get("index_price"):
+            _breaker_until = 0.0
+            reason = f"200 in {elapsed * 1000:.0f} ms"
+            _set_status(True, reason, elapsed)
+            return True, reason, res["index_price"]
+    reason = _describe_response(resp)
+    if resp.status_code == 200:
+        reason += " · no result in body"
+    _set_status(False, reason, elapsed)
+    return False, reason, None
+
+
+def _exc_reason(e: Exception) -> str:
+    name = type(e).__name__
+    text = str(e)
+    # requests wraps urllib3 errors; keep the most informative tail, short.
+    for key in ("Name or service not known", "Temporary failure in name resolution",
+                "Connection refused", "Connection reset", "certificate verify failed",
+                "timed out", "Max retries exceeded"):
+        if key in text:
+            return f"{name} ({key})"
+    return name
 
 
 def _rate_limit():
@@ -139,7 +262,7 @@ def _request(endpoint: str, params: dict | None = None, ttl: float = 60.0,
             _inflight[cache_key] = event
     if not leader:
         # Another thread is already fetching this exact request.
-        event.wait(timeout=DEFAULT_TIMEOUT * retries + sum(RETRY_BACKOFF_S))
+        event.wait(timeout=_TOTAL_TIMEOUT * retries + sum(RETRY_BACKOFF_S))
         cached = _cache_get(cache_key, ttl)
         if cached is not None:
             return cached
@@ -155,26 +278,45 @@ def _request(endpoint: str, params: dict | None = None, ttl: float = 60.0,
 
 def _fetch(url: str, params: dict | None, cache_key: str, retries: int):
     """Network part of ``_request``: rate limit, GET with retry, cache."""
+    global _breaker_until
+    if time.time() < _breaker_until:
+        return None  # Deribit just failed hard; don't stack more timeouts
     _rate_limit()
 
+    reason, blocked = "", False
     for attempt in range(retries):
         retryable = False
+        t0 = time.time()
         try:
             resp = _session().get(url, params=params, timeout=DEFAULT_TIMEOUT)
             if resp.status_code == 200:
                 data = resp.json()
                 if "result" in data:
                     _cache_set(cache_key, data["result"])
+                    _breaker_until = 0.0
+                    _set_status(True, f"200 in {(time.time() - t0) * 1000:.0f} ms",
+                                time.time() - t0)
                     return data["result"]
+                # 200 with a JSON-RPC error body (bad params, or Deribit's
+                # maintenance error): hand it back, but record why.
+                _set_status(False, _describe_response(resp), time.time() - t0)
                 return data
+            reason = _describe_response(resp)
             # 429 (rate limit) and 5xx (Deribit hiccup) are transient; other
             # 4xx are our fault and won't get better on retry.
             retryable = resp.status_code == 429 or resp.status_code >= 500
-        except (requests.RequestException, ValueError):
-            retryable = True
+            blocked = resp.status_code in (403, 451) or resp.status_code >= 500
+        except requests.RequestException as e:
+            reason, retryable, blocked = _exc_reason(e), True, True
+        except ValueError:
+            reason, retryable = "HTTP 200 · body is not JSON", True
         if not retryable or attempt >= retries - 1:
             break
         time.sleep(RETRY_BACKOFF_S[min(attempt, len(RETRY_BACKOFF_S) - 1)])
+    if reason:
+        _set_status(False, reason)
+    if blocked:
+        _breaker_until = time.time() + BREAKER_S
     return None
 
 
@@ -387,3 +529,4 @@ def clear_cache():
     with _cache_lock:
         _cache.clear()
         _cache_gen += 1
+    reset_breaker()
