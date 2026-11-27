@@ -1,7 +1,8 @@
 """Figures for the 10x Research chart collection (maths in ``lib.tenx``).
 
-Dark card with white / violet lines, in the spirit of the 10x exhibits, but
-branded ours ("MCM Analytics") and drawn from our own data.
+White card with dark text and a violet accent, matching the Daily Shot /
+Ecoinometrics chart book, branded ours ("MCM Analytics") and drawn from
+our own data.
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ from plotly.subplots import make_subplots
 
 from lib import tenx
 
-BG, INK, MUTED, GRID = "#000000", "#FFFFFF", "#A6A6A6", "#2A2A2A"
+BG, INK, MUTED, GRID = "#FFFFFF", "#1A1A1A", "#6B6B6B", "#E6E6E6"
 VIOLET, GREY, LILAC = "#7B61FF", "#BFBFBF", "#8E7CC3"
 FONT = "Poppins, 'Helvetica Neue', Arial, sans-serif"
 
@@ -23,16 +24,16 @@ def style(fig: go.Figure, title: str, subtitle: str = "", notes: str = "", heigh
     sub = "<br>".join(textwrap.wrap(subtitle, 110)) if subtitle else ""
     top = 60 + 22 * (sub.count("<br>") + 1 if sub else 0)
     fig.update_layout(
-        template=None, paper_bgcolor=BG, plot_bgcolor=BG, height=height,
+        template="plotly_white", paper_bgcolor=BG, plot_bgcolor=BG, height=height,
         font=dict(family=FONT, color=INK, size=14),
         title=dict(text=f"<b>{title}</b>", x=0, xref="paper", xanchor="left", y=0.99, yanchor="top",
                    font=dict(size=22, color=INK)),
         margin=dict(l=70, r=70, t=top + 30, b=110),
         legend=dict(orientation="h", x=0, y=1.02, yanchor="bottom", bgcolor="rgba(0,0,0,0)",
                     font=dict(color=INK, size=13)),
-        hovermode="x unified", hoverlabel=dict(bgcolor="#111111", font_color=INK),
+        hovermode="x unified", hoverlabel=dict(bgcolor=BG, font_color=INK, bordercolor=GRID),
         xaxis=dict(showgrid=False, linecolor=MUTED, tickfont=dict(color=INK), tickformat="%b-%y"),
-        yaxis=dict(showgrid=False, linecolor=MUTED, tickfont=dict(color=INK), zeroline=False),
+        yaxis=dict(showgrid=True, gridcolor=GRID, linecolor=MUTED, tickfont=dict(color=INK), zeroline=False),
     )
     if sub:
         fig.add_annotation(text=sub, xref="paper", yref="paper", x=0, y=1.0, xanchor="left", yanchor="bottom",
@@ -80,7 +81,7 @@ def figure_btc_rsi(df: pd.DataFrame, stats: dict, source: str) -> go.Figure:
     notes = (f"RSI: Wilder {st['n']}-day on daily closes; MA: {st['ma_n']}-day average of the RSI. Arrow = buy reversal: "
              f"RSI at or below {st['lo']:g} crosses up through its MA (one per 20 days). Source: {source}.")
     style(fig, title, sub, notes)
-    fig.update_yaxes(tickformat=",.0f", secondary_y=False, showgrid=False, tickfont=dict(color=INK))
+    fig.update_yaxes(tickformat=",.0f", secondary_y=False, showgrid=True, gridcolor=GRID, tickfont=dict(color=INK))
     fig.update_yaxes(range=[5, 95], tickmode="linear", tick0=10, dtick=10, secondary_y=True,
                      showgrid=False, tickfont=dict(color=INK))
     return fig
@@ -117,7 +118,7 @@ def figure_gold_channel(df: pd.DataFrame, stats: dict, source: str) -> go.Figure
              "parallel lines through the largest move above and below it. Relative to BTC: gold's trailing "
              f"{st['rel_days']}-day return minus Bitcoin's, percentage points. Source: {source}.")
     style(fig, title, sub, notes)
-    fig.update_yaxes(tickformat=",.0f", secondary_y=False, showgrid=False, tickfont=dict(color=INK))
+    fig.update_yaxes(tickformat=",.0f", secondary_y=False, showgrid=True, gridcolor=GRID, tickfont=dict(color=INK))
     fig.update_yaxes(ticksuffix="%", tickmode="auto", nticks=10, secondary_y=True, showgrid=False,
                      tickfont=dict(color=INK))
     return fig
@@ -142,7 +143,7 @@ def figure_btc_coin(df: pd.DataFrame, stats: dict, source: str) -> go.Figure:
     notes = ("BTC shown on Coinbase trading days only (no weekend points). Correlation of daily log returns. "
              f"Source: {source}.")
     style(fig, title, sub, notes)
-    fig.update_yaxes(tickformat=",.0f", secondary_y=False, showgrid=False, tickfont=dict(color=INK))
+    fig.update_yaxes(tickformat=",.0f", secondary_y=False, showgrid=True, gridcolor=GRID, tickfont=dict(color=INK))
     fig.update_yaxes(tickformat=",.0f", tickmode="auto", nticks=10, secondary_y=True, showgrid=False,
                      tickfont=dict(color=INK))
     return fig

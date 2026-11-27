@@ -32,6 +32,7 @@ missing day stays missing.
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -127,6 +128,12 @@ def charts_by_post() -> dict[str, list[TenXChart]]:
 
 def has_post(post_date: str, post_title: str) -> bool:
     return post_id(post_date, post_title) in charts_by_post()
+
+
+def anchor(*parts) -> str:
+    """URL fragment for a post section or chart header on the scrolling page."""
+    slug = re.sub(r"[^a-z0-9]+", "-", "-".join(str(p) for p in parts).lower()).strip("-")
+    return "tenx-" + slug
 
 
 # ---------------------------------------------------------------------- data

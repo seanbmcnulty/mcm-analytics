@@ -148,3 +148,34 @@ def test_registry_keyed_by_post():
     assert len(pairs) == len(set(pairs)), "same exhibit from the same post registered twice"
     for pid, charts in by.items():
         assert len({c.post_url for c in charts}) == 1
+
+
+def test_anchor_and_charts_grouped_by_post():
+    pid = "2026-11-27 | Bitcoin and Gold: The Thanksgiving Charts"
+    assert tenx.anchor(pid) == "tenx-2026-11-27-bitcoin-and-gold-the-thanksgiving-charts"
+    assert tenx.anchor(pid, "BTC daily RSI").endswith("btc-daily-rsi")
+    by = tenx.charts_by_post()
+    posts = list(by)
+    dates = [pd.Timestamp(by[p][0].post_date) for p in posts]
+    assert dates == sorted(dates, reverse=True)
+    keys = [c.key for charts in by.values() for c in charts]
+    assert set(keys) == set(tenx.registry_keys()) and len(keys) == len(tenx.REGISTRY)
+
+
+def test_white_theme_and_scroll_page():
+    from lib import tenx_charts
+    pr = tenx.load_prices(live=False)
+    fig, _st = tenx_charts.BUILDERS[tenx.REGISTRY[0].key](pr)
+    layout = fig.layout
+    assert layout.paper_bgcolor == "#FFFFFF"
+    assert layout.plot_bgcolor == "#FFFFFF"
+    assert tenx_charts.BG == "#FFFFFF" and tenx_charts.INK == "#1A1A1A"
+    assert tenx_charts.GRID == "#E6E6E6"
+    src = (Path(__file__).resolve().parent.parent / "pages" / "15_10x_Research.py").read_text(encoding="utf-8")
+    assert "st.tabs(" not in src
+    assert 'with st.expander("Refresh data", expanded=False):' in src
+    assert "#### Contents" in src
+    assert "tenx.charts_by_post()" in src
+    assert "tenx.anchor(" in src
+    for c in tenx.REGISTRY:
+        assert c.key in tenx_charts.BUILDERS
