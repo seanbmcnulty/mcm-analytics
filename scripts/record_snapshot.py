@@ -112,7 +112,7 @@ def record_market(assets, slot_minutes: int | None = 15, path=None, now=None,
         row: dict[str, object] = {"timestamp": pd.Timestamp(now).isoformat()}
         for a in assets:
             for k, v in row_fn(a).items():
-                row[f"{a}_{k}"] = v
+                row[f"{a}_{k}"] = round(float(v), 8) if v is not None else v
         if len(row) == 1:
             return "no_data"
         new = pd.DataFrame([row])

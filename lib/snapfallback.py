@@ -29,6 +29,7 @@ import requests
 SGT = timezone(timedelta(hours=8))
 MARKET_FILE = "market.csv"
 _TTL = 300.0
+_MISS_TTL = 60.0
 _TIMEOUT = 6.0
 # Snapshots older than this aren't used (the recorder itself would have to be
 # down for hours); the page stays blank with a note instead.
@@ -127,7 +128,9 @@ def _fetch_market(get=None) -> pd.DataFrame | None:
 def market_frame(get=None) -> pd.DataFrame | None:
     global _market_cache
     with _lock:
-        if _market_cache is not None and time.time() - _market_cache[0] < _TTL:
+        # A miss (404 / timeout) is retried after a minute, not the full TTL.
+        if _market_cache is not None and time.time() - _market_cache[0] < (
+                _TTL if _market_cache[1] is not None else _MISS_TTL):
             return _market_cache[1]
     df = _fetch_market(get)
     with _lock:
