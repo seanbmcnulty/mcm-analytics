@@ -1,19 +1,17 @@
 """
-Daily Shot — our own versions of charts from The Daily Shot
-(https://thedailyshot.com/, Lev Borodovsky's global macro newsletter).
+Daily Shot — a standing, Daily Shot-style chart book.
 
-Started 2026-11-27 at Sean's request. Issue bodies sit behind the subscriber
-login, so each tab rebuilds the issue's public headline story (or a section
-item named in the public excerpt) from free public data, newest first.
-Registry, data and maths: lib/dailyshot.py; figures: lib/dailyshot_charts.py.
-Nothing of The Daily Shot's is stored here: each tab cites the issue
-(headline, date, link) and our data source.
-
-Data: Yahoo Finance daily closes (live, else data/dailyshot_prices.csv), FRED
-(live, else data/dailyshot_fred.csv) and Treasury par yields (lib.eco_more).
+Sean (27 Nov 2026): one long page laid out like The Daily Shot newsletter,
+with its sections in order and a bunch of charts under each, refreshed on
+demand, not tied to any issue. Every chart is our own, from free public data
+on a rolling window ending at the latest data point (Yahoo Finance, FRED, US
+Treasury, Deribit), with committed CSVs of real values as fallbacks.
+Chart list, loaders and maths: lib/dailyshot.py; figures: lib/dailyshot_charts.py.
 """
+import concurrent.futures as cf
 import importlib
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -21,106 +19,63 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import streamlit as st
 
-from lib.constants import TTL_DAILY_EXTERNAL
-from lib import cache as cache_lib
 from lib import fx_style
-from lib import eco_more
 from lib import dailyshot
 from lib import dailyshot_charts
 
-# Same as the 10x page: Streamlit Cloud keeps lib modules in sys.modules across
-# commits, and new charts land in these two modules with every issue, so reload
-# them on every run. dailyshot first: dailyshot_charts imports it.
+# Streamlit Cloud keeps lib modules in sys.modules across commits; reload so
+# chart-list changes in lib/ show up without a reboot (dailyshot first).
 importlib.reload(dailyshot)
 importlib.reload(dailyshot_charts)
 
-st.set_page_config(page_title="Daily Shot", page_icon="📈", layout="wide",
-                   initial_sidebar_state="expanded")
-st.title("📈 The Daily Shot charts")
-st.caption("Our own rebuilds of the lead stories in The Daily Shot, newest first, drawn from public data "
-           "(Yahoo Finance, FRED, US Treasury). Issue bodies are for subscribers, so each chart follows the "
-           "issue's public headline and is MCM's reading of it, not The Daily Shot's chart. Each issue "
-           "header links the original.")
+st.set_page_config(page_title="Daily Shot", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
+
+
+# Plain tuples in the cache, not dailyshot.Dataset: the module is reloaded every run
+# and pickling an instance of a just-replaced class fails.
+@st.cache_data(ttl=3600, show_spinner="Fetching market and macro data…")
+def _load_all():
+    t0 = time.time()
+    loaders = {"prices": dailyshot.load_prices, "fred": dailyshot.load_fred,
+               "yields": dailyshot.load_yields, "dvol": dailyshot.load_dvol}
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {k: ex.submit(fn) for k, fn in loaders.items()}
+        out = {k: (f.result().df, dict(f.result().source), list(f.result().errors)) for k, f in futs.items()}
+    return out, fx_style.local_now(), time.time() - t0
+
+
+st.title("📈 Daily Shot charts")
+st.caption("A standing chart book in the style of The Daily Shot, section by section, from public data "
+           "(Yahoo Finance, FRED, US Treasury, Deribit). Each chart runs to the latest data point; "
+           "press Refresh to pull fresh data.")
 
 with st.sidebar:
     st.header("Daily Shot")
-    cache_lib.render_refresh_button(help="Clears cached fetches across the app and reloads this page.")
+    if st.button("🔄 Refresh data", width="stretch", help="Re-fetch every source for this page and redraw."):
+        _load_all.clear()
+        st.rerun()
 
+data, loaded_at, secs = _load_all()
+ctx = dailyshot_charts.Ctx(*(dailyshot.Dataset(*data[k]) for k in ("prices", "fred", "yields", "dvol")))
+groups = dailyshot.sections()
+st.sidebar.caption(f"Data last updated {loaded_at:%d %b %Y %H:%M} SGT (fetch {secs:.1f}s). "
+                   f"{len(dailyshot.CHARTS)} charts in {len(groups)} sections.")
+st.caption(f"Data last updated **{loaded_at:%d %b %Y %H:%M} SGT**.")
+notes = [e for k in ("prices", "fred", "yields", "dvol") for e in data[k][2]]
+if notes:
+    st.info("Some live sources did not answer, so those charts use the committed CSV of earlier real values "
+            "(see each chart's source line): " + "; ".join(notes[:6]) + (" …" if len(notes) > 6 else ""))
 
-# Plain tuples, not dailyshot.Prices: the module is reloaded every run, and pickling an
-# instance of a class that was just replaced would fail.
-@st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Fetching Yahoo daily closes…")
-def _prices():
-    pr = dailyshot.load_prices()
-    return pr.df, dict(pr.source), list(pr.errors)
+st.markdown("#### Contents\n" + " · ".join(f"[{s}](#{dailyshot.anchor(s)})" for s, _ in groups))
 
-
-@st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Fetching FRED series…")
-def _fred():
-    fr = dailyshot.load_fred()
-    return fr.df, dict(fr.source), list(fr.errors)
-
-
-@st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Fetching Treasury yields…")
-def _yields():
-    r = eco_more.fetch_yield_curve_result(timeout=10)
-    label = {"live": "US Treasury par yields (live)", "csv": "US Treasury par yields (committed CSV)"}
-    return r.df, label.get(r.source, "Treasury yields unavailable")
-
-
-prices = dailyshot.Prices(*_prices())
-fred = dailyshot.Fred(*_fred())
-ydf, ysrc = _yields()
-ctx = dailyshot_charts.Ctx(prices, fred, ydf, ysrc)
-
-_now = fx_style.local_now()
-st.sidebar.caption(f"Loaded {_now:%d %b %Y %H:%M} SGT. Charts: {len(dailyshot.REGISTRY)} from "
-                   f"{len(dailyshot.charts_by_issue())} issues.")
-_errs = prices.errors + fred.errors
-if _errs:
-    st.info("Some live fetches failed, so those series use the committed CSV of earlier real values: "
-            + "; ".join(_errs))
-
-
-
-def _render(chart) -> None:
-    missing = [c for c in chart.series if prices.source.get(c) == "none"]
-    missing += [c for c in chart.fred if fred.source.get(c) == "none"]
-    if missing:
-        st.error(f"No data for {', '.join(missing)}; chart skipped.")
-        return
-    try:
-        fig, _stats = dailyshot_charts.BUILDERS[chart.key](ctx)
-    except Exception as ex:   # one bad chart must not take the page down
-        st.error(f"{chart.tab}: could not draw the chart ({type(ex).__name__}: {ex}).")
-        return
-    st.plotly_chart(fig, theme=None, width="stretch", config={"displaylogo": False}, key=f"ds_{chart.key}")
-    st.caption(chart.summary)
-
-
-# One long page laid out like the newsletter: issues newest first, each issue's
-# sections in its own order, charts stacked under each section. Contents first.
-issues = dailyshot.layout()
-toc = []
-for iss in issues:
-    day = pd.Timestamp(iss["date"])
-    secs = " · ".join(f"[{s}](#{dailyshot.anchor(iss['date'], s)})" for s in iss["sections"])
-    toc.append(f"- **[{day:%a %d %b %Y}](#{dailyshot.anchor(iss['date'])})**: {iss['title']} ({secs})")
-st.markdown("#### Contents\n" + "\n".join(toc))
-
-for iss in issues:
-    day = pd.Timestamp(iss["date"])
+for section, charts in groups:
     st.divider()
-    st.header(f"The Daily Shot: {day:%d %b %Y}", anchor=dailyshot.anchor(iss["date"]))
-    st.markdown(f"**[{iss['title']}]({iss['url']})**")
-    if iss["all_sections"]:
-        st.caption("Sections in this issue: " + " • ".join(iss["all_sections"]))
-    for section, charts in iss["sections"].items():
-        st.subheader(section, anchor=dailyshot.anchor(iss["date"], section))
-        for chart in charts:
-            _render(chart)
-
-st.divider()
-with st.expander(f"Recent issues not rebuilt ({len(dailyshot.NOT_REBUILT)})"):
-    st.markdown("\n".join(f"- {pd.Timestamp(d):%d %b %Y}: [{t}]({u}). {why}"
-                           for d, t, u, why in dailyshot.NOT_REBUILT))
+    st.header(section, anchor=dailyshot.anchor(section))
+    for chart in charts:
+        try:
+            fig, info = dailyshot_charts.build(chart, ctx)
+        except Exception as ex:   # one bad chart must not take the page down
+            st.caption(f"**{chart.title}**: not drawn ({type(ex).__name__}: {ex}).")
+            continue
+        st.plotly_chart(fig, theme=None, width="stretch", config={"displaylogo": False}, key=f"ds_{chart.key}")
+        st.caption(f"{chart.caption} Source: {info['source']}. Data to {info['as_of']:%d %b %Y}.")
