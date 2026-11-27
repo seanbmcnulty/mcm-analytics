@@ -407,7 +407,12 @@ def load_fred(get=None, data_dir=None, live=True, timeout=FRED_TIMEOUT) -> Datas
             more, errors = _parallel(one, ids[1:], workers=len(ids))
             live_cols.update(more)
     df, src = merge_live_csv(live_cols, _read_csv(FRED_CSV, data_dir), ids)
-    err = [f"FRED unreachable ({len(errors)} of {len(ids)} series)"] if errors else []
+    if not errors:
+        err = []
+    elif not live_cols:
+        err = ["FRED unreachable (all FRED charts on the committed CSV)"]
+    else:
+        err = [f"FRED: {len(errors)} of {len(ids)} series failed"]
     return Dataset(df, src, err)
 
 
