@@ -13,6 +13,7 @@ import streamlit as st
 from datetime import datetime, timezone
 
 from lib.deribit import get_index_price, get_option_chain, get_ticker
+from lib import deribit as deribit_lib
 from lib.constants import ASSET_CONFIG, ASSETS
 from lib.telegram import is_configured
 from lib import cache as cache_lib
@@ -37,11 +38,20 @@ st.caption("Crypto derivatives analytics • Deribit public API • No authentic
 
 st.subheader("Market Overview")
 
+# One fast, uncached connectivity probe up front. If Deribit is down or blocking
+# this server, say why once and skip the per-asset calls instead of letting
+# each one wait out its own timeouts.
+_dbt_ok, _dbt_reason, _ = deribit_lib.probe()
+if not _dbt_ok:
+    st.warning(f"Deribit API unreachable from this server ({_dbt_reason}) — live prices, "
+               "funding and option activity are unavailable until it answers. "
+               "Use 🔄 refresh / rerun to retry.")
+
 cols = st.columns(len(ASSETS))
 for i, asset in enumerate(ASSETS):
     cfg = ASSET_CONFIG[asset]
     with cols[i]:
-        price = get_index_price(cfg["index"])
+        price = get_index_price(cfg["index"]) if _dbt_ok else None
         if price:
             # Get perp data for funding + OI
             ticker = get_ticker(cfg["perp"])
@@ -70,7 +80,7 @@ for col, h in zip(option_cols, headers):
 
 for asset in ASSETS:
     cfg = ASSET_CONFIG[asset]
-    chain = get_option_chain(cfg["deribit_ccy"], "option")
+    chain = get_option_chain(cfg["deribit_ccy"], "option") if _dbt_ok else None
     if chain:
         # Filter to this asset's prefix
         prefix = cfg["deribit_prefix"]
@@ -103,12 +113,15 @@ with status_cols[0]:
 
 with status_cols[1]:
     st.markdown("**Deribit API**")
-    # Quick connectivity check
-    test = get_index_price("btc_usd")
-    if test:
+    # Result of the uncached probe above, with the reason (HTTP status,
+    # Cloudflare block, timeout type...) so an outage is diagnosable here.
+    if _dbt_ok:
         st.success("✅ Connected")
+        st.caption(f"get_index_price {_dbt_reason}")
     else:
-        st.error("❌ Unreachable")
+        st.error(f"❌ Unreachable — {_dbt_reason}")
+        st.caption(f"{deribit_lib.BASE_URL} · checked "
+                   f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
 
 with status_cols[2]:
     st.markdown("**Assets**")
