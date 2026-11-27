@@ -395,7 +395,17 @@ def load_fred(get=None, data_dir=None, live=True, timeout=FRED_TIMEOUT) -> Datas
             raise ValueError("no rows")
         return s
 
-    live_cols, errors = _parallel(one, ids, workers=8) if live else ({}, [])
+    live_cols, errors = {}, []
+    if live:
+        # Probe one id first: from Streamlit Cloud FRED times out on every request, so a
+        # failed probe skips the rest instead of waiting out a timeout per batch.
+        try:
+            live_cols[ids[0]] = one(ids[0])
+        except Exception as e:
+            errors.append(f"{ids[0]}: {type(e).__name__}")
+        if live_cols:
+            more, errors = _parallel(one, ids[1:], workers=len(ids))
+            live_cols.update(more)
     df, src = merge_live_csv(live_cols, _read_csv(FRED_CSV, data_dir), ids)
     err = [f"FRED unreachable ({len(errors)} of {len(ids)} series)"] if errors else []
     return Dataset(df, src, err)

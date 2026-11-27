@@ -80,3 +80,15 @@ def test_every_chart_draws_from_committed_data():
         fig, info = dc.build(c, ctx)
         assert fig.data, c.key
         assert isinstance(info["as_of"], pd.Timestamp) and "committed CSV" in info["source"], c.key
+
+
+def test_fred_probe_fails_fast():
+    calls = []
+
+    def dead(url, params=None, headers=None, timeout=None):
+        calls.append(params["id"])
+        raise TimeoutError("no answer")
+
+    fr = ds.load_fred(get=dead)
+    assert calls == [ds.fred_ids()[0]]
+    assert fr.errors and set(fr.source.values()) <= {"csv", "none"}
