@@ -30,32 +30,32 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# One fast, uncached connectivity probe up front. If Deribit is down or blocking
+# this server, say why once and skip the per-asset calls instead of letting
+# each one wait out its own timeouts.
+_dbt_ok, _dbt_reason, _ = deribit_lib.probe()
+# Live Deribit blocked: fall back to the latest 15-min snapshot recorded by
+# GitHub Actions (real Deribit data). Never synthesized. One page-level note
+# when the fallback is in use; chart titles and metric labels stay clean.
+_snap = {} if _dbt_ok else {a: snapfallback.latest_market(a) for a in ASSETS}
+_snap_ts = [ts for _, ts in _snap.values() if ts is not None]
+_snap_asof = min(_snap_ts) if _snap_ts else None
+
 st.title("📊 MCM Analytics")
 st.caption("Crypto derivatives analytics • Deribit public API • No authentication required")
+if not _dbt_ok:
+    if _snap_asof is not None:
+        st.caption(snapfallback.caption(_snap_asof))
+    else:
+        st.warning(f"Deribit API unreachable from this server ({_dbt_reason}) and no recent "
+                   "snapshot is available — live prices, funding and option activity are blank "
+                   "until it answers. Use 🔄 refresh / rerun to retry.")
 
 # ---------------------------------------------------------------------------
 # Market Overview
 # ---------------------------------------------------------------------------
 
 st.subheader("Market Overview")
-
-# One fast, uncached connectivity probe up front. If Deribit is down or blocking
-# this server, say why once and skip the per-asset calls instead of letting
-# each one wait out its own timeouts.
-_dbt_ok, _dbt_reason, _ = deribit_lib.probe()
-# Live Deribit blocked: fall back to the latest 15-min snapshot recorded by
-# GitHub Actions (real Deribit data, flagged as delayed). Never synthesized.
-_snap = {} if _dbt_ok else {a: snapfallback.latest_market(a) for a in ASSETS}
-_snap_ts = [ts for _, ts in _snap.values() if ts is not None]
-_snap_asof = min(_snap_ts) if _snap_ts else None
-if not _dbt_ok:
-    if _snap_asof is not None:
-        st.warning(f"⚠ {snapfallback.banner(_snap_asof, _dbt_reason)}. Prices, funding and "
-                   "option activity below are from the 15-minute snapshot recorder, not live.")
-    else:
-        st.warning(f"Deribit API unreachable from this server ({_dbt_reason}) and no recent "
-                   "snapshot is available — live prices, funding and option activity are blank "
-                   "until it answers. Use 🔄 refresh / rerun to retry.")
 
 cols = st.columns(len(ASSETS))
 for i, asset in enumerate(ASSETS):
@@ -65,7 +65,7 @@ for i, asset in enumerate(ASSETS):
             _vals, _ts = _snap.get(asset, ({}, None))
             if _vals.get("index"):
                 _f = _vals.get("funding")
-                st.metric(label=f"{asset} (delayed)",
+                st.metric(label=asset,
                           value=f"${_vals['index']:,.{cfg['price_dp']}f}",
                           delta=f"Funding: {_f * 100:+.4f}%/8h" if _f is not None else None)
             else:
@@ -106,13 +106,11 @@ if not _dbt_ok:
             continue
         _any_opt = True
         row_cols = st.columns(4)
-        row_cols[0].markdown(f"**{asset}** (delayed)")
+        row_cols[0].markdown(f"**{asset}**")
         row_cols[1].markdown(f"{_vals['opt_oi']:,.0f}")
         row_cols[2].markdown(f"{_vals.get('opt_volume', 0):,.0f}")
         row_cols[3].markdown(f"{_vals.get('opt_count', 0):,.0f}")
-    if _any_opt and _snap_asof is not None:
-        st.caption(f"⚠ {snapfallback.label(_snap_asof)}")
-    elif not _any_opt:
+    if not _any_opt:
         st.caption("No option activity: live Deribit unreachable and no recent snapshot.")
 
 for asset in (ASSETS if _dbt_ok else []):
@@ -156,8 +154,7 @@ with status_cols[1]:
         st.success("✅ Connected")
         st.caption(f"get_index_price {_dbt_reason}")
     elif _snap_asof is not None:
-        st.warning(f"⚠️ Unreachable — using snapshots (as of "
-                   f"{_snap_asof.tz_convert(snapfallback.SGT).strftime('%H:%M')} SGT)")
+        st.warning("⚠️ Unreachable — snapshot data")
         st.caption(f"Live call: {_dbt_reason}")
     else:
         st.error(f"❌ Unreachable — {_dbt_reason}")

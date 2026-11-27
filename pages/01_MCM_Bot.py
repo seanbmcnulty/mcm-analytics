@@ -56,10 +56,10 @@ def _fresh_lib_modules() -> list[str]:
     """
     import importlib
     import os
-    from lib import cmd_market, cmd_vol, history, telegram_caption
+    from lib import cmd_market, cmd_vol, history, snapfallback, telegram_caption
     started = _process_start()
     reloaded, stale = [], False
-    for mod in (fx_style, telegram_caption, surface, history, cmd_vol, cmd_market, cmdreg):
+    for mod in (fx_style, telegram_caption, snapfallback, surface, history, cmd_vol, cmd_market, cmdreg):
         path = getattr(mod, "__file__", None)
         try:
             mtime = os.path.getmtime(path) if path else None
@@ -706,7 +706,7 @@ st.caption("Crypto derivatives analytics · Deribit public API · "
 
 # Live-Deribit check (memoised 60 s per session). When Streamlit Cloud can't
 # reach Deribit, the vol-surface reports fall back to the 15-minute snapshot
-# store and every such chart's title says "Delayed — Deribit snapshot as of …".
+# store. One page-level "Snapshot data" note; chart titles are left alone.
 def _deribit_probe():
     import time as _time
     from lib import deribit as _deribit
@@ -722,11 +722,12 @@ _dbt_ok, _dbt_reason = _deribit_probe()
 if not _dbt_ok:
     from lib import snapfallback as _snapfb
     _sv, _sts = _snapfb.latest_expiry_vols("BTC")
-    _asof = f" (latest snapshot {_snapfb.as_of_text(_sts)})" if _sts is not None else ""
-    st.warning(f"⚠ Live Deribit unreachable from this server: {_dbt_reason}. Vol-surface reports "
-               f"(vol run, term structures, skew, butterflies, forward vols, smiles, time series) use "
-               f"the 15-minute snapshot recorder{_asof} and are labelled **Delayed** in their titles. "
-               "Funding, basis, RV, moon phase and block trades need live Deribit and stay blank.")
+    if _sts is not None:
+        st.caption(_snapfb.caption(_sts))
+    else:
+        st.warning(f"Live Deribit unreachable from this server: {_dbt_reason}. "
+                   "No recent snapshot is available — vol-surface reports stay blank. "
+                   "Funding, basis, RV, moon phase and block trades need live Deribit and stay blank.")
 
 with st.expander("What each report shows"):
     st.markdown("""

@@ -222,7 +222,7 @@ def option_vols_by_dte(asset: str) -> dict[str, dict[int, float]]:
     snap_ts = None
     if not out.get("atm") and _snap().deribit_blocked():
         # Live chain unavailable (Deribit blocked / down): serve the latest
-        # 15-min snapshot recorded by GitHub Actions, flagged as delayed.
+        # 15-min snapshot recorded by GitHub Actions; the page notes this once.
         snap, snap_ts = _snap().latest_expiry_vols(asset)
         if snap:
             out = snap
@@ -613,7 +613,7 @@ def perp_mark(asset: str) -> float | None:
 
 
 def spot_price(asset: str) -> float | None:
-    """Live index price; the latest snapshot's (flagged delayed) when Deribit is blocked."""
+    """Live index price; the latest snapshot when Deribit is blocked."""
     v = deribit.get_index_price(acfg(asset)["index"])
     if v:
         return v
