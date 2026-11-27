@@ -134,4 +134,33 @@ def test_probe_reports_http_status(monkeypatch):
     monkeypatch.setattr(deribit, "_session", lambda: _Blocked())
     ok, reason, px = deribit.probe()
     assert (ok, px) == (False, None)
-    assert reason == "HTTP 403 · Cloudflare bot check"
+    assert reason.startswith("HTTP 403 · Cloudflare bot check; alt headers: HTTP 403")
+    assert deribit._header_idx == 0  # neither set worked: stay on the plain one
+
+
+def test_probe_switches_to_browser_headers_on_403(monkeypatch):
+    seen = []
+
+    class _Ok:
+        status_code = 200
+        headers = {}
+
+        def json(self):
+            return {"result": {"index_price": 61000.0}}
+
+    def fake_session():
+        idx = deribit._header_idx
+        seen.append(idx)
+
+        class S:
+            def get(self, url, params=None, timeout=None):
+                if idx == 0:
+                    return _ErrResp(403, "<title>Just a moment...</title>", {"server": "cloudflare"})
+                return _Ok()
+        return S()
+
+    monkeypatch.setattr(deribit, "_session", fake_session)
+    monkeypatch.setattr(deribit, "_header_idx", 0)
+    ok, reason, px = deribit.probe()
+    assert ok and px == 61000.0 and seen == [0, 1]
+    assert deribit._header_idx == 1 and "browser headers" in reason
