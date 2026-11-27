@@ -11,6 +11,7 @@ stored here: each tab cites the post (title, date, link) and our data source.
 Data: Yahoo Finance daily closes (BTC-USD, GC=F, COIN), live, with the
 committed data/tenx_prices.csv (real Yahoo closes) for anything live misses.
 """
+import importlib
 import sys
 from pathlib import Path
 
@@ -21,13 +22,17 @@ import streamlit as st
 
 from lib.constants import TTL_DAILY_EXTERNAL
 from lib import cache as cache_lib
-from lib import freshness, fx_style
+from lib import fx_style
 from lib import tenx
 from lib import tenx_charts
 
-# Streamlit Cloud keeps lib modules in sys.modules across a redeploy; reload them when
-# their file changed so a lib-only fix shows up (same guard as the Ecoinometrics page).
-freshness.reload_if_changed(tenx, tenx_charts)
+# Streamlit Cloud pulls a new commit into the running process and keeps lib
+# modules in sys.modules, and lib.freshness's mtime check did not fire here on
+# 27 Nov 2026 (the RSI tick fix in #29 stayed invisible). Both modules are small
+# and new charts land in them every time a 10x email comes in, so reload them on
+# every run. tenx first: tenx_charts imports it.
+importlib.reload(tenx)
+importlib.reload(tenx_charts)
 
 st.set_page_config(page_title="10x Research", page_icon="🔟", layout="wide",
                    initial_sidebar_state="expanded")
@@ -43,10 +48,13 @@ with st.sidebar:
 
 @st.cache_data(ttl=TTL_DAILY_EXTERNAL, show_spinner="Fetching Yahoo daily closes…")
 def _prices():
-    return tenx.load_prices()
+    # Plain tuple, not tenx.Prices: the module is reloaded every run, and pickling an
+    # instance of a class that was just replaced would fail.
+    pr = tenx.load_prices()
+    return pr.df, dict(pr.source), list(pr.errors)
 
 
-prices = _prices()
+prices = tenx.Prices(*_prices())
 _now = fx_style.local_now()
 st.sidebar.caption(f"Loaded {_now:%d %b %Y %H:%M} SGT. Charts: {len(tenx.REGISTRY)}.")
 if prices.errors:
