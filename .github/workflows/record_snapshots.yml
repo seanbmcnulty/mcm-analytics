@@ -14,6 +14,10 @@ name: Record vol snapshots
 # publish_snapshot_history.bat ran), the new row is merged onto the new tip
 # and the push retried. A bad file fails the run instead of being published.
 #
+# market.csv (prices / funding / OI / option activity, written by
+# record_snapshot.py) rides along for the app's delayed fallback when live
+# Deribit is unreachable from Streamlit Cloud (lib/snapfallback.py).
+#
 # Triggers: GitHub's own schedule drops most runs, so the primary trigger is
 # an external workflow_dispatch call every 15 minutes (docs/EXTERNAL_TRIGGER.md).
 # The two hourly crons stay as a backup. Slot-based skip (--slot-minutes 15)
@@ -78,6 +82,7 @@ jobs:
             cp "$PUB"/data/snapshots/*_surface.* "$BASELINE"/ 2>/dev/null || true
             cp "$PUB"/data/snapshots/*_surface.* data/snapshots/ 2>/dev/null || true
             cp "$PUB"/data/snapshots/*_expiry.csv data/snapshots/ 2>/dev/null || true
+            cp "$PUB"/data/snapshots/market.csv data/snapshots/ 2>/dev/null || true
           elif [ "$rc" -eq 2 ]; then
             echo "HAVE_BRANCH=0" >> "$GITHUB_ENV"
             git worktree add --orphan -b snapshots "$PUB"
@@ -116,6 +121,7 @@ jobs:
               rm -f "$PUB"/data/snapshots/*_surface.*   # mirror candidate exactly (csv->parquet switch)
               cp data/snapshots/*_surface.* "$PUB/data/snapshots/"
               cp data/snapshots/*_expiry.csv "$PUB/data/snapshots/" 2>/dev/null || true
+              cp data/snapshots/market.csv "$PUB/data/snapshots/" 2>/dev/null || true
             else
               # Branch moved: merge our rows onto the new tip, re-validate.
               git -C "$PUB" fetch --depth=1 origin snapshots
@@ -124,6 +130,7 @@ jobs:
               cp "$PUB"/data/snapshots/*_surface.* "$BASELINE"/
               python scripts/snapshot_tools.py merge --base "$PUB/data/snapshots" --incoming data/snapshots
               python scripts/merge_expiry.py "$PUB/data/snapshots" data/snapshots
+              python scripts/merge_market.py "$PUB/data/snapshots" data/snapshots
               python scripts/snapshot_tools.py validate --published "$BASELINE" --candidate "$PUB/data/snapshots" --max-added 2
             fi
             git -C "$PUB" add -f -A data/snapshots
