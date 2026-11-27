@@ -21,9 +21,13 @@ import streamlit as st
 
 from lib.constants import TTL_DAILY_EXTERNAL
 from lib import cache as cache_lib
-from lib import fx_style
+from lib import freshness, fx_style
 from lib import tenx
 from lib import tenx_charts
+
+# Streamlit Cloud keeps lib modules in sys.modules across a redeploy; reload them when
+# their file changed so a lib-only fix shows up (same guard as the Ecoinometrics page).
+freshness.reload_if_changed(tenx, tenx_charts)
 
 st.set_page_config(page_title="10x Research", page_icon="🔟", layout="wide",
                    initial_sidebar_state="expanded")
