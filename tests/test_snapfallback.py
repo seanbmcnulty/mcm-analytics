@@ -71,9 +71,9 @@ def test_latest_market_parses_csv():
     assert snapfallback.latest_market("SOL", now=NOW) == ({}, None)
 
 
-def test_label_text():
-    assert snapfallback.label(TS, NOW) == "Delayed — Deribit snapshot as of 20:15 SGT (15 min old)"
-    assert snapfallback.banner(TS, "HTTP 403", NOW).endswith("; live Deribit blocked: HTTP 403")
+def test_caption_text():
+    assert snapfallback.as_of_clock(TS) == "20:15 SGT"
+    assert snapfallback.caption(TS) == "Snapshot data · as of 20:15 SGT"
 
 
 def test_option_vols_fall_back_only_when_blocked(monkeypatch):
@@ -91,16 +91,16 @@ def test_option_vols_fall_back_only_when_blocked(monkeypatch):
     assert snapfallback.used() == TS
 
 
-def test_run_command_stamps_delayed_label_on_titles(monkeypatch):
+def test_run_command_leaves_titles_untouched_when_snapshot_used(monkeypatch):
     def handler(asset, **kw):
         snapfallback.mark(TS)
-        return go.Figure(layout={"title": {"text": "BTC Vol Term Structure"}}), None, None
+        return go.Figure(layout={"title": {"text": "BTC Vol Term Structure"}}), None, "ok"
 
     monkeypatch.setitem(commands.HANDLERS, "vol_term_structure", handler)
     fig, df, text = commands.run_command("BTC", "/vol_term_structure")
-    assert fig.layout.title.text.startswith("⚠ Delayed — Deribit snapshot as of 20:15 SGT")
-    assert fig.layout.title.text.endswith("<br>BTC Vol Term Structure")
-    assert "Delayed" in text
+    assert fig.layout.title.text == "BTC Vol Term Structure"
+    assert text == "ok"
+    assert snapfallback.used() == TS
 
 
 def test_run_command_live_is_untouched(monkeypatch):

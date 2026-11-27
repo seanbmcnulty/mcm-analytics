@@ -10,11 +10,11 @@ real Deribit data to the ``snapshots`` branch:
   perp OI and option-book totals per asset (written by
   scripts/record_snapshot.py from this PR on)
 
-When a live call fails, callers here serve the latest recorded row instead and
-mark the current thread as "using snapshot data" so the UI (and any chart sent
-to Telegram) can say so: ``Delayed — Deribit snapshot as of 20:15 SGT (7 min
-old)``. Nothing is ever synthesized: fields the snapshots don't carry stay
-blank.
+When a live call falls back to a snapshot, callers here serve the latest
+recorded row and mark the current thread as "using snapshot data" so the page
+can show a single note: ``Snapshot data · as of 20:15 SGT``. Chart titles and
+Telegram captions are left alone. Nothing is ever synthesized: fields the
+snapshots don't carry stay blank.
 """
 from __future__ import annotations
 
@@ -70,36 +70,23 @@ def deribit_blocked() -> bool:
     return st.get("ok") is False or bool(st.get("breaker_open"))
 
 
-def as_of_text(ts, now: datetime | None = None) -> str:
+def as_of_clock(ts) -> str:
+    """Snapshot timestamp as ``HH:MM SGT``."""
     ts = pd.Timestamp(ts)
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
-    now = now or datetime.now(timezone.utc)
-    age = max(0, int((pd.Timestamp(now) - ts).total_seconds() // 60))
-    return f"{ts.tz_convert(SGT).strftime('%H:%M')} SGT ({age} min old)"
+    return f"{ts.tz_convert(SGT).strftime('%H:%M')} SGT"
 
 
-def label(ts, now: datetime | None = None) -> str:
-    """Short label for chart titles / captions."""
-    return f"Delayed — Deribit snapshot as of {as_of_text(ts, now)}"
+# Kept as a synonym so older call sites / comments stay readable.
+as_of_text = as_of_clock
 
 
-def banner(ts, reason: str | None = None, now: datetime | None = None) -> str:
-    out = label(ts, now)
-    if reason:
-        out += f"; live Deribit blocked: {reason}"
-    return out
-
-
-def stamp_title(fig, ts) -> None:
-    """Prefix a plotly figure's title with the delayed label (in place)."""
-    try:
-        old = fig.layout.title.text or ""
-        tag = f"⚠ {label(ts)}"
-        if tag not in old:
-            fig.update_layout(title_text=f"{tag}<br>{old}" if old else tag)
-    except Exception:  # noqa: BLE001 - never break a chart over its label
-        pass
+def caption(ts) -> str:
+    """One-line page note when snapshot fallback is in use. Neutral on
+    purpose: the data is typically only a few minutes old, so we don't
+    say 'Delayed' or show a warning."""
+    return f"Snapshot data · as of {as_of_clock(ts)}"
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +152,7 @@ def latest_market(asset: str, now: datetime | None = None) -> tuple[dict, pd.Tim
 
 
 def market_value(asset: str, field: str) -> float | None:
-    """One market field from the latest snapshot, marking the thread as delayed."""
+    """One market field from the latest snapshot, marking the thread as using snapshot data."""
     vals, ts = latest_market(asset)
     v = vals.get(field)
     if v is not None:

@@ -115,24 +115,11 @@ def run_command(asset: str, command: str, expiry_target_days: int | None = None)
     kwargs = {}
     if name in EXPIRY_COMMANDS and expiry_target_days is not None:
         kwargs["dte"] = int(expiry_target_days)
+    # Track snapshot use for this command, but do not stamp chart titles or
+    # prepend a Delayed note — the page shows a single "Snapshot data" caption.
     snapfallback.begin()
     try:
         fig, df, text = handler(asset, **kwargs)
     except Exception as exc:  # noqa: BLE001 - surfaced to the UI as text
         return None, None, f"/{name} failed: {short_error(exc)}"
-    return _label_if_delayed(fig, df, text)
-
-
-def _label_if_delayed(fig, df, text):
-    """If the command was served from the 15-min snapshot store (live Deribit
-    unreachable), put the 'Delayed — as of' label in every figure title (so
-    Telegram captions carry it too) and in front of the text."""
-    ts = snapfallback.used()
-    if ts is None:
-        return fig, df, text
-    for f in (fig if isinstance(fig, (list, tuple)) else [fig]):
-        if f is not None and hasattr(f, "update_layout"):
-            snapfallback.stamp_title(f, ts)
-    note = f"⚠ {snapfallback.label(ts)} (live Deribit unreachable)"
-    text = f"{note}\n\n{text}" if text else note
     return fig, df, text
